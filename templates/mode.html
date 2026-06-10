@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %} · Choose mode{% endblock %}
+
+{% block steps %}
+<div class="steps">
+  <div class="step-dot done">&#10003;</div>
+  <div class="step-line done"></div>
+  <div class="step-dot active">2</div>
+  <div class="step-line"></div>
+  <div class="step-dot">3</div>
+  <div class="step-line"></div>
+  <div class="step-dot">4</div>
+</div>
+{% endblock %}
+
+{% block content %}
+<div style="padding-top:12px;">
+  <h1 class="page-heading">Where do you want to start?</h1>
+  <p class="page-heading-sub">Choose how you want to build your meal plan.</p>
+
+  <div class="mode-grid">
+    <form action="/mode" method="post">
+      <input type="hidden" name="mode" value="suggestions" />
+      <button type="submit" class="mode-card mode-card-dark" style="width:100%;">
+        <div>
+          <h3>Recipe suggestions</h3>
+          <p>Get recipe ideas built around shared ingredients. Browse and add what you want, we build your grocery list automatically.</p>
+        </div>
+      </button>
+    </form>
+
+    <form action="/mode" method="post">
+      <input type="hidden" name="mode" value="existing" />
+      <button type="submit" class="mode-card mode-card-dark" style="width:100%;">
+        <div>
+          <h3>Use my ingredients</h3>
+          <p>Tell us what you already have. We suggest recipes that use them and only list the gaps on your grocery list.</p>
+        </div>
+      </button>
+    </form>
+  </div>
+
+  <div style="margin-top:20px;text-align:center;">
+    <a href="/" class="btn btn-ghost btn-sm">Back to setup</a>
+  </div>
+</div>
+{% endblock %}

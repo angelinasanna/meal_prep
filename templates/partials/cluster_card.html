@@ -1,0 +1,95 @@
+{% set difficulty_class = {'Easy': 'difficulty-easy', 'Medium': 'difficulty-medium', 'Hard': 'difficulty-hard'} %}
+{% set search_query = cluster.clusterName ~ " recipe" %}
+{% set search_url = "https://www.google.com/search?q=" ~ search_query | replace(" ", "+") %}
+
+<div
+  class="cluster-card {% if cluster.accepted %}accepted{% endif %}"
+  id="cluster-{{ cluster.id }}"
+>
+  {% if cluster.accepted %}
+  <div class="cluster-accepted-bar">Added to your plan</div>
+  {% endif %}
+
+  <div class="cluster-body">
+    <div class="cluster-top">
+      <div>
+        <div class="cluster-name">{{ cluster.clusterName }}</div>
+        <div class="cluster-tagline">{{ cluster.tagline }}</div>
+      </div>
+      <a href="{{ search_url }}" target="_blank" rel="noopener" class="search-link">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        Search
+      </a>
+    </div>
+
+    <div class="cluster-meta">
+      <span class="meta-chip">{{ cluster.cookTime }}</span>
+      <span class="meta-chip {{ difficulty_class.get(cluster.difficulty, 'difficulty-easy') }}">
+        {{ cluster.difficulty }}
+      </span>
+    </div>
+
+    <div class="meals-label">Meals from this set</div>
+    <div class="meals-list">
+      {% for meal in cluster.meals %}
+      <div class="meal-item">
+        <div class="meal-dot"></div>
+        <div>
+          <div class="meal-item-name">{{ meal.name }}</div>
+          {% if meal.description %}
+          <div class="meal-item-desc">{{ meal.description }}</div>
+          {% endif %}
+          {% if meal.suggestedDay %}
+          <div class="meal-item-day">{{ meal.suggestedDay }}</div>
+          {% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <div class="ingredients-label">Ingredients</div>
+    <div class="ingredient-tags">
+      {% for ing in cluster.ingredients %}
+        {% if ing.userHas %}
+        <span class="ing-tag have">{{ ing.name }}</span>
+        {% else %}
+        <span class="ing-tag">{{ ing.amount }} {{ ing.unit }} {{ ing.name }}</span>
+        {% endif %}
+      {% endfor %}
+    </div>
+
+    {% if not cluster.accepted %}
+    <div class="cluster-actions">
+      <button
+        class="btn-accept"
+        hx-post="/toggle/{{ cluster.id }}"
+        hx-target="#cluster-{{ cluster.id }}"
+        hx-swap="outerHTML"
+        hx-on::after-request="updateAcceptedCount()"
+      >
+        Add to plan
+      </button>
+      <button
+        class="btn-skip"
+        hx-post="/toggle/{{ cluster.id }}"
+        hx-target="#cluster-{{ cluster.id }}"
+        hx-swap="outerHTML"
+        hx-on::after-request="updateAcceptedCount()"
+        onclick="this.closest('.cluster-card').classList.add('skipped')"
+      >
+        Skip
+      </button>
+    </div>
+    {% else %}
+    <button
+      class="btn-undo"
+      hx-post="/toggle/{{ cluster.id }}"
+      hx-target="#cluster-{{ cluster.id }}"
+      hx-swap="outerHTML"
+      hx-on::after-request="updateAcceptedCount()"
+    >
+      Remove from plan
+    </button>
+    {% endif %}
+  </div>
+</div>

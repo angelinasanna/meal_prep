@@ -1,0 +1,39 @@
+{% set meal_order = ['breakfast', 'lunch', 'dinner'] %}
+{% set meal_labels = {'breakfast': 'Breakfast', 'lunch': 'Lunch', 'dinner': 'Dinner'} %}
+{% set badge_class = {'breakfast': 'badge-breakfast', 'lunch': 'badge-lunch', 'dinner': 'badge-dinner'} %}
+
+{% for mt in meal_order %}
+  {% set mt_clusters = clusters | selectattr('mealType', 'equalto', mt) | list %}
+  {% if mt_clusters %}
+  <div style="margin-bottom:28px;">
+    <div class="section-header">
+      <span class="section-badge {{ badge_class[mt] }}">{{ meal_labels[mt] }}</span>
+      <span class="section-title">2 suggestions</span>
+    </div>
+    {% for cluster in mt_clusters %}
+      {% include "partials/cluster_card.html" %}
+    {% endfor %}
+  </div>
+  {% endif %}
+{% endfor %}
+
+{% set accepted_count = clusters | selectattr('accepted') | list | length %}
+
+<div style="position:sticky;bottom:0;background:rgba(244,240,232,0.94);backdrop-filter:blur(8px);border-top:1px solid var(--border);padding:14px 0;margin:0 -20px;padding-left:20px;padding-right:20px;" id="plan-cta">
+  <div style="max-width:640px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:12px;">
+    <span style="font-size:.875rem;color:var(--text-2);font-weight:600;" id="accepted-count-label">
+      {% if accepted_count == 0 %}
+        Select recipes to build your plan
+      {% elif accepted_count == 1 %}
+        1 set added
+      {% else %}
+        {{ accepted_count }} sets added
+      {% endif %}
+    </span>
+    {% if accepted_count > 0 %}
+    <a href="/plan" class="btn btn-primary">View my plan</a>
+    {% else %}
+    <button class="btn btn-primary" disabled>View my plan</button>
+    {% endif %}
+  </div>
+</div>

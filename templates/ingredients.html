@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %} · Your ingredients{% endblock %}
+
+{% block steps %}
+<div class="steps">
+  <div class="step-dot done">&#10003;</div>
+  <div class="step-line done"></div>
+  <div class="step-dot done">&#10003;</div>
+  <div class="step-line done"></div>
+  <div class="step-dot active">3</div>
+  <div class="step-line"></div>
+  <div class="step-dot">4</div>
+</div>
+{% endblock %}
+
+{% block content %}
+<div style="padding-top:12px;">
+  <h1 class="page-heading">What do you already have?</h1>
+  <p class="page-heading-sub">Add the ingredients in your fridge or pantry. We will build recipes around them and only list what is missing on your grocery list.</p>
+
+  <form action="/ingredients" method="post" class="form-card">
+
+    <label>Your ingredients</label>
+    <p style="font-size:.8125rem;color:var(--text-3);margin-bottom:10px;">
+      Type an ingredient and press <kbd>Enter</kbd> or <kbd>,</kbd> to add it.
+    </p>
+
+    <div class="tag-input-area" id="tag-input-area">
+      <div class="tag-list" id="tag-list"></div>
+      <input
+        type="text"
+        class="tag-text-input"
+        id="tag-text"
+        placeholder="chicken, rice, garlic, olive oil"
+        autocomplete="off"
+      />
+    </div>
+
+    <input type="hidden" name="ingredients" id="ingredients-hidden" value="" />
+
+    <div style="margin-top:20px;display:flex;gap:8px;justify-content:space-between;align-items:center;">
+      <a href="/mode" class="btn btn-ghost">Back</a>
+      <button type="submit" class="btn btn-primary">Get suggestions</button>
+    </div>
+  </form>
+
+  <p style="text-align:center;font-size:.8rem;color:var(--text-3);margin-top:10px;">
+    You can leave this blank and we will suggest a full shopping list.
+  </p>
+</div>
+{% endblock %}

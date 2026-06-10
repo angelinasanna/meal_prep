@@ -1,0 +1,8 @@
+<input
+  type="checkbox"
+  class="grocery-checkbox"
+  {% if checked %}checked{% endif %}
+  hx-post="/grocery/toggle/{{ key }}"
+  hx-swap="outerHTML"
+  hx-on::after-request="this.closest('.grocery-item').classList.toggle('done', this.checked)"
+/>

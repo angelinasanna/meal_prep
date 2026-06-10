@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %} · Recipe suggestions{% endblock %}
+
+{% block steps %}
+<div class="steps">
+  <div class="step-dot done">&#10003;</div>
+  <div class="step-line done"></div>
+  <div class="step-dot done">&#10003;</div>
+  <div class="step-line done"></div>
+  <div class="step-dot {% if not has_clusters %}active{% else %}done{% endif %}">
+    {% if has_clusters %}&#10003;{% else %}3{% endif %}
+  </div>
+  <div class="step-line {% if has_clusters %}done{% endif %}"></div>
+  <div class="step-dot {% if has_clusters %}active{% endif %}">4</div>
+</div>
+{% endblock %}
+
+{% block content %}
+<div style="padding-top:12px;">
+  <h1 class="page-heading">Recipe suggestions</h1>
+  <p class="page-heading-sub">
+    Each set gives you 2 or 3 meals from the same core ingredients. Less shopping, more variety.
+  </p>
+
+  <div id="suggestions-container">
+    {% if has_clusters %}
+      {% include "partials/suggestions_grid.html" %}
+    {% else %}
+      <div
+        hx-post="/generate"
+        hx-trigger="load"
+        hx-target="#suggestions-container"
+        hx-swap="innerHTML"
+      >
+        <div class="loading-state">
+          <div class="spinner"></div>
+          <div class="loading-title">Finding your recipes</div>
+          <div class="loading-subtitle">Matching ingredients across your whole week. This takes about 10 seconds.</div>
+        </div>
+      </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function updateAcceptedCount() {
+  const accepted = document.querySelectorAll('.cluster-card.accepted').length;
+  const label = document.getElementById('accepted-count-label');
+  const cta = document.getElementById('plan-cta');
+  if (!label) return;
+  if (accepted === 0) {
+    label.textContent = 'Select recipes to build your plan';
+    if (cta) {
+      const btn = cta.querySelector('a.btn-primary, button.btn-primary');
+      if (btn) { btn.outerHTML = '<button class="btn btn-primary" disabled>View my plan</button>'; }
+    }
+  } else {
+    label.textContent = accepted === 1 ? '1 set added' : `${accepted} sets added`;
+    if (cta) {
+      const btn = cta.querySelector('button[disabled]');
+      if (btn) { btn.outerHTML = '<a href="/plan" class="btn btn-primary">View my plan</a>'; }
+    }
+  }
+}
+</script>
+{% endblock %}

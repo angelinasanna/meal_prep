@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %} · My plan{% endblock %}
+
+{% block steps %}
+<div class="steps">
+  <div class="step-dot done">&#10003;</div>
+  <div class="step-line done"></div>
+  <div class="step-dot done">&#10003;</div>
+  <div class="step-line done"></div>
+  <div class="step-dot done">&#10003;</div>
+  <div class="step-line done"></div>
+  <div class="step-dot active">4</div>
+</div>
+{% endblock %}
+
+{% block content %}
+{% set meal_order = ['breakfast', 'lunch', 'dinner'] %}
+{% set meal_labels = {'breakfast': 'Breakfast', 'lunch': 'Lunch', 'dinner': 'Dinner'} %}
+{% set badge_class = {'breakfast': 'badge-breakfast', 'lunch': 'badge-lunch', 'dinner': 'badge-dinner'} %}
+
+<div style="padding-top:12px;">
+  <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:5px;">
+    <h1 class="plan-section-title">Your meal plan</h1>
+    <a href="/suggest" class="btn btn-ghost btn-sm" style="margin-top:4px;">Edit</a>
+  </div>
+  <p class="plan-subtitle">
+    {{ accepted_clusters | length }} recipe set{{ 's' if accepted_clusters | length != 1 else '' }} for the week
+  </p>
+
+  {% for mt in meal_order %}
+    {% set mt_clusters = accepted_clusters | selectattr('mealType', 'equalto', mt) | list %}
+    {% if mt_clusters %}
+    <div style="margin-bottom:24px;">
+      <div class="section-header">
+        <span class="section-badge {{ badge_class[mt] }}">{{ meal_labels[mt] }}</span>
+      </div>
+      {% for cluster in mt_clusters %}
+      <div class="plan-cluster">
+        <div class="plan-cluster-top">
+          <div class="plan-cluster-name">{{ cluster.clusterName }}</div>
+          <span style="font-size:.75rem;color:var(--text-3);">{{ cluster.cookTime }}</span>
+        </div>
+        <div class="plan-meals-grid">
+          {% for meal in cluster.meals %}
+          <div class="plan-meal-tile">
+            <div class="plan-meal-name">{{ meal.name }}</div>
+            {% if meal.suggestedDay %}
+            <div class="plan-meal-day">{{ meal.suggestedDay }}</div>
+            {% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+  {% endfor %}
+
+  <div class="grocery-section">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+      <h2 class="grocery-title">Grocery list</h2>
+      <span style="font-size:.8rem;color:var(--text-3);">{{ grocery_list | length }} items</span>
+    </div>
+    <p class="grocery-subtitle">
+      {% set checked_count = checked_items | length %}
+      {% if checked_count == 0 %}
+        Tap items as you shop to check them off.
+      {% else %}
+        {{ checked_count }} of {{ grocery_list | length }} checked.
+      {% endif %}
+    </p>
+
+    {% if grocery_list %}
+    <div class="grocery-list">
+      {% for item in grocery_list %}
+      {% set is_checked = item.key in checked_items %}
+      <div class="grocery-item {{ 'done' if is_checked else '' }}">
+        <input
+          type="checkbox"
+          class="grocery-checkbox"
+          {{ 'checked' if is_checked else '' }}
+          hx-post="/grocery/toggle/{{ item.key }}"
+          hx-swap="outerHTML"
+          hx-on::after-request="this.closest('.grocery-item').classList.toggle('done', this.checked)"
+        />
+        <span class="grocery-name">{{ item.name | capitalize }}</span>
+        <span class="grocery-amount">{{ item.amount }} {{ item.unit }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="card card-body" style="text-align:center;color:var(--text-3);font-size:.875rem;">
+      You already have everything you need.
+    </div>
+    {% endif %}
+  </div>
+
+  <div style="margin-top:36px;text-align:center;padding-bottom:16px;">
+    <a href="/reset" class="btn btn-secondary">Plan another week</a>
+  </div>
+</div>
+{% endblock %}

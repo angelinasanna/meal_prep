@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% block title %} · Setup{% endblock %}
+
+{% block content %}
+<div style="padding-top:12px;">
+
+  <form action="/setup" method="post" id="setup-form" autocomplete="off">
+
+    <!-- Step dots -->
+    <div style="display:flex;align-items:center;justify-content:center;gap:5px;margin-bottom:28px;">
+      <div class="step-dot" data-step-dot>1</div>
+      <div class="step-line"></div>
+      <div class="step-dot" data-step-dot>2</div>
+      <div class="step-line"></div>
+      <div class="step-dot" data-step-dot>3</div>
+    </div>
+
+    <!-- Step 1: Meal types -->
+    <div class="step-section form-card" id="step-0">
+      <div class="form-card-title">Which meals do you want to plan?</div>
+      <div class="form-card-subtitle">Select all that apply.</div>
+
+      <div class="meal-type-stack">
+
+        <label class="meal-type-row" id="label-breakfast">
+          <input type="checkbox" name="meal_types" value="breakfast" />
+          <div class="meal-row-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+              <circle cx="12" cy="12" r="4"/>
+              <line x1="12" y1="2" x2="12" y2="5"/>
+              <line x1="12" y1="19" x2="12" y2="22"/>
+              <line x1="4.22" y1="4.22" x2="6.34" y2="6.34"/>
+              <line x1="17.66" y1="17.66" x2="19.78" y2="19.78"/>
+              <line x1="2" y1="12" x2="5" y2="12"/>
+              <line x1="19" y1="12" x2="22" y2="12"/>
+              <line x1="4.22" y1="19.78" x2="6.34" y2="17.66"/>
+              <line x1="17.66" y1="6.34" x2="19.78" y2="4.22"/>
+            </svg>
+          </div>
+          <span class="meal-row-name">Breakfast</span>
+          <div class="meal-row-check">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="20 6 9 17 4 12"/>
+            </svg>
+          </div>
+        </label>
+
+        <label class="meal-type-row" id="label-lunch">
+          <input type="checkbox" name="meal_types" value="lunch" />
+          <div class="meal-row-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+              <path d="M3 2v7c0 1.1.9 2 2 2h4a2 2 0 002-2V2"/>
+              <line x1="7" y1="2" x2="7" y2="22"/>
+              <line x1="21" y1="15" x2="21" y2="22"/>
+              <path d="M21 2a5 5 0 00-5 5v8h5"/>
+            </svg>
+          </div>
+          <span class="meal-row-name">Lunch</span>
+          <div class="meal-row-check">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="20 6 9 17 4 12"/>
+            </svg>
+          </div>
+        </label>
+
+        <label class="meal-type-row" id="label-dinner">
+          <input type="checkbox" name="meal_types" value="dinner" checked />
+          <div class="meal-row-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+              <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
+            </svg>
+          </div>
+          <span class="meal-row-name">Dinner</span>
+          <div class="meal-row-check">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="20 6 9 17 4 12"/>
+            </svg>
+          </div>
+        </label>
+
+      </div>
+
+      <div style="margin-top:24px;text-align:right;">
+        <button type="button" class="btn btn-primary" data-next-step>Next</button>
+      </div>
+    </div>
+
+    <!-- Step 2: Servings -->
+    <div class="step-section form-card" id="step-1">
+      <div class="form-card-title">How many people are you cooking for?</div>
+      <div class="form-card-subtitle">We will scale ingredient amounts on your grocery list.</div>
+
+      <div style="display:flex;align-items:center;gap:16px;margin-top:4px;">
+        <div class="stepper">
+          <button class="stepper-btn" type="button" id="servings-dec">-</button>
+          <div class="stepper-value" id="servings-display">2</div>
+          <button class="stepper-btn" type="button" id="servings-inc">+</button>
+        </div>
+        <input type="hidden" name="servings" id="servings-hidden" value="2" />
+        <span style="font-size:.875rem;color:var(--text-3);">people per meal</span>
+      </div>
+
+      <div style="margin-top:22px;display:flex;gap:8px;justify-content:space-between;">
+        <button type="button" class="btn btn-ghost" data-prev-step>Back</button>
+        <button type="button" class="btn btn-primary" data-next-step>Next</button>
+      </div>
+    </div>
+
+    <!-- Step 3: Dietary needs -->
+    <div class="step-section form-card" id="step-2">
+      <div class="form-card-title">Any dietary needs or preferences?</div>
+      <div class="form-card-subtitle">Leave blank if none.</div>
+
+      <input
+        type="text"
+        name="dietary_needs"
+        class="input"
+        placeholder="e.g. vegetarian, gluten-free, nut allergy, low-carb"
+        autocomplete="off"
+      />
+
+      <div style="margin-top:22px;display:flex;gap:8px;justify-content:space-between;align-items:center;">
+        <button type="button" class="btn btn-ghost" data-prev-step>Back</button>
+        <button type="submit" class="btn btn-primary btn-lg">Plan my week</button>
+      </div>
+    </div>
+
+  </form>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+  // Override any browser-restored state: only dinner is selected by default
+  document.querySelectorAll('.meal-type-row').forEach(row => {
+    const cb = row.querySelector('input[type="checkbox"]');
+    if (!cb) return;
+    cb.checked = cb.value === 'dinner';
+    row.classList.toggle('checked', cb.checked);
+  });
+</script>
+{% endblock %}
