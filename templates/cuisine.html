@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %} · Your taste{% endblock %}
+
+{% block content %}
+<div style="padding-top:12px;">
+  <h1 class="page-heading">What are you craving?</h1>
+  <p class="page-heading-sub">Choose the cuisines you're in the mood for and your current season. We'll suggest meals that match your taste and what's fresh right now.</p>
+
+  <form action="/cuisine" method="post" class="form-card">
+
+    <div class="pref-section-label">Cuisines <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--text-3);font-size:.75rem;">(pick any)</span></div>
+    <div class="cuisine-grid">
+      {% for cuisine in cuisines %}
+      <label class="cuisine-chip {% if cuisine in selected_cuisines %}selected{% endif %}">
+        <input type="checkbox" name="cuisines" value="{{ cuisine }}" {% if cuisine in selected_cuisines %}checked{% endif %} />
+        <span>{{ cuisine }}</span>
+      </label>
+      {% endfor %}
+    </div>
+
+    <div class="pref-section-label" style="margin-top:28px;">Season</div>
+    <div class="season-row">
+      {% for s in seasons %}
+      <label class="season-pill {% if s == selected_season %}selected{% endif %}">
+        <input type="radio" name="season" value="{{ s }}" {% if s == selected_season %}checked{% endif %} required />
+        <span>{{ s }}</span>
+      </label>
+      {% endfor %}
+    </div>
+
+    <div style="margin-top:32px;display:flex;gap:8px;justify-content:space-between;align-items:center;">
+      <a href="/mode" class="btn btn-ghost">Back</a>
+      <button type="submit" class="btn btn-primary">Get suggestions</button>
+    </div>
+  </form>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.querySelectorAll('.cuisine-chip input').forEach(function(cb) {
+  cb.addEventListener('change', function() {
+    this.closest('.cuisine-chip').classList.toggle('selected', this.checked);
+  });
+});
+
+document.querySelectorAll('.season-pill input').forEach(function(rb) {
+  rb.addEventListener('change', function() {
+    document.querySelectorAll('.season-pill').forEach(function(pill) {
+      pill.classList.toggle('selected', pill.querySelector('input').checked);
+    });
+  });
+});
+</script>
+{% endblock %}

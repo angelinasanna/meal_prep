@@ -3,150 +3,182 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>mealprepped</title>
+  <title>Mise</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Sacramento&family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400;1,600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/css/style.css" />
   <style>
-    html, body {
-      height: 100%;
-      margin: 0;
-    }
-    .landing-page {
-      min-height: 100vh;
+    html, body { margin: 0; background: var(--bg); }
+
+    /* ── Banner ── */
+    .landing-banner {
       background: var(--green);
       display: flex;
-      flex-direction: column;
       align-items: center;
       justify-content: center;
-      padding: 48px 24px;
+      padding: clamp(40px, 8vw, 72px) 24px;
+    }
+
+    #mise-stage {
+      width: min(80vw, 520px);
+      display: block;
+    }
+
+    .mise-text {
+      fill: white;
+      fill-opacity: 0;
+      stroke: white;
+      stroke-width: 1.4;
+      stroke-linejoin: round;
+      stroke-linecap: round;
+      filter: drop-shadow(0 0 12px rgba(255,255,255,0.22));
+    }
+
+    /* ── Content below banner ── */
+    .landing-content {
       text-align: center;
-    }
-    .landing-icon-bg {
-      background: rgba(255,255,255,0.13);
-      border-radius: 24px;
-      padding: 22px;
-      display: inline-flex;
-      margin-bottom: 32px;
-    }
-    .landing-title {
-      font-size: 2.5rem;
-      font-weight: 900;
-      color: white;
-      letter-spacing: -0.05em;
-      line-height: 1.1;
-      margin-bottom: 18px;
+      padding: clamp(36px, 6vw, 60px) 24px clamp(48px, 8vw, 80px);
       max-width: 480px;
+      margin: 0 auto;
     }
-    .landing-sub {
-      font-size: 1.0625rem;
-      color: rgba(255,255,255,0.72);
-      line-height: 1.65;
-      max-width: 380px;
-      margin: 0 auto 40px;
-    }
-    .landing-sub strong {
-      color: rgba(255,255,255,0.95);
+
+    .landing-title {
+      font-family: 'Cormorant Garamond', Georgia, serif;
+      font-size: clamp(1.75rem, 5vw, 2.75rem);
       font-weight: 600;
+      font-style: italic;
+      color: var(--black);
+      line-height: 1.2;
+      margin-bottom: 14px;
+      opacity: 0;
+      transform: translateY(12px);
     }
+
+    .landing-sub {
+      font-family: 'Cormorant Garamond', Georgia, serif;
+      font-size: clamp(1rem, 2.5vw, 1.2rem);
+      color: var(--text-3);
+      line-height: 1.7;
+      margin-bottom: 32px;
+      opacity: 0;
+      transform: translateY(12px);
+    }
+
+    .landing-btns {
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      flex-wrap: wrap;
+      opacity: 0;
+      transform: translateY(12px);
+    }
+
     .btn-landing {
-      display: inline-flex;
-      align-items: center;
-      gap: 9px;
-      background: white;
-      color: var(--green);
-      font-weight: 700;
-      font-size: 1rem;
-      padding: 13px 32px;
-      border-radius: 8px;
+      display: inline-block;
+      font-family: 'Cormorant Garamond', Georgia, serif;
+      font-weight: 600;
+      font-size: 1.1rem;
+      letter-spacing: 0.03em;
+      padding: 13px 44px;
+      border-radius: 6px;
       text-decoration: none;
-      letter-spacing: -0.01em;
-      transition: 140ms ease;
-      box-shadow: 0 4px 20px rgba(0,0,0,0.18);
+      transition: background 150ms ease, transform 150ms ease, color 150ms ease;
     }
-    .btn-landing:hover {
-      background: var(--green-lt);
-      text-decoration: none;
-      color: var(--green);
+    .btn-landing-primary {
+      background: var(--green);
+      color: white;
+    }
+    .btn-landing-primary:hover {
+      background: var(--green-2);
       transform: translateY(-1px);
-      box-shadow: 0 6px 24px rgba(0,0,0,0.22);
+      text-decoration: none;
+      color: white;
     }
-    .landing-wordmark {
-      position: absolute;
-      top: 24px;
-      left: 50%;
-      transform: translateX(-50%);
-      font-weight: 800;
-      font-size: .9375rem;
-      color: rgba(255,255,255,0.55);
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
+    .btn-landing-ghost {
+      background: transparent;
+      color: var(--text-3);
+      border: 1.5px solid var(--border-dk);
+    }
+    .btn-landing-ghost:hover {
+      background: var(--border);
+      color: var(--black);
+      transform: translateY(-1px);
+      text-decoration: none;
     }
   </style>
 </head>
 <body>
-<div class="landing-page">
-  <span class="landing-wordmark">mealprepped</span>
 
-  <div class="landing-icon-bg">
-    <!-- Detailed salad bowl -->
-    <svg width="80" height="80" viewBox="0 0 56 56" fill="none" stroke="white" stroke-linecap="round" stroke-linejoin="round">
-      <!-- Bowl body -->
-      <path d="M9 27c0 11 8.5 19 19 19s19-8 19-19" stroke-width="1.75"/>
-      <!-- Rim -->
-      <line x1="7" y1="27" x2="49" y2="27" stroke-width="1.75"/>
-
-      <!-- Large left leaf -->
-      <path d="M19 27c0-9.5 3.5-14.5 7.5-14.5-1.5 6.5-4.5 12.5-7.5 14.5z"
-            stroke-width="1.5" fill="white" fill-opacity="0.18"/>
-      <!-- Vein on left leaf -->
-      <path d="M22 24c.5-3 1.5-6 3-8" stroke-width="1" opacity="0.6"/>
-
-      <!-- Right leaf -->
-      <path d="M27 27c0-8.5 4-13 8-11.5-1.5 5.5-5 10-8 11.5z"
-            stroke-width="1.5" fill="white" fill-opacity="0.13"/>
-      <!-- Vein on right leaf -->
-      <path d="M29.5 24.5c.5-2.5 2-5.5 4-7.5" stroke-width="1" opacity="0.6"/>
-
-      <!-- Small center sprig -->
-      <path d="M24.5 27c-.5-7 1.5-10.5 4.5-9.5" stroke-width="1.4"/>
-
-      <!-- Cherry tomato 1 (left) -->
-      <circle cx="16" cy="22" r="2.5" stroke-width="1.4" fill="white" fill-opacity="0.2"/>
-      <line x1="16" y1="19.5" x2="16.8" y2="17.5" stroke-width="1.1"/>
-      <line x1="16.8" y1="17.5" x2="17.5" y2="17" stroke-width="1" opacity="0.7"/>
-
-      <!-- Cherry tomato 2 (right, smaller) -->
-      <circle cx="36.5" cy="20" r="2" stroke-width="1.4" fill="white" fill-opacity="0.15"/>
-      <line x1="36.5" y1="18" x2="37" y2="16.5" stroke-width="1.1"/>
-
-      <!-- Cucumber slice -->
-      <ellipse cx="32" cy="25" rx="3" ry="1.75" stroke-width="1.3" fill="white" fill-opacity="0.1"/>
-      <line x1="32" y1="23.25" x2="32" y2="26.75" stroke-width="0.9" opacity="0.5"/>
-      <line x1="29" y1="25" x2="35" y2="25" stroke-width="0.9" opacity="0.5"/>
-
-      <!-- Fork to the right of bowl -->
-      <line x1="45" y1="12" x2="45" y2="26" stroke-width="1.5"/>
-      <line x1="43" y1="12" x2="43" y2="17" stroke-width="1.25"/>
-      <line x1="45" y1="12" x2="45" y2="17" stroke-width="1.25"/>
-      <line x1="47" y1="12" x2="47" y2="17" stroke-width="1.25"/>
-      <path d="M43 17 Q45 20.5 47 17" stroke-width="1.25" fill="none"/>
-
-      <!-- Small radish / round element at bowl rim -->
-      <circle cx="22" cy="27" r="1.25" stroke-width="1.2" fill="white" fill-opacity="0.25"/>
-    </svg>
-  </div>
-
-  <h1 class="landing-title">Plan your perfect week</h1>
-  <p class="landing-sub">
-    Smart meal suggestions that share ingredients for <strong>less shopping</strong>, <strong>less waste</strong>, and <strong>more variety</strong>.
-  </p>
-
-  <a href="/onboarding" class="btn-landing">
-    Get started
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-      <line x1="5" y1="12" x2="19" y2="12"/>
-      <polyline points="12 5 19 12 12 19"/>
-    </svg>
-  </a>
+<!-- Banner -->
+<div class="landing-banner">
+  <svg id="mise-stage" viewBox="0 0 800 240" preserveAspectRatio="xMidYMid meet">
+    <text
+      id="mise-text"
+      class="mise-text"
+      x="400"
+      y="195"
+      text-anchor="middle"
+      font-family="Sacramento, cursive"
+      font-size="210"
+    >Mise</text>
+  </svg>
 </div>
+
+<!-- Info -->
+<div class="landing-content">
+  <h1 class="landing-title" id="landing-title">Everything in its place.</h1>
+  <p class="landing-sub" id="landing-sub">Smart meal suggestions that share ingredients — less shopping, less waste, more variety.</p>
+  <div class="landing-btns" id="landing-btn">
+    {% if has_prefs %}
+      <a href="/dashboard" class="btn-landing btn-landing-primary">View my plan</a>
+      <a href="/onboarding" class="btn-landing btn-landing-ghost">Start over</a>
+    {% else %}
+      <a href="/onboarding" class="btn-landing btn-landing-primary">Get started</a>
+    {% endif %}
+  </div>
+</div>
+
+<script>
+document.fonts.ready.then(function() {
+  var textEl = document.getElementById('mise-text');
+
+  var bbox      = textEl.getBBox();
+  var strokeLen = Math.ceil((bbox.width + bbox.height) * 8);
+  textEl.style.strokeDasharray  = strokeLen;
+  textEl.style.strokeDashoffset = strokeLen;
+
+  var drawDelay    = 180;
+  var drawDuration = 1100;
+  var fillDelay    = drawDelay + drawDuration;
+  var fillDuration = 320;
+  var contentDelay = fillDelay + fillDuration + 200;
+  var stagger      = 110;
+
+  setTimeout(function() {
+    textEl.style.transition = 'stroke-dashoffset ' + drawDuration + 'ms cubic-bezier(0.3, 0, 0.6, 1)';
+    textEl.style.strokeDashoffset = '0';
+  }, drawDelay);
+
+  setTimeout(function() {
+    textEl.style.transition += ', fill-opacity ' + fillDuration + 'ms ease';
+    textEl.style.fillOpacity = '1';
+  }, fillDelay);
+
+  var els = [
+    document.getElementById('landing-title'),
+    document.getElementById('landing-sub'),
+    document.getElementById('landing-btn'),
+  ];
+
+  var fadeIn = 'opacity 550ms ease, transform 550ms cubic-bezier(0.16, 1, 0.3, 1)';
+  els.forEach(function(el, i) {
+    setTimeout(function() {
+      el.style.transition = fadeIn;
+      el.style.opacity    = '1';
+      el.style.transform  = 'translateY(0)';
+    }, contentDelay + i * stagger);
+  });
+});
+</script>
 </body>
 </html>

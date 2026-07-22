@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+{% block title %} · Dashboard{% endblock %}
+{% block extra_container_class %} container--dash{% endblock %}
+
+{% block content %}
+<div class="dashboard">
+
+  <!-- Page header -->
+  <div class="dash-header">
+    <div>
+      <h1 class="dash-title">{{ week_range }}</h1>
+      <p class="dash-subtitle">
+        {% if selected_week == current_week %}This week{% else %}Week of {{ week_range }}{% endif %}
+      </p>
+    </div>
+    {% if has_plan %}
+    <div class="dash-actions">
+      <a href="/plan" class="btn btn-secondary btn-sm">Grocery list</a>
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="dash-grid">
+
+    <!-- Left: This Week's Plan -->
+    <div class="dash-main">
+      <div class="dash-section-head">
+        <svg class="icon icon-sm" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-3);">
+          <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>
+        </svg>
+        <h2 class="dash-section-title">This Week's Plan</h2>
+        {% if selected_week == current_week %}
+          <span class="dash-week-pill">Current week</span>
+        {% endif %}
+      </div>
+
+      {% if has_plan and calendar_data %}
+        <div class="day-list">
+          {% for day in calendar_data %}
+          <div class="day-row{% if day.is_today %} day-today{% endif %}{% if day.is_past %} day-past{% endif %}" style="animation-delay:{{ loop.index0 * 55 }}ms">
+            <div class="day-row-left">
+              <span class="day-row-name">{{ day.full }}</span>
+              <span class="day-row-sub">
+                {{ day.meal_count }} meal{{ 's' if day.meal_count != 1 else '' }} planned
+              </span>
+            </div>
+            <div class="day-row-right">
+              {% if day.date_str %}
+              <button
+                class="day-status-btn {{ 'complete' if day.is_complete else 'planned' }}"
+                onclick="toggleDay(this,'{{ day.date_str }}')">
+                {{ 'Complete' if day.is_complete else 'Planned' }}
+              </button>
+              {% endif %}
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+
+        <div class="dash-plan-cta">
+          <a href="/recipes" class="btn btn-primary btn-sm">View recipes</a>
+          <a href="/plan" class="btn btn-secondary btn-sm">Grocery list</a>
+        </div>
+
+      {% elif has_plan and not calendar_data %}
+        <!-- Plan exists but no days match this week -->
+        <div class="day-list-empty">
+          <p class="day-list-empty-text">Your plan is for a different week.</p>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center;">
+            <a href="/dashboard" class="btn btn-ghost btn-sm">Go to current week</a>
+            <a href="/new-plan" class="btn btn-secondary btn-sm">Start new plan</a>
+          </div>
+        </div>
+
+      {% else %}
+        <!-- No plan yet -->
+        <div class="day-list-empty">
+          <div class="day-list-empty-icon">
+            <svg class="icon icon-lg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 5v14M5 12h14"/>
+            </svg>
+          </div>
+          <p class="day-list-empty-title">No plan yet</p>
+          <p class="day-list-empty-text">Pick your meals and build your week.</p>
+          <a href="/mode" class="btn btn-primary">Plan this week</a>
+        </div>
+      {% endif %}
+    </div>
+
+    <!-- Right: Month calendar -->
+    <div class="dash-sidebar">
+      <div class="month-cal">
+
+        <!-- Month nav header -->
+        <div class="month-cal-head">
+          <form action="/calendar-nav" method="post" style="display:contents;">
+            <input type="hidden" name="year" value="{{ prev_year }}">
+            <input type="hidden" name="month" value="{{ prev_month }}">
+            <button type="submit" class="month-cal-nav" aria-label="Previous month">
+              <svg class="icon icon-xs" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="15 18 9 12 15 6"/></svg>
+            </button>
+          </form>
+
+          <span class="month-cal-title">{{ cal_month_name }} {{ cal_year }}</span>
+
+          <form action="/calendar-nav" method="post" style="display:contents;">
+            <input type="hidden" name="year" value="{{ next_year }}">
+            <input type="hidden" name="month" value="{{ next_month }}">
+            <button type="submit" class="month-cal-nav" aria-label="Next month">
+              <svg class="icon icon-xs" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+            </button>
+          </form>
+        </div>
+
+        <!-- Day-of-week labels -->
+        <div class="month-cal-dow">
+          {% for d in ['M','T','W','T','F','S','S'] %}
+          <span>{{ d }}</span>
+          {% endfor %}
+        </div>
+
+        <!-- Week rows -->
+        {% for wk_key, wk_dates in month_weeks %}
+        <form action="/select-week" method="post">
+          <input type="hidden" name="week" value="{{ wk_key }}">
+          <input type="hidden" name="cal_year" value="{{ cal_year }}">
+          <input type="hidden" name="cal_month" value="{{ cal_month }}">
+          <button type="submit" class="month-cal-week{% if wk_key == selected_week %} selected{% endif %}">
+            {% for d in wk_dates %}
+            <span class="month-cal-day{% if d.month != cal_month %} other-month{% endif %}{% if d.isoformat() == today_str %} today{% endif %}">
+              {{ d.day }}
+            </span>
+            {% endfor %}
+          </button>
+        </form>
+        {% endfor %}
+
+      </div>
+    </div>
+
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function toggleDay(btn, dateStr) {
+  var r = document.createElement('span');
+  r.className = 'ripple-el';
+  var rect = btn.getBoundingClientRect();
+  r.style.left = (event.clientX - rect.left - 10) + 'px';
+  r.style.top  = (event.clientY - rect.top  - 10) + 'px';
+  btn.appendChild(r);
+  r.addEventListener('animationend', function() { r.remove(); });
+
+  btn.classList.add('btn-popping');
+  btn.addEventListener('animationend', function() { btn.classList.remove('btn-popping'); }, { once: true });
+
+  fetch('/day/complete/' + dateStr, { method: 'POST' })
+    .then(function(res) { return res.text(); })
+    .then(function(html) { btn.outerHTML = html; });
+}
+</script>
+{% endblock %}

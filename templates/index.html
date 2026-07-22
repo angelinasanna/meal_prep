@@ -1,95 +1,207 @@
-{% extends "base.html" %}
-{% block title %} · Setup{% endblock %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mise · Setup</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Sacramento&family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400;1,600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/css/style.css" />
+  <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
+  <style>
+    html, body { margin: 0; background: var(--bg); }
 
-{% block content %}
-<div style="padding-top:12px;">
+    /* ── Banner ── */
+    #mise-banner {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 5;
+      height: 100px;
+      background: var(--green);
+      display: flex;
+      align-items: center;
+      padding: 0 clamp(24px, 6vw, 52px);
+    }
+    #mise-banner-text {
+      font-family: 'Sacramento', cursive;
+      font-size: clamp(2.2rem, 6vw, 3rem);
+      color: white;
+      line-height: 1;
+      margin: 0;
+    }
+
+    /* ── Form ── */
+    .setup-wrap {
+      max-width: 540px;
+      margin: 0 auto;
+      padding: calc(100px + clamp(24px, 4vw, 40px)) clamp(20px, 5vw, 40px) clamp(48px, 8vw, 80px);
+    }
+    .setup-heading {
+      font-family: 'Cormorant Garamond', Georgia, serif;
+      font-size: clamp(1.3rem, 3.5vw, 1.65rem);
+      font-weight: 600;
+      font-style: italic;
+      color: var(--black);
+      margin-bottom: 24px;
+    }
+
+    /* ── Splash ── */
+    #splash {
+      position: fixed;
+      inset: 0;
+      z-index: 20;
+      background: var(--green);
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: clamp(32px, 8vw, 72px) clamp(28px, 7vw, 60px) 80px;
+      will-change: transform;
+      overflow: hidden;
+    }
+
+    #mise-stage {
+      display: block;
+      width: min(74vw, 420px);
+      overflow: visible;
+      flex-shrink: 0;
+    }
+    .mise-text {
+      fill: white;
+      fill-opacity: 0;
+      stroke: white;
+      stroke-width: 1.4;
+      stroke-linejoin: round;
+      stroke-linecap: round;
+    }
+
+    #splash-tagline {
+      font-family: 'Cormorant Garamond', Georgia, serif;
+      font-size: clamp(1.2rem, 3.5vw, 1.8rem);
+      font-weight: 600;
+      font-style: italic;
+      color: white;
+      line-height: 1.25;
+      margin: clamp(10px, 2.5vw, 20px) 0 8px;
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    #splash-sub {
+      font-family: 'Cormorant Garamond', Georgia, serif;
+      font-size: clamp(.9rem, 2.2vw, 1.1rem);
+      color: rgba(255,255,255,0.7);
+      line-height: 1.65;
+      margin: 0;
+      max-width: 400px;
+      opacity: 0;
+      transform: translateY(8px);
+    }
+
+    /* ── Scroll indicator ── */
+    #scroll-indicator {
+      position: absolute;
+      bottom: clamp(28px, 5vw, 44px);
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      opacity: 0;
+      transition: opacity 500ms ease;
+      pointer-events: none;
+    }
+    #scroll-indicator span {
+      font-family: 'Cormorant Garamond', Georgia, serif;
+      font-size: .8rem;
+      color: rgba(255,255,255,0.55);
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    #scroll-indicator svg {
+      animation: scroll-bounce 1.6s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+    }
+    @keyframes scroll-bounce {
+      0%   { transform: translateY(-4px); opacity: 0.4; }
+      50%  { transform: translateY(5px);  opacity: 1;   }
+      100% { transform: translateY(-4px); opacity: 0.4; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- Banner (z-index: 5, always beneath the splash) -->
+<header id="mise-banner">
+  <p id="mise-banner-text">Mise</p>
+</header>
+
+<!-- Form -->
+<div class="setup-wrap">
+  <h1 class="setup-heading">Let's get you set up</h1>
 
   <form action="/setup" method="post" id="setup-form" autocomplete="off">
 
-    <!-- Step dots -->
-    <div style="display:flex;align-items:center;justify-content:center;gap:5px;margin-bottom:28px;">
+    <div style="display:flex;align-items:center;gap:5px;margin-bottom:24px;">
       <div class="step-dot" data-step-dot>1</div>
       <div class="step-line"></div>
       <div class="step-dot" data-step-dot>2</div>
       <div class="step-line"></div>
       <div class="step-dot" data-step-dot>3</div>
+      <div class="step-line"></div>
+      <div class="step-dot" data-step-dot>4</div>
+      <div class="step-line"></div>
+      <div class="step-dot" data-step-dot>5</div>
     </div>
 
-    <!-- Step 1: Meal types -->
+    <!-- Step 1 -->
     <div class="step-section form-card" id="step-0">
       <div class="form-card-title">Which meals do you want to plan?</div>
       <div class="form-card-subtitle">Select all that apply.</div>
-
       <div class="meal-type-stack">
-
         <label class="meal-type-row" id="label-breakfast">
           <input type="checkbox" name="meal_types" value="breakfast" />
           <div class="meal-row-icon">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+            <svg class="icon icon-md" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
               <circle cx="12" cy="12" r="4"/>
-              <line x1="12" y1="2" x2="12" y2="5"/>
-              <line x1="12" y1="19" x2="12" y2="22"/>
-              <line x1="4.22" y1="4.22" x2="6.34" y2="6.34"/>
-              <line x1="17.66" y1="17.66" x2="19.78" y2="19.78"/>
-              <line x1="2" y1="12" x2="5" y2="12"/>
-              <line x1="19" y1="12" x2="22" y2="12"/>
-              <line x1="4.22" y1="19.78" x2="6.34" y2="17.66"/>
-              <line x1="17.66" y1="6.34" x2="19.78" y2="4.22"/>
+              <line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/>
+              <line x1="4.22" y1="4.22" x2="6.34" y2="6.34"/><line x1="17.66" y1="17.66" x2="19.78" y2="19.78"/>
+              <line x1="2" y1="12" x2="5" y2="12"/><line x1="19" y1="12" x2="22" y2="12"/>
+              <line x1="4.22" y1="19.78" x2="6.34" y2="17.66"/><line x1="17.66" y1="6.34" x2="19.78" y2="4.22"/>
             </svg>
           </div>
           <span class="meal-row-name">Breakfast</span>
-          <div class="meal-row-check">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="20 6 9 17 4 12"/>
-            </svg>
-          </div>
+          <div class="meal-row-check"><svg class="icon icon-xs" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
         </label>
-
         <label class="meal-type-row" id="label-lunch">
           <input type="checkbox" name="meal_types" value="lunch" />
           <div class="meal-row-icon">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
-              <path d="M3 2v7c0 1.1.9 2 2 2h4a2 2 0 002-2V2"/>
-              <line x1="7" y1="2" x2="7" y2="22"/>
-              <line x1="21" y1="15" x2="21" y2="22"/>
-              <path d="M21 2a5 5 0 00-5 5v8h5"/>
+            <svg class="icon icon-md" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+              <path d="M3 2v7c0 1.1.9 2 2 2h4a2 2 0 002-2V2"/><line x1="7" y1="2" x2="7" y2="22"/>
+              <line x1="21" y1="15" x2="21" y2="22"/><path d="M21 2a5 5 0 00-5 5v8h5"/>
             </svg>
           </div>
           <span class="meal-row-name">Lunch</span>
-          <div class="meal-row-check">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="20 6 9 17 4 12"/>
-            </svg>
-          </div>
+          <div class="meal-row-check"><svg class="icon icon-xs" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
         </label>
-
         <label class="meal-type-row" id="label-dinner">
-          <input type="checkbox" name="meal_types" value="dinner" checked />
+          <input type="checkbox" name="meal_types" value="dinner" />
           <div class="meal-row-icon">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+            <svg class="icon icon-md" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
               <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
             </svg>
           </div>
           <span class="meal-row-name">Dinner</span>
-          <div class="meal-row-check">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="20 6 9 17 4 12"/>
-            </svg>
-          </div>
+          <div class="meal-row-check"><svg class="icon icon-xs" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
         </label>
-
       </div>
-
-      <div style="margin-top:24px;text-align:right;">
+      <div style="margin-top:22px;text-align:right;">
         <button type="button" class="btn btn-primary" data-next-step>Next</button>
       </div>
     </div>
 
-    <!-- Step 2: Servings -->
+    <!-- Step 2 -->
     <div class="step-section form-card" id="step-1">
       <div class="form-card-title">How many people are you cooking for?</div>
       <div class="form-card-subtitle">We will scale ingredient amounts on your grocery list.</div>
-
       <div style="display:flex;align-items:center;gap:16px;margin-top:4px;">
         <div class="stepper">
           <button class="stepper-btn" type="button" id="servings-dec">-</button>
@@ -99,26 +211,54 @@
         <input type="hidden" name="servings" id="servings-hidden" value="2" />
         <span style="font-size:.875rem;color:var(--text-3);">people per meal</span>
       </div>
-
       <div style="margin-top:22px;display:flex;gap:8px;justify-content:space-between;">
         <button type="button" class="btn btn-ghost" data-prev-step>Back</button>
         <button type="button" class="btn btn-primary" data-next-step>Next</button>
       </div>
     </div>
 
-    <!-- Step 3: Dietary needs -->
+    <!-- Step 3 -->
     <div class="step-section form-card" id="step-2">
       <div class="form-card-title">Any dietary needs or preferences?</div>
       <div class="form-card-subtitle">Leave blank if none.</div>
+      <input type="text" name="dietary_needs" class="input"
+        placeholder="e.g. vegetarian, gluten-free, nut allergy, low-carb" autocomplete="off" />
+      <div style="margin-top:22px;display:flex;gap:8px;justify-content:space-between;align-items:center;">
+        <button type="button" class="btn btn-ghost" data-prev-step>Back</button>
+        <button type="button" class="btn btn-primary" data-next-step>Next</button>
+      </div>
+    </div>
 
-      <input
-        type="text"
-        name="dietary_needs"
-        class="input"
-        placeholder="e.g. vegetarian, gluten-free, nut allergy, low-carb"
-        autocomplete="off"
-      />
+    <!-- Step 4 -->
+    <div class="step-section form-card" id="step-3">
+      <div class="form-card-title">How adventurous are you?</div>
+      <div class="form-card-subtitle">This shapes the variety of flavors and ingredients we suggest.</div>
+      <div class="adventure-slider-wrap">
+        <input type="range" min="0" max="2" value="1" class="adventure-slider" id="adventure-slider" />
+        <div class="adventure-ticks" id="adventure-ticks">
+          <span>Familiar</span><span>Curious</span><span>Bold</span>
+        </div>
+        <input type="hidden" name="adventure_level" id="adventure-level-hidden" value="curious" />
+      </div>
+      <div style="margin-top:22px;display:flex;gap:8px;justify-content:space-between;">
+        <button type="button" class="btn btn-ghost" data-prev-step>Back</button>
+        <button type="button" class="btn btn-primary" data-next-step>Next</button>
+      </div>
+    </div>
 
+    <!-- Step 5 -->
+    <div class="step-section form-card" id="step-4">
+      <div class="form-card-title">Which days are you meal prepping?</div>
+      <div class="form-card-subtitle">Select the days that you are planning to cook.</div>
+      <div class="day-picker" style="margin-top:12px;">
+        <label class="day-chip"><input type="checkbox" name="meal_prep_days" value="Mon" checked /><span>Mon</span></label>
+        <label class="day-chip"><input type="checkbox" name="meal_prep_days" value="Tue" checked /><span>Tue</span></label>
+        <label class="day-chip"><input type="checkbox" name="meal_prep_days" value="Wed" checked /><span>Wed</span></label>
+        <label class="day-chip"><input type="checkbox" name="meal_prep_days" value="Thu" checked /><span>Thu</span></label>
+        <label class="day-chip"><input type="checkbox" name="meal_prep_days" value="Fri" checked /><span>Fri</span></label>
+        <label class="day-chip"><input type="checkbox" name="meal_prep_days" value="Sat" /><span>Sat</span></label>
+        <label class="day-chip"><input type="checkbox" name="meal_prep_days" value="Sun" /><span>Sun</span></label>
+      </div>
       <div style="margin-top:22px;display:flex;gap:8px;justify-content:space-between;align-items:center;">
         <button type="button" class="btn btn-ghost" data-prev-step>Back</button>
         <button type="submit" class="btn btn-primary btn-lg">Plan my week</button>
@@ -127,16 +267,147 @@
 
   </form>
 </div>
-{% endblock %}
 
-{% block extra_js %}
+<!-- Splash overlay -->
+<div id="splash">
+  <svg id="mise-stage" viewBox="0 0 500 160" preserveAspectRatio="xMinYMid meet">
+    <text id="mise-text" class="mise-text" x="8" y="138"
+      text-anchor="start" font-family="Sacramento, cursive" font-size="150">Mise</text>
+  </svg>
+  <h1 id="splash-tagline">Everything in its place.</h1>
+  <p id="splash-sub">Smart meal suggestions that share ingredients — less shopping, less waste, more variety.</p>
+
+  <!-- Scroll down indicator -->
+  <div id="scroll-indicator">
+    <span>scroll</span>
+    <svg class="icon icon-md" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="12" y1="5" x2="12" y2="19"/>
+      <polyline points="19 12 12 19 5 12"/>
+    </svg>
+  </div>
+</div>
+
+<script src="/static/js/main.js"></script>
 <script>
-  // Override any browser-restored state: only dinner is selected by default
-  document.querySelectorAll('.meal-type-row').forEach(row => {
-    const cb = row.querySelector('input[type="checkbox"]');
-    if (!cb) return;
-    cb.checked = cb.value === 'dinner';
-    row.classList.toggle('checked', cb.checked);
+document.fonts.ready.then(function() {
+  var textEl    = document.getElementById('mise-text');
+  var splash    = document.getElementById('splash');
+  var tagline   = document.getElementById('splash-tagline');
+  var sub       = document.getElementById('splash-sub');
+  var indicator = document.getElementById('scroll-indicator');
+  var miseStage = document.getElementById('mise-stage');
+
+  var bbox      = textEl.getBBox();
+  var strokeLen = Math.ceil((bbox.width + bbox.height) * 8);
+  textEl.style.strokeDasharray  = strokeLen;
+  textEl.style.strokeDashoffset = strokeLen;
+
+  var drawDelay    = 120;
+  var drawDuration = 950;
+  var fillDelay    = drawDelay + drawDuration;
+  var fillDuration = 260;
+  var infoDelay    = fillDelay + fillDuration + 80;
+  var stagger      = 100;
+  // show scroll indicator after info has faded in
+  var indicatorDelay = infoDelay + stagger + 500;
+
+  var bannerH  = 100;
+  var fadeDur  = 300;
+  var slideDur = 1000; // slower, smoother
+
+  // Draw
+  setTimeout(function() {
+    textEl.style.transition = 'stroke-dashoffset ' + drawDuration + 'ms cubic-bezier(0.3,0,0.6,1)';
+    textEl.style.strokeDashoffset = '0';
+  }, drawDelay);
+
+  // Fill
+  setTimeout(function() {
+    textEl.style.transition += ', fill-opacity ' + fillDuration + 'ms ease';
+    textEl.style.fillOpacity = '1';
+  }, fillDelay);
+
+  // Info fade in
+  var fadeInStyle = 'opacity 450ms ease, transform 450ms cubic-bezier(0.16,1,0.3,1)';
+  [tagline, sub].forEach(function(el, i) {
+    setTimeout(function() {
+      el.style.transition = fadeInStyle;
+      el.style.opacity    = '1';
+      el.style.transform  = 'translateY(0)';
+    }, infoDelay + i * stagger);
   });
+
+  // Show scroll indicator
+  setTimeout(function() {
+    indicator.style.opacity = '1';
+  }, indicatorDelay);
+
+  // Slide trigger — fires once on scroll or swipe down
+  var triggered = false;
+  function triggerSlide() {
+    if (triggered) return;
+    triggered = true;
+
+    // Hide indicator and splash content
+    indicator.style.opacity = '0';
+    [tagline, sub, miseStage].forEach(function(el) {
+      el.style.transition = 'opacity ' + fadeDur + 'ms ease';
+      el.style.opacity    = '0';
+    });
+
+    // Slide splash up after content fades enough
+    setTimeout(function() {
+      var vh = window.innerHeight;
+      splash.style.transition = 'transform ' + slideDur + 'ms cubic-bezier(0.25, 1, 0.35, 1)';
+      splash.style.transform  = 'translateY(-' + (vh - bannerH) + 'px)';
+      splash.addEventListener('transitionend', function() {
+        splash.style.display = 'none';
+      }, { once: true });
+    }, 120);
+  }
+
+  // Mouse wheel (desktop)
+  window.addEventListener('wheel', function(e) {
+    if (e.deltaY > 0) triggerSlide();
+  }, { passive: true, once: true });
+
+  // Touch swipe up (mobile)
+  var touchY = 0;
+  window.addEventListener('touchstart', function(e) {
+    touchY = e.touches[0].clientY;
+  }, { passive: true });
+  window.addEventListener('touchmove', function(e) {
+    if (!triggered && e.touches[0].clientY < touchY - 20) triggerSlide();
+  }, { passive: true });
+});
+
+document.querySelectorAll('.meal-type-row').forEach(function(row) {
+  var cb = row.querySelector('input[type="checkbox"]');
+  if (!cb) return;
+  cb.checked = false;
+  row.classList.remove('checked');
+});
+
+(function() {
+  var LEVELS = ['familiar', 'curious', 'bold'];
+  var slider = document.getElementById('adventure-slider');
+  var ticks  = document.querySelectorAll('#adventure-ticks span');
+  var hidden = document.getElementById('adventure-level-hidden');
+  if (!slider) return;
+  function update() {
+    var i   = parseInt(slider.value);
+    var pct = (i / 2) * 100;
+    slider.style.background =
+      'linear-gradient(to right, var(--green) 0%, var(--green) ' + pct + '%, var(--border-dk) ' + pct + '%, var(--border-dk) 100%)';
+    hidden.value = LEVELS[i];
+    ticks.forEach(function(t, idx) {
+      t.style.fontWeight = idx === i ? '700' : '400';
+      t.style.color      = idx === i ? 'var(--black)' : 'var(--text-3)';
+    });
+  }
+  slider.addEventListener('input', update);
+  update();
+})();
 </script>
-{% endblock %}
+</body>
+</html>

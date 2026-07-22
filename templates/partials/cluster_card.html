@@ -1,13 +1,18 @@
-{% set difficulty_class = {'Easy': 'difficulty-easy', 'Medium': 'difficulty-medium', 'Hard': 'difficulty-hard'} %}
+{% set difficulty_colors = {'Easy': 'difficulty-easy', 'Medium': 'difficulty-medium', 'Hard': 'difficulty-hard'} %}
+{% set diff_class = difficulty_colors[cluster.difficulty] if cluster.difficulty in difficulty_colors else 'difficulty-easy' %}
 {% set search_query = cluster.clusterName ~ " recipe" %}
 {% set search_url = "https://www.google.com/search?q=" ~ search_query | replace(" ", "+") %}
 
 <div
   class="cluster-card {% if cluster.accepted %}accepted{% endif %}"
   id="cluster-{{ cluster.id }}"
+  data-meal-type="{{ cluster.mealType }}"
 >
   {% if cluster.accepted %}
-  <div class="cluster-accepted-bar">Added to your plan</div>
+  <div class="cluster-accepted-bar">
+    <svg class="icon icon-xs" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="display:inline;vertical-align:middle;margin-right:5px;"><polyline points="20 6 9 17 4 12"/></svg>
+    Added to your plan
+  </div>
   {% endif %}
 
   <div class="cluster-body">
@@ -17,16 +22,9 @@
         <div class="cluster-tagline">{{ cluster.tagline }}</div>
       </div>
       <a href="{{ search_url }}" target="_blank" rel="noopener" class="search-link">
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <svg class="icon icon-xs" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
         Search
       </a>
-    </div>
-
-    <div class="cluster-meta">
-      <span class="meta-chip">{{ cluster.cookTime }}</span>
-      <span class="meta-chip {{ difficulty_class.get(cluster.difficulty, 'difficulty-easy') }}">
-        {{ cluster.difficulty }}
-      </span>
     </div>
 
     <div class="meals-label">Meals from this set</div>
@@ -39,9 +37,6 @@
           {% if meal.description %}
           <div class="meal-item-desc">{{ meal.description }}</div>
           {% endif %}
-          {% if meal.suggestedDay %}
-          <div class="meal-item-day">{{ meal.suggestedDay }}</div>
-          {% endif %}
         </div>
       </div>
       {% endfor %}
@@ -50,7 +45,7 @@
     <div class="ingredients-label">Ingredients</div>
     <div class="ingredient-tags">
       {% for ing in cluster.ingredients %}
-        {% if ing.userHas %}
+        {% if ing.userHas and mode == 'existing' %}
         <span class="ing-tag have">{{ ing.name }}</span>
         {% else %}
         <span class="ing-tag">{{ ing.amount }} {{ ing.unit }} {{ ing.name }}</span>
@@ -65,19 +60,16 @@
         hx-post="/toggle/{{ cluster.id }}"
         hx-target="#cluster-{{ cluster.id }}"
         hx-swap="outerHTML"
-        hx-on::after-request="updateAcceptedCount()"
       >
         Add to plan
       </button>
       <button
         class="btn-skip"
-        hx-post="/toggle/{{ cluster.id }}"
+        hx-post="/skip/{{ cluster.id }}"
         hx-target="#cluster-{{ cluster.id }}"
         hx-swap="outerHTML"
-        hx-on::after-request="updateAcceptedCount()"
-        onclick="this.closest('.cluster-card').classList.add('skipped')"
       >
-        Skip
+        Try another
       </button>
     </div>
     {% else %}
@@ -86,7 +78,6 @@
       hx-post="/toggle/{{ cluster.id }}"
       hx-target="#cluster-{{ cluster.id }}"
       hx-swap="outerHTML"
-      hx-on::after-request="updateAcceptedCount()"
     >
       Remove from plan
     </button>

@@ -1,68 +1,216 @@
 {% extends "base.html" %}
 {% block title %} · Recipe suggestions{% endblock %}
 
-{% block steps %}
-<div class="steps">
-  <div class="step-dot done">&#10003;</div>
-  <div class="step-line done"></div>
-  <div class="step-dot done">&#10003;</div>
-  <div class="step-line done"></div>
-  <div class="step-dot {% if not has_clusters %}active{% else %}done{% endif %}">
-    {% if has_clusters %}&#10003;{% else %}3{% endif %}
-  </div>
-  <div class="step-line {% if has_clusters %}done{% endif %}"></div>
-  <div class="step-dot {% if has_clusters %}active{% endif %}">4</div>
-</div>
-{% endblock %}
+{% set meal_order = ['breakfast', 'lunch', 'dinner'] %}
+{% set meal_labels = {'breakfast': 'Breakfast', 'lunch': 'Lunch', 'dinner': 'Dinner'} %}
+{% set badge_class = {'breakfast': 'badge-breakfast', 'lunch': 'badge-lunch', 'dinner': 'badge-dinner'} %}
 
 {% block content %}
 <div style="padding-top:12px;">
   <h1 class="page-heading">Recipe suggestions</h1>
-  <p class="page-heading-sub">
-    Each set gives you 2 or 3 meals from the same core ingredients. Less shopping, more variety.
-  </p>
+  <p class="page-heading-sub">Each set gives you 2–3 meals from the same core ingredients. Select 2 sets per meal to build your week.</p>
 
-  <div id="suggestions-container">
-    {% if has_clusters %}
-      {% include "partials/suggestions_grid.html" %}
-    {% else %}
-      <div
-        hx-post="/generate"
-        hx-trigger="load"
-        hx-target="#suggestions-container"
-        hx-swap="innerHTML"
-      >
-        <div class="loading-state">
-          <div class="spinner"></div>
-          <div class="loading-title">Finding your recipes</div>
-          <div class="loading-subtitle">Matching ingredients across your whole week. This takes about 10 seconds.</div>
-        </div>
+  <div id="suggestions-container" data-meal-types="{{ meal_types | join(',') }}" data-mode="{{ mode }}">
+
+    <!-- Single loading screen — hidden once all sections are ready -->
+    <div id="suggest-loading" style="text-align:center;padding:72px 24px 40px;">
+      <div class="spinner" style="margin:0 auto 22px;"></div>
+      <p id="suggest-loading-text" style="font-size:1rem;font-weight:500;color:var(--text-2);">Finding ideas…</p>
+    </div>
+
+    <!-- All sections revealed at once when loading finishes -->
+    <div id="sections-wrapper" style="display:none;opacity:0;">
+      {% for mt in meal_order %}
+      {% if mt in meal_types %}
+      <div id="mt-section-{{ mt }}" style="margin-bottom:28px;">
+        {% if has_clusters_by_mt.get(mt) %}
+          {% set mt_clusters = clusters | selectattr('mealType', 'equalto', mt) | rejectattr('reserve') | rejectattr('skipped') | list %}
+          <div class="section-header">
+            <span class="section-badge {{ badge_class[mt] }}">{{ meal_labels[mt] }}</span>
+            <span class="section-title">{{ mt_clusters | length }} suggestion{{ 's' if mt_clusters | length != 1 }}</span>
+          </div>
+          {% for cluster in mt_clusters %}
+            {% include "partials/cluster_card.html" %}
+          {% endfor %}
+        {% endif %}
       </div>
-    {% endif %}
+      {% endif %}
+      {% endfor %}
+    </div>
+
+    <!-- Sticky CTA bar -->
+    {% set total_needed = meal_types | length * sets_per_type %}
+    <div style="position:sticky;bottom:0;background:rgba(244,240,232,0.94);backdrop-filter:blur(8px);border-top:1px solid var(--border);padding:14px 0;margin:0 -20px;padding-left:20px;padding-right:20px;" id="plan-cta">
+      <div style="max-width:680px;margin:0 auto;position:relative;display:flex;align-items:center;justify-content:space-between;">
+
+        {% if mode == 'existing' %}
+        <a href="/ingredients" class="btn btn-ghost btn-sm">Edit ingredients</a>
+        {% else %}
+        <a href="/cuisine" class="btn btn-ghost btn-sm">Edit preferences</a>
+        {% endif %}
+
+        <span id="accepted-count-label"
+          style="position:absolute;left:50%;transform:translateX(-50%);font-size:.875rem;color:var(--text-2);font-weight:500;white-space:nowrap;pointer-events:none;visibility:hidden;">
+          {{ total_needed }} sets still needed
+        </span>
+
+        {% if can_view_plan %}
+        <a id="plan-cta-btn" href="/plan" class="btn btn-primary">View my plan</a>
+        {% else %}
+        <button id="plan-cta-btn" class="btn btn-primary" disabled>View my plan</button>
+        {% endif %}
+
+      </div>
+    </div>
+
   </div>
 </div>
 {% endblock %}
 
 {% block extra_js %}
 <script>
-function updateAcceptedCount() {
-  const accepted = document.querySelectorAll('.cluster-card.accepted').length;
-  const label = document.getElementById('accepted-count-label');
-  const cta = document.getElementById('plan-cta');
-  if (!label) return;
-  if (accepted === 0) {
-    label.textContent = 'Select recipes to build your plan';
-    if (cta) {
-      const btn = cta.querySelector('a.btn-primary, button.btn-primary');
-      if (btn) { btn.outerHTML = '<button class="btn btn-primary" disabled>View my plan</button>'; }
-    }
-  } else {
-    label.textContent = accepted === 1 ? '1 set added' : `${accepted} sets added`;
-    if (cta) {
-      const btn = cta.querySelector('button[disabled]');
-      if (btn) { btn.outerHTML = '<a href="/plan" class="btn btn-primary">View my plan</a>'; }
+(function() {
+  var MEAL_ORDER = ['breakfast', 'lunch', 'dinner'];
+  var container  = document.getElementById('suggestions-container');
+  var mealTypes  = (container.getAttribute('data-meal-types') || '').split(',').filter(Boolean);
+
+  var LABELS = {breakfast: 'Breakfast', lunch: 'Lunch', dinner: 'Dinner'};
+  var SETS_PER_TYPE = {{ sets_per_type }};
+  var mealTypeOrder = MEAL_ORDER.filter(function(mt) { return mealTypes.indexOf(mt) !== -1; });
+  var settledSet = {};
+
+  function isSectionLoaded(mt) {
+    var el = document.getElementById('mt-section-' + mt);
+    return el && el.querySelector('.section-header') !== null;
+  }
+
+  function allSectionsSettled() {
+    return mealTypeOrder.every(function(mt) { return settledSet[mt]; });
+  }
+
+  function updateLoadingText() {
+    var textEl = document.getElementById('suggest-loading-text');
+    if (!textEl) return;
+    for (var i = 0; i < mealTypeOrder.length; i++) {
+      var mt = mealTypeOrder[i];
+      if (!settledSet[mt]) {
+        textEl.textContent = 'Finding ' + LABELS[mt] + ' ideas…';
+        return;
+      }
     }
   }
-}
+
+  function revealContent() {
+    var loadingEl = document.getElementById('suggest-loading');
+    var wrapper   = document.getElementById('sections-wrapper');
+    if (loadingEl) loadingEl.style.display = 'none';
+    if (wrapper) {
+      wrapper.style.display = '';
+      // Fade in
+      requestAnimationFrame(function() {
+        requestAnimationFrame(function() {
+          wrapper.style.transition = 'opacity 0.35s ease';
+          wrapper.style.opacity = '1';
+        });
+      });
+    }
+    showCountLabel();
+    updateAcceptedCount();
+  }
+
+  function showCountLabel() {
+    var label = document.getElementById('accepted-count-label');
+    if (label) label.style.visibility = 'visible';
+  }
+
+  function updateAcceptedCount() {
+    var counts = {};
+    mealTypes.forEach(function(mt) { counts[mt] = 0; });
+    document.querySelectorAll('.cluster-card.accepted').forEach(function(card) {
+      var mt = card.getAttribute('data-meal-type');
+      if (mt && counts.hasOwnProperty(mt)) counts[mt]++;
+    });
+
+    var needed = 0;
+    mealTypes.forEach(function(mt) { needed += Math.max(0, SETS_PER_TYPE - (counts[mt] || 0)); });
+    var totalNeeded = mealTypes.length * SETS_PER_TYPE;
+    var allMet = mealTypes.length === 0
+      ? document.querySelectorAll('.cluster-card.accepted').length > 0
+      : needed === 0;
+
+    var label   = document.getElementById('accepted-count-label');
+    var planBtn = document.getElementById('plan-cta-btn');
+    if (!label) return;
+
+    if (allMet) {
+      label.textContent = totalNeeded + ' of ' + totalNeeded + ' sets selected';
+      if (planBtn && planBtn.tagName === 'BUTTON') {
+        planBtn.outerHTML = '<a id="plan-cta-btn" href="/plan" class="btn btn-primary">View my plan</a>';
+      }
+    } else {
+      label.textContent = needed + (needed === 1 ? ' set' : ' sets') + ' still needed';
+      if (planBtn && planBtn.tagName === 'A') {
+        planBtn.outerHTML = '<button id="plan-cta-btn" class="btn btn-primary" disabled>View my plan</button>';
+      }
+    }
+  }
+
+  // Use fetch() for initial section loading — more reliable than htmx.ajax()
+  function loadSection(mt) {
+    var section = document.getElementById('mt-section-' + mt);
+    if (!section) { markSettled(mt); return; }
+
+    fetch('/generate/' + mt, {method: 'POST', credentials: 'same-origin'})
+      .then(function(resp) { return resp.text(); })
+      .then(function(html) {
+        section.innerHTML = html;
+        if (typeof htmx !== 'undefined') htmx.process(section);
+      })
+      .catch(function() {
+        section.innerHTML = '<p style="padding:12px;color:var(--text-3);">Could not load suggestions. Try refreshing.</p>';
+      })
+      .finally(function() {
+        markSettled(mt);
+      });
+  }
+
+  function markSettled(mt) {
+    settledSet[mt] = true;
+    updateLoadingText();
+    if (allSectionsSettled()) revealContent();
+  }
+
+  // Update count after any HTMX interaction (toggle, skip).
+  // Must use htmx:afterSettle, not htmx:afterSwap — htmx temporarily copies the
+  // old element's attributes (including class) onto the new element during the swap,
+  // so the "accepted" class isn't present until afterSettle fires (~20ms later).
+  document.addEventListener('htmx:afterSettle', function() { updateAcceptedCount(); });
+
+  // Disable action buttons while their request is in flight to prevent double-clicks
+  document.addEventListener('htmx:beforeRequest', function(evt) {
+    var elt = evt.detail && evt.detail.elt;
+    if (elt && (elt.classList.contains('btn-accept') || elt.classList.contains('btn-skip') || elt.classList.contains('btn-undo'))) {
+      elt.disabled = true;
+    }
+  });
+  document.addEventListener('htmx:afterRequest', function(evt) {
+    var elt = evt.detail && evt.detail.elt;
+    if (elt) elt.disabled = false;
+  });
+
+  document.addEventListener('DOMContentLoaded', function() {
+    updateLoadingText();
+
+    mealTypeOrder.forEach(function(mt) {
+      if (isSectionLoaded(mt)) {
+        settledSet[mt] = true;
+        return;
+      }
+      loadSection(mt);
+    });
+
+    if (allSectionsSettled()) revealContent();
+  });
+})();
 </script>
 {% endblock %}

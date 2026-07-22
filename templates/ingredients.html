@@ -1,51 +1,106 @@
 {% extends "base.html" %}
 {% block title %} · Your ingredients{% endblock %}
 
-{% block steps %}
-<div class="steps">
-  <div class="step-dot done">&#10003;</div>
-  <div class="step-line done"></div>
-  <div class="step-dot done">&#10003;</div>
-  <div class="step-line done"></div>
-  <div class="step-dot active">3</div>
-  <div class="step-line"></div>
-  <div class="step-dot">4</div>
-</div>
-{% endblock %}
-
 {% block content %}
 <div style="padding-top:12px;">
   <h1 class="page-heading">What do you already have?</h1>
-  <p class="page-heading-sub">Add the ingredients in your fridge or pantry. We will build recipes around them and only list what is missing on your grocery list.</p>
+  <p class="page-heading-sub">List what's in your fridge or pantry and roughly how much you have — estimates are fine (e.g. "about half a bag", "1/4 lb", "a few cups"). We'll build recipes around what you have and only list what's still missing on your grocery list.</p>
 
-  <form action="/ingredients" method="post" class="form-card">
+  <form action="/ingredients" method="post" class="form-card" id="ing-form">
 
-    <label>Your ingredients</label>
-    <p style="font-size:.8125rem;color:var(--text-3);margin-bottom:10px;">
-      Type an ingredient and press <kbd>Enter</kbd> or <kbd>,</kbd> to add it.
-    </p>
-
-    <div class="tag-input-area" id="tag-input-area">
-      <div class="tag-list" id="tag-list"></div>
-      <input
-        type="text"
-        class="tag-text-input"
-        id="tag-text"
-        placeholder="chicken, rice, garlic, olive oil"
-        autocomplete="off"
-      />
+    <div class="ing-form-header">
+      <span class="ing-col-label">Ingredient</span>
+      <span class="ing-col-label">How much you have</span>
+      <span></span>
     </div>
 
-    <input type="hidden" name="ingredients" id="ingredients-hidden" value="" />
+    <div id="ing-rows">
+      {% if existing_ingredients %}
+        {% for ing in existing_ingredients %}
+        <div class="ing-form-row">
+          <input type="text" name="ing_name" value="{{ ing.name }}" class="input" autocomplete="off" />
+          <input type="text" name="ing_amount" value="{{ ing.amount }}" class="input" autocomplete="off" />
+          <button type="button" class="ing-remove-btn" onclick="removeIngRow(this)" aria-label="Remove">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        {% endfor %}
+      {% else %}
+      <div class="ing-form-row">
+        <input type="text" name="ing_name" placeholder="e.g. chicken breast" class="input" autocomplete="off" />
+        <input type="text" name="ing_amount" placeholder="e.g. 2 lbs" class="input" autocomplete="off" />
+        <button type="button" class="ing-remove-btn" onclick="removeIngRow(this)" aria-label="Remove">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      {% endif %}
+    </div>
 
-    <div style="margin-top:20px;display:flex;gap:8px;justify-content:space-between;align-items:center;">
+    <button type="button" id="add-ing-row" class="btn btn-ghost btn-sm" style="margin-top:10px;">+ Add another ingredient</button>
+
+    <p id="ing-error" style="display:none;color:#c0392b;font-size:.8125rem;margin-top:10px;">
+      Please add at least one ingredient with an amount.
+    </p>
+
+    <div style="margin-top:24px;display:flex;gap:8px;justify-content:space-between;align-items:center;">
       <a href="/mode" class="btn btn-ghost">Back</a>
       <button type="submit" class="btn btn-primary">Get suggestions</button>
     </div>
   </form>
-
-  <p style="text-align:center;font-size:.8rem;color:var(--text-3);margin-top:10px;">
-    You can leave this blank and we will suggest a full shopping list.
-  </p>
 </div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+var ING_EXAMPLES = [
+  {name: 'e.g. olive oil',       amount: 'e.g. half a bottle'},
+  {name: 'e.g. garlic',          amount: 'e.g. 1 head'},
+  {name: 'e.g. pasta',           amount: 'e.g. 500g'},
+  {name: 'e.g. cherry tomatoes', amount: 'e.g. 1 pint'},
+  {name: 'e.g. eggs',            amount: 'e.g. 6'},
+  {name: 'e.g. canned beans',    amount: 'e.g. 2 cans'},
+  {name: 'e.g. spinach',         amount: 'e.g. 5 oz bag'},
+  {name: 'e.g. rice',            amount: 'e.g. 2 cups'},
+  {name: 'e.g. onion',           amount: 'e.g. 2 large'},
+  {name: 'e.g. butter',          amount: 'e.g. 1 stick'},
+];
+
+var rowCount = document.querySelectorAll('#ing-rows .ing-form-row').length;
+
+document.getElementById('add-ing-row').addEventListener('click', function() {
+  var ex = ING_EXAMPLES[(rowCount - 1) % ING_EXAMPLES.length];
+  rowCount++;
+  var row = document.createElement('div');
+  row.className = 'ing-form-row';
+  row.innerHTML =
+    '<input type="text" name="ing_name" placeholder="' + ex.name + '" class="input" autocomplete="off" />' +
+    '<input type="text" name="ing_amount" placeholder="' + ex.amount + '" class="input" autocomplete="off" />' +
+    '<button type="button" class="ing-remove-btn" onclick="removeIngRow(this)" aria-label="Remove">' +
+      '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>' +
+    '</button>';
+  document.getElementById('ing-rows').appendChild(row);
+  row.querySelector('input').focus();
+});
+
+function removeIngRow(btn) {
+  var rows = document.getElementById('ing-rows');
+  if (rows.children.length > 1) {
+    btn.closest('.ing-form-row').remove();
+  }
+}
+
+document.getElementById('ing-form').addEventListener('submit', function(e) {
+  var names   = document.querySelectorAll('#ing-rows input[name="ing_name"]');
+  var amounts = document.querySelectorAll('#ing-rows input[name="ing_amount"]');
+  var valid = false;
+  for (var i = 0; i < names.length; i++) {
+    if (names[i].value.trim() && amounts[i].value.trim()) { valid = true; break; }
+  }
+  if (!valid) {
+    e.preventDefault();
+    document.getElementById('ing-error').style.display = 'block';
+    names[0].focus();
+  }
+});
+</script>
 {% endblock %}

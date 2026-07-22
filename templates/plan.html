@@ -1,61 +1,37 @@
 {% extends "base.html" %}
 {% block title %} · My plan{% endblock %}
-
-{% block steps %}
-<div class="steps">
-  <div class="step-dot done">&#10003;</div>
-  <div class="step-line done"></div>
-  <div class="step-dot done">&#10003;</div>
-  <div class="step-line done"></div>
-  <div class="step-dot done">&#10003;</div>
-  <div class="step-line done"></div>
-  <div class="step-dot active">4</div>
-</div>
-{% endblock %}
+{% block extra_container_class %}{% endblock %}
 
 {% block content %}
-{% set meal_order = ['breakfast', 'lunch', 'dinner'] %}
 {% set meal_labels = {'breakfast': 'Breakfast', 'lunch': 'Lunch', 'dinner': 'Dinner'} %}
-{% set badge_class = {'breakfast': 'badge-breakfast', 'lunch': 'badge-lunch', 'dinner': 'badge-dinner'} %}
 
 <div style="padding-top:12px;">
-  <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:5px;">
-    <h1 class="plan-section-title">Your meal plan</h1>
-    <a href="/suggest" class="btn btn-ghost btn-sm" style="margin-top:4px;">Edit</a>
-  </div>
-  <p class="plan-subtitle">
-    {{ accepted_clusters | length }} recipe set{{ 's' if accepted_clusters | length != 1 else '' }} for the week
-  </p>
 
-  {% for mt in meal_order %}
-    {% set mt_clusters = accepted_clusters | selectattr('mealType', 'equalto', mt) | list %}
-    {% if mt_clusters %}
-    <div style="margin-bottom:24px;">
-      <div class="section-header">
-        <span class="section-badge {{ badge_class[mt] }}">{{ meal_labels[mt] }}</span>
-      </div>
-      {% for cluster in mt_clusters %}
-      <div class="plan-cluster">
-        <div class="plan-cluster-top">
-          <div class="plan-cluster-name">{{ cluster.clusterName }}</div>
-          <span style="font-size:.75rem;color:var(--text-3);">{{ cluster.cookTime }}</span>
+  <!-- Week calendar -->
+  <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:14px;">
+    <h1 class="plan-section-title">Your week</h1>
+    <a href="/suggest" class="btn btn-ghost btn-sm">Change selections</a>
+  </div>
+
+  <div class="week-calendar" style="--cal-cols: {{ calendar | length }};">
+    {% for day in calendar %}
+    <div class="cal-day{% if loop.index0 >= 5 %} cal-weekend{% endif %}">
+      <div class="cal-day-name">{{ day.short }}</div>
+      {% for mt in meal_types %}
+        {% if mt in day.meals %}
+        <div class="cal-slot cal-slot-{{ mt }}">
+          <span class="cal-slot-type">{{ meal_labels[mt] }}</span>
+          <span class="cal-slot-meal">{{ day.meals[mt] }}</span>
         </div>
-        <div class="plan-meals-grid">
-          {% for meal in cluster.meals %}
-          <div class="plan-meal-tile">
-            <div class="plan-meal-name">{{ meal.name }}</div>
-            {% if meal.suggestedDay %}
-            <div class="plan-meal-day">{{ meal.suggestedDay }}</div>
-            {% endif %}
-          </div>
-          {% endfor %}
-        </div>
-      </div>
+        {% else %}
+        <div class="cal-slot-empty"></div>
+        {% endif %}
       {% endfor %}
     </div>
-    {% endif %}
-  {% endfor %}
+    {% endfor %}
+  </div>
 
+  <!-- Grocery list -->
   <div class="grocery-section">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
       <h2 class="grocery-title">Grocery list</h2>
@@ -70,22 +46,24 @@
       {% endif %}
     </p>
 
-    {% if grocery_list %}
+    {% if grocery_by_category %}
     <div class="grocery-list">
-      {% for item in grocery_list %}
+      {% for category, items in grocery_by_category.items() %}
+      <div class="grocery-category-header">{{ category }}</div>
+      {% for item in items %}
       {% set is_checked = item.key in checked_items %}
       <div class="grocery-item {{ 'done' if is_checked else '' }}">
         <input
           type="checkbox"
           class="grocery-checkbox"
+          data-key="{{ item.key }}"
           {{ 'checked' if is_checked else '' }}
-          hx-post="/grocery/toggle/{{ item.key }}"
-          hx-swap="outerHTML"
-          hx-on::after-request="this.closest('.grocery-item').classList.toggle('done', this.checked)"
+          onchange="toggleGrocery(this)"
         />
         <span class="grocery-name">{{ item.name | capitalize }}</span>
         <span class="grocery-amount">{{ item.amount }} {{ item.unit }}</span>
       </div>
+      {% endfor %}
       {% endfor %}
     </div>
     {% else %}
@@ -95,8 +73,32 @@
     {% endif %}
   </div>
 
-  <div style="margin-top:36px;text-align:center;padding-bottom:16px;">
-    <a href="/reset" class="btn btn-secondary">Plan another week</a>
+  <div style="margin-top:36px;display:flex;flex-direction:column;align-items:center;gap:12px;padding-bottom:16px;">
+    <a href="/recipes" id="recipes-btn" class="btn btn-primary btn-lg" style="width:100%;max-width:340px;">Get the recipes</a>
+  </div>
+
+  <!-- Loading overlay -->
+  <div id="recipes-loading" style="display:none;position:fixed;inset:0;background:rgba(244,240,232,0.92);backdrop-filter:blur(8px);z-index:200;flex-direction:column;align-items:center;justify-content:center;gap:20px;">
+    <div class="spinner" style="width:36px;height:36px;"></div>
+    <p style="font-family:'Cormorant Garamond',Georgia,serif;font-size:1.4rem;font-style:italic;color:var(--black);">Writing your recipes…</p>
+    <p style="font-size:.8125rem;color:var(--text-3);">This takes about 15 seconds.</p>
   </div>
 </div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function toggleGrocery(cb) {
+  cb.closest('.grocery-item').classList.toggle('done', cb.checked);
+  fetch('/grocery/toggle/' + cb.dataset.key, {method: 'POST'});
+}
+
+document.getElementById('recipes-btn').addEventListener('click', function(e) {
+  e.preventDefault();
+  var href = this.href;
+  var overlay = document.getElementById('recipes-loading');
+  overlay.style.display = 'flex';
+  window.location.href = href;
+});
+</script>
 {% endblock %}

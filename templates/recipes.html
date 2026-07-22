@@ -1,0 +1,147 @@
+{% extends "base.html" %}
+{% block title %} · Recipes{% endblock %}
+
+{% block content %}
+<div style="padding-top:12px;">
+
+  <div style="margin-bottom:6px;">
+    <h1 class="plan-section-title">Your recipes</h1>
+  </div>
+  
+  {% if recipe_clusters %}
+
+  <!-- Tab nav -->
+  <div class="recipe-tabs" role="tablist">
+    {% for cluster in recipe_clusters %}
+    <button
+      class="recipe-tab{% if loop.first %} active{% endif %}"
+      role="tab"
+      aria-selected="{{ 'true' if loop.first else 'false' }}"
+      aria-controls="recipe-panel-{{ loop.index0 }}"
+      data-tab="{{ loop.index0 }}"
+    >{{ cluster.base.title }}</button>
+    {% endfor %}
+  </div>
+
+  <!-- Tab panels -->
+  {% for cluster in recipe_clusters %}
+  <div
+    class="recipe-panel{% if loop.first %} active{% endif %}"
+    id="recipe-panel-{{ loop.index0 }}"
+    role="tabpanel"
+    data-panel="{{ loop.index0 }}"
+  >
+    <article class="recipe-article">
+
+      <h2 class="recipe-cluster-title">{{ cluster.base.title }}</h2>
+      <p class="recipe-intro">{{ cluster.intro }}</p>
+
+      <!-- Base prep -->
+      <section class="recipe-section">
+        <h3 class="recipe-section-heading">Base prep</h3>
+        <div class="recipe-columns">
+          <div class="recipe-ingredients">
+            <p class="recipe-col-label">Ingredients</p>
+            <ul class="recipe-ing-list">
+              {% for ing in cluster.base.ingredients %}
+              <li>{{ ing }}</li>
+              {% endfor %}
+            </ul>
+          </div>
+          <div class="recipe-steps-col">
+            <p class="recipe-col-label">Method</p>
+            <ol class="recipe-steps-list">
+              {% for step in cluster.base.steps %}
+              <li>{{ step }}</li>
+              {% endfor %}
+            </ol>
+          </div>
+        </div>
+      </section>
+
+      <!-- Uses -->
+      {% if cluster.uses %}
+      <section class="recipe-section recipe-uses-section">
+        <h3 class="recipe-section-heading">{{ cluster.uses | length }} way{{ 's' if cluster.uses | length != 1 }} to use it</h3>
+        <div class="recipe-uses-grid" style="--use-cols: {{ cluster.uses | length }};">
+          {% for use in cluster.uses %}
+          <div class="recipe-use-card">
+            <div class="recipe-use-header">
+              <span class="recipe-use-num">{{ loop.index }}</span>
+              <div>
+                <p class="recipe-use-title">{{ use.name }}</p>
+                {% if use.subtitle %}<p class="recipe-use-sub">{{ use.subtitle }}</p>{% endif %}
+              </div>
+            </div>
+
+            {% if use.extras %}
+            <p class="recipe-col-label" style="margin-bottom:6px;">You'll also need</p>
+            <ul class="recipe-extras-list">
+              {% for ex in use.extras %}
+              <li>{{ ex }}</li>
+              {% endfor %}
+            </ul>
+            {% endif %}
+
+            <ol class="recipe-use-steps">
+              {% for step in use.steps %}
+              <li>{{ step }}</li>
+              {% endfor %}
+            </ol>
+
+            {% if use.tip %}
+            <p class="recipe-tip">{{ use.tip }}</p>
+            {% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      </section>
+      {% endif %}
+
+    </article>
+  </div>
+  {% endfor %}
+
+  {% else %}
+  <div class="card card-body" style="text-align:center;padding:40px 24px;">
+    <p style="font-size:1rem;font-weight:600;color:var(--black);margin-bottom:8px;">Something went wrong generating your recipes.</p>
+    <p style="font-size:.875rem;color:var(--text-3);margin-bottom:24px;">This sometimes happens — just try again and it usually works.</p>
+    <form action="/recipes/regenerate" method="post">
+      <button type="submit" class="btn btn-primary">Try again</button>
+    </form>
+  </div>
+  {% endif %}
+
+  <div style="margin-top:40px;display:flex;justify-content:center;gap:10px;padding-bottom:24px;">
+    <a href="/suggest" class="btn btn-ghost">Change selections</a>
+    <a href="/plan" class="btn btn-ghost">Grocery list</a>
+    <a href="/new-plan" class="btn btn-secondary">New week</a>
+  </div>
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function () {
+  var tabs   = document.querySelectorAll('.recipe-tab');
+  var panels = document.querySelectorAll('.recipe-panel');
+
+  tabs.forEach(function (tab) {
+    tab.addEventListener('click', function () {
+      var idx = this.getAttribute('data-tab');
+
+      tabs.forEach(function (t) {
+        t.classList.remove('active');
+        t.setAttribute('aria-selected', 'false');
+      });
+      panels.forEach(function (p) { p.classList.remove('active'); });
+
+      this.classList.add('active');
+      this.setAttribute('aria-selected', 'true');
+      document.querySelector('.recipe-panel[data-panel="' + idx + '"]').classList.add('active');
+    });
+  });
+})();
+</script>
+{% endblock %}

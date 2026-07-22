@@ -4,13 +4,14 @@
 
 {% for mt in meal_order %}
   {% set mt_clusters = clusters | selectattr('mealType', 'equalto', mt) | list %}
-  {% if mt_clusters %}
+  {% set visible = mt_clusters | rejectattr('reserve') | rejectattr('skipped') | list %}
+  {% if visible %}
   <div style="margin-bottom:28px;">
     <div class="section-header">
       <span class="section-badge {{ badge_class[mt] }}">{{ meal_labels[mt] }}</span>
-      <span class="section-title">2 suggestions</span>
+      <span class="section-title">{{ visible | length }} suggestion{{ 's' if visible | length != 1 }}</span>
     </div>
-    {% for cluster in mt_clusters %}
+    {% for cluster in visible %}
       {% include "partials/cluster_card.html" %}
     {% endfor %}
   </div>
@@ -19,21 +20,35 @@
 
 {% set accepted_count = clusters | selectattr('accepted') | list | length %}
 
+{% set total_needed = meal_types | length * 2 %}
+{% set accepted_count = clusters | selectattr('accepted') | list | length %}
+
 <div style="position:sticky;bottom:0;background:rgba(244,240,232,0.94);backdrop-filter:blur(8px);border-top:1px solid var(--border);padding:14px 0;margin:0 -20px;padding-left:20px;padding-right:20px;" id="plan-cta">
-  <div style="max-width:640px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:12px;">
-    <span style="font-size:.875rem;color:var(--text-2);font-weight:600;" id="accepted-count-label">
-      {% if accepted_count == 0 %}
-        Select recipes to build your plan
-      {% elif accepted_count == 1 %}
-        1 set added
+  <div style="max-width:680px;margin:0 auto;position:relative;display:flex;align-items:center;justify-content:space-between;">
+
+    <!-- Left: back button, destination depends on mode -->
+    {% if mode == 'existing' %}
+    <a href="/ingredients" id="cta-back-link" class="btn btn-primary">Edit ingredients</a>
+    {% else %}
+    <a href="/cuisine" id="cta-back-link" class="btn btn-primary">Edit preferences</a>
+    {% endif %}
+
+    <!-- Center: absolutely pinned to the exact middle, never shifts with button widths -->
+    <span id="accepted-count-label"
+      style="position:absolute;left:50%;transform:translateX(-50%);font-size:.875rem;color:var(--text-2);font-weight:500;white-space:nowrap;pointer-events:none;">
+      {% set still_needed = total_needed - accepted_count %}
+      {% if still_needed > 0 %}
+        {{ still_needed }} set{{ 's' if still_needed != 1 }} still needed
       {% else %}
-        {{ accepted_count }} sets added
+        {{ total_needed }} of {{ total_needed }} sets selected
       {% endif %}
     </span>
-    {% if accepted_count > 0 %}
-    <a href="/plan" class="btn btn-primary">View my plan</a>
+
+    <!-- Right: view plan button (id used by JS to avoid touching Edit ingredients) -->
+    {% if can_view_plan %}
+    <a id="plan-cta-btn" href="/plan" class="btn btn-primary">View my plan</a>
     {% else %}
-    <button class="btn btn-primary" disabled>View my plan</button>
+    <button id="plan-cta-btn" class="btn btn-primary" disabled>View my plan</button>
     {% endif %}
   </div>
 </div>

@@ -1,0 +1,12 @@
+{% set meal_labels = {'breakfast': 'Breakfast', 'lunch': 'Lunch', 'dinner': 'Dinner'} %}
+{% set badge_class = {'breakfast': 'badge-breakfast', 'lunch': 'badge-lunch', 'dinner': 'badge-dinner'} %}
+{% set visible = clusters | rejectattr('reserve') | rejectattr('skipped') | list %}
+
+<div class="section-header">
+  <span class="section-badge {{ badge_class[meal_type] }}">{{ meal_labels[meal_type] }}</span>
+  <span class="section-title">{{ visible | length }} suggestion{{ 's' if visible | length != 1 }}</span>
+</div>
+
+{% for cluster in visible %}
+  {% include "partials/cluster_card.html" %}
+{% endfor %}
