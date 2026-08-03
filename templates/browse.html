@@ -1,0 +1,711 @@
+{% extends "base.html" %}
+{% block title %} · Browse recipes{% endblock %}
+
+{% block extra_styles %}
+<style>
+/* ── Search ─────────────────────────────────────────────── */
+.browse-search-wrap {
+  position: relative;
+  margin-bottom: 20px;
+}
+.browse-search-wrap input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 16px 10px 40px;
+  border: 1.5px solid var(--border);
+  border-radius: 12px;
+  font-size: .9375rem;
+  background: white;
+  color: var(--black);
+  outline: none;
+  transition: border-color var(--t);
+}
+.browse-search-wrap input:focus { border-color: var(--green); }
+.browse-search-icon {
+  position: absolute; left: 13px; top: 50%;
+  transform: translateY(-50%); color: var(--text-3); pointer-events: none;
+}
+.search-dropdown {
+  position: absolute; top: calc(100% + 6px); left: 0; right: 0;
+  background: white; border: 1.5px solid var(--border); border-radius: 14px;
+  box-shadow: 0 10px 32px rgba(0,0,0,.12); z-index: 200;
+  max-height: 340px; overflow-y: auto; display: none;
+}
+.search-dropdown.open { display: block; }
+.search-result {
+  display: flex; align-items: center; gap: 12px; padding: 10px 14px;
+  cursor: pointer; transition: background .1s;
+}
+.search-result:first-child { border-radius: 12px 12px 0 0; }
+.search-result:last-child  { border-radius: 0 0 12px 12px; }
+.search-result:only-child  { border-radius: 12px; }
+.search-result:hover { background: var(--bg); }
+.search-result-img { width: 44px; height: 44px; object-fit: cover; border-radius: 8px; flex-shrink: 0; background: var(--bg); }
+.search-result-img-ph { width: 44px; height: 44px; border-radius: 8px; background: var(--bg); flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: var(--text-3); }
+.search-result-title { font-size: .875rem; font-weight: 700; color: var(--black); line-height: 1.3; }
+.search-result-sub { font-size: .75rem; color: var(--text-3); margin-top: 1px; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
+.search-no-results { padding: 20px 16px; text-align: center; color: var(--text-3); font-size: .875rem; }
+
+/* ── Recipe cards ─────────────────────────────────────────── */
+.recipe-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; }
+.recipe-card {
+  position: relative; background: white; border: 1px solid var(--border);
+  border-radius: 14px; overflow: hidden; cursor: pointer;
+  transition: transform .15s, box-shadow .15s; display: flex; flex-direction: column;
+}
+.recipe-card:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0,0,0,.1); }
+.recipe-card-img { width: 100%; aspect-ratio: 4/3; object-fit: cover; background: var(--bg); display: block; }
+.recipe-card-img-placeholder { width: 100%; aspect-ratio: 4/3; background: var(--bg); display: flex; align-items: center; justify-content: center; color: var(--text-3); }
+.recipe-card-body { padding: 11px 13px 13px; display: flex; flex-direction: column; gap: 4px; flex: 1; }
+.recipe-card-title { font-size: .85rem; font-weight: 700; color: var(--black); line-height: 1.3; }
+.recipe-card-intro { font-size: .75rem; color: var(--text-3); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.recipe-card-uses { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
+.recipe-use-pill { font-size: .65rem; font-weight: 600; background: var(--bg); border: 1px solid var(--border); border-radius: 20px; padding: 2px 7px; color: var(--text-3); white-space: nowrap; }
+
+/* ── Favorite button ─────────────────────────────────────── */
+.fav-btn {
+  position: absolute; top: 7px; right: 7px; z-index: 3;
+  width: 28px; height: 28px; border-radius: 50%;
+  background: rgba(255,255,255,.88); border: 1px solid rgba(0,0,0,.06);
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; color: var(--text-3);
+  transition: background .15s, color .15s, transform .12s; backdrop-filter: blur(4px);
+}
+.fav-btn:hover { background: white; color: #e05; transform: scale(1.12); }
+.fav-btn.active { color: #e05; }
+.fav-btn .heart-filled { display: none; }
+.fav-btn.active .heart-outline { display: none; }
+.fav-btn.active .heart-filled { display: block; }
+
+/* ── Section structure ───────────────────────────────────── */
+.browse-section { margin-bottom: 28px; }
+.browse-section-heading {
+  font-family: 'Kalam', cursive;
+  font-size: 1.55rem;
+  font-weight: 700;
+  color: var(--black);
+  margin: 0 0 14px;
+  line-height: 1.2;
+}
+.browse-divider { border: none; border-top: 1.5px solid var(--border); margin: 24px 0; }
+
+/* ── Featured scroll (6 cards) ───────────────────────────── */
+.featured-scroll {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+  padding-bottom: 8px;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.featured-scroll::-webkit-scrollbar { display: none; }
+.featured-scroll .recipe-card {
+  flex: 0 0 calc(25% - 9px);
+  scroll-snap-align: start;
+}
+
+/* ── Favorites ───────────────────────────────────────────── */
+#favorites-divider { display: none; }
+
+/* ── Card title font ─────────────────────────────────────── */
+.recipe-card-title {
+  font-family: 'Caveat', cursive !important;
+  font-size: 1.05rem !important;
+  font-weight: 700 !important;
+  line-height: 1.25 !important;
+}
+
+/* ── Featured scroll arrows ──────────────────────────────── */
+.featured-arrow {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  z-index: 4; width: 32px; height: 32px; border-radius: 50%;
+  background: white; border: 1.5px solid var(--border);
+  box-shadow: 0 2px 8px rgba(0,0,0,.12);
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; color: var(--black);
+  transition: background .15s, box-shadow .15s, opacity .2s;
+}
+.featured-arrow:hover { background: var(--bg); box-shadow: 0 4px 14px rgba(0,0,0,.15); }
+.featured-arrow-prev { left: -14px; }
+.featured-arrow-next { right: -14px; }
+
+/* ── Category cards ──────────────────────────────────────── */
+.meal-type-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.meal-type-grid .category-card { height: clamp(220px, 36vw, 320px); aspect-ratio: unset; }
+/* ── Cuisine scroll ──────────────────────────────────────── */
+.cuisine-scroll-wrap { position: relative; }
+.cuisine-grid {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+  scrollbar-width: none;
+  padding-bottom: 4px;
+}
+.cuisine-grid::-webkit-scrollbar { display: none; }
+.cuisine-grid .category-card {
+  flex: 0 0 calc(20% - 10px);
+  scroll-snap-align: start;
+  height: clamp(220px, 32vw, 320px);
+  aspect-ratio: unset;
+}
+.cuisine-arrow {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  z-index: 4; width: 32px; height: 32px; border-radius: 50%;
+  background: white; border: 1.5px solid var(--border);
+  box-shadow: 0 2px 8px rgba(0,0,0,.12);
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; color: var(--black);
+  transition: background .15s, opacity .2s;
+}
+.cuisine-arrow:hover { background: var(--bg); }
+.cuisine-arrow-prev { left: -14px; }
+.cuisine-arrow-next { right: -14px; }
+.category-card {
+  position: relative; border-radius: 14px; overflow: hidden;
+  aspect-ratio: 2/3; cursor: pointer; background: var(--bg);
+  transition: transform .2s, box-shadow .2s;
+}
+.category-card:hover { transform: translateY(-3px); box-shadow: 0 12px 28px rgba(0,0,0,.15); }
+.category-card img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform .3s; }
+.category-card:hover img { transform: scale(1.05); }
+.category-card-overlay {
+  position: absolute; inset: 0;
+  background: linear-gradient(to top, rgba(0,0,0,.72) 0%, rgba(0,0,0,.08) 60%, transparent 100%);
+  display: flex; flex-direction: column; justify-content: flex-end; padding: 12px;
+}
+.category-card-no-img { width: 100%; height: 100%; background: linear-gradient(135deg, var(--bg) 0%, var(--border) 100%); display: flex; align-items: center; justify-content: center; color: var(--text-3); }
+.category-card-name { font-family: 'Caveat', cursive; font-size: clamp(1.3rem, 4vw, 1.75rem); font-weight: 700; color: white; line-height: 1.1; }
+.category-card-count { font-size: .68rem; color: rgba(255,255,255,.78); font-weight: 600; letter-spacing: .04em; margin-top: 2px; }
+
+/* ── Category sub-view ───────────────────────────────────── */
+#browse-category { display: none; padding-top: 4px; }
+.back-btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  background: none; border: none; cursor: pointer;
+  color: var(--green); font-size: .875rem; font-weight: 600; padding: 0; margin-bottom: 18px;
+}
+.back-btn:hover { text-decoration: underline; }
+#category-title {
+  font-family: 'Kalam', cursive;
+  font-size: 1.8rem; font-weight: 700; color: var(--black); margin: 0 0 16px; line-height: 1.2;
+}
+
+/* ── Modal ───────────────────────────────────────────────── */
+.recipe-modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(30,30,20,.45); backdrop-filter: blur(4px); z-index: 500; align-items: flex-end; justify-content: center; }
+.recipe-modal-backdrop.open { display: flex; }
+@media (min-width: 600px) { .recipe-modal-backdrop { align-items: center; } }
+.recipe-modal { background-color: #fdfdf7; background-image: repeating-linear-gradient(to bottom, transparent 0px, transparent 27px, rgba(170,200,220,.45) 27px, rgba(170,200,220,.45) 28px); background-attachment: local; border-radius: 20px 20px 0 0; width: 100%; max-width: 640px; max-height: 92vh; overflow-y: auto; display: flex; flex-direction: column; animation: slideUp .22s ease; }
+@media (min-width: 600px) { .recipe-modal { border-radius: 20px; max-height: 88vh; } }
+@keyframes slideUp { from { transform: translateY(40px); opacity: 0; } to { transform: none; opacity: 1; } }
+.recipe-modal-img { width: 100%; aspect-ratio: 16/9; object-fit: cover; flex-shrink: 0; border-radius: 20px 20px 0 0; }
+.recipe-modal-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 28px 20px 0; }
+.recipe-modal-title { font-family: 'Caveat', cursive; font-size: clamp(1.9rem,5vw,2.5rem); font-weight: 700; color: var(--black); line-height: 28px; }
+.recipe-modal-close { background: rgba(255,255,255,.7); border: 1px solid var(--border); border-radius: 50%; width: 32px; height: 32px; flex-shrink: 0; cursor: pointer; display: flex; align-items: center; justify-content: center; color: var(--text-3); }
+.recipe-modal-intro { font-size: .875rem; color: var(--text-3); line-height: 28px; padding: 0 20px; margin: 0; }
+.recipe-modal-body { padding: 28px 20px 56px; display: flex; flex-direction: column; gap: 28px; }
+.recipe-section-label { font-size: .65rem; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; color: var(--green); line-height: 28px; margin-bottom: 0; }
+.recipe-ingredient-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0; }
+.recipe-ingredient-list li { font-size: .8375rem; color: var(--black); padding-left: 14px; position: relative; line-height: 28px; }
+.recipe-ingredient-list li::before { content: '·'; position: absolute; left: 0; color: var(--green); font-weight: 700; }
+.recipe-steps-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0; counter-reset: step-counter; }
+.recipe-steps-list li { font-size: .8375rem; color: var(--black); padding-left: 28px; position: relative; line-height: 28px; counter-increment: step-counter; }
+.recipe-steps-list li::before { content: counter(step-counter); position: absolute; left: 0; width: 20px; height: 20px; background: var(--green); color: white; border-radius: 50%; font-size: .65rem; font-weight: 800; display: flex; align-items: center; justify-content: center; top: 4px; }
+.recipe-uses-grid { display: flex; flex-direction: column; gap: 12px; }
+.recipe-use-card { background: #fdfdf7; border: 1px solid rgba(170,200,220,.6); border-radius: 10px; padding: 0 14px 14px; }
+.recipe-use-name { font-size: .875rem; font-weight: 700; color: var(--black); line-height: 28px; }
+.recipe-use-subtitle { font-size: .78rem; color: var(--text-3); font-style: italic; line-height: 28px; margin-bottom: 0; }
+.recipe-use-extras { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0; }
+.recipe-use-extras li { font-size: .78rem; color: var(--text-3); padding-left: 12px; position: relative; line-height: 28px; }
+.recipe-use-extras li::before { content: '+'; position: absolute; left: 0; color: var(--green); font-weight: 700; }
+.recipe-use-tip { font-size: .775rem; color: var(--text-3); font-style: italic; line-height: 28px; margin-top: 0; padding-top: 0; border-top: 1px solid var(--border); }
+
+/* ── Accordion Slider ─────────────────────────────────────── */
+.accordion-slider {
+  display: flex;
+  gap: 8px;
+  height: clamp(300px, 40vw, 400px);
+  overflow: hidden;
+}
+.accordion-item {
+  flex: 0 0 60px;
+  position: relative;
+  border-radius: 16px;
+  overflow: hidden;
+  cursor: pointer;
+  transition: flex 0.52s cubic-bezier(0.4, 0, 0.2, 1);
+  background: #1a1a1a;
+  min-width: 0;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.accordion-item.open {
+  flex: 1 1 0%;
+  cursor: default;
+}
+.accordion-item-bg {
+  position: absolute;
+  inset: 0;
+  background-size: cover;
+  background-position: center;
+  transition: transform 0.52s ease, filter 0.3s;
+  filter: brightness(0.72);
+}
+.accordion-item.open .accordion-item-bg {
+  transform: scale(1.04);
+  filter: brightness(0.6);
+}
+.accordion-item-overlay {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to top, rgba(0,0,0,.92) 0%, rgba(0,0,0,.08) 55%, transparent 100%);
+}
+.accordion-item-label {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: 22px;
+  opacity: 1;
+  transition: opacity 0.18s;
+  pointer-events: none;
+}
+.accordion-item-label span {
+  font-family: 'Caveat', cursive;
+  font-size: .88rem;
+  font-weight: 700;
+  color: rgba(255,255,255,.85);
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  transform: rotate(180deg);
+  white-space: nowrap;
+  overflow: hidden;
+  max-height: 160px;
+}
+.accordion-item.open .accordion-item-label { opacity: 0; }
+.accordion-item-content {
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  padding: clamp(16px, 3vw, 26px);
+  opacity: 0;
+  transform: translateY(10px);
+  transition: opacity 0.28s 0.2s, transform 0.28s 0.2s;
+  pointer-events: none;
+}
+.accordion-item.open .accordion-item-content {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+}
+.accordion-item-title {
+  font-family: 'Caveat', cursive;
+  font-size: clamp(1.5rem, 2.4vw, 2rem);
+  font-weight: 700;
+  color: white;
+  line-height: 1.2;
+  margin-bottom: 6px;
+}
+.accordion-item-sub {
+  font-size: .78rem;
+  color: rgba(255,255,255,.68);
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin-bottom: 14px;
+}
+.accordion-item-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: none;
+  border: none;
+  padding: 0;
+  color: rgba(255,255,255,.88);
+  font-family: 'Caveat', cursive;
+  font-size: 1.05rem;
+  font-weight: 700;
+  cursor: pointer;
+  letter-spacing: .01em;
+  transition: color .15s, gap .2s;
+}
+.accordion-item-btn:hover {
+  color: white;
+  gap: 11px;
+}
+@media (max-width: 600px) {
+  .accordion-slider {
+    height: clamp(300px, 72vw, 400px);
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .accordion-slider::-webkit-scrollbar { display: none; }
+  .accordion-item { flex: 0 0 50px; min-width: 50px; }
+  .accordion-item.open { flex: 0 0 75vw; min-width: 75vw; }
+}
+</style>
+{% endblock %}
+
+{% block content %}
+
+{# ── Card macro ──────────────────────────────────────────── #}
+{% macro recipe_card(r) %}
+<div class="recipe-card" data-id="{{ r.id }}" onclick="openModal('{{ r.id }}')">
+  {% if r.image %}<img class="recipe-card-img" src="{{ r.image }}" alt="{{ r.title }}" loading="lazy" />
+  {% else %}<div class="recipe-card-img-placeholder"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2v7c0 1.1.9 2 2 2h4a2 2 0 002-2V2"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="21" y1="15" x2="21" y2="22"/><path d="M21 2a5 5 0 00-5 5v8h5"/></svg></div>{% endif %}
+  <button class="fav-btn{% if r.id in favorite_ids %} active{% endif %}" data-id="{{ r.id }}" onclick="toggleFav(event,'{{ r.id }}')" aria-label="Favorite">
+    <svg class="heart-outline" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
+    <svg class="heart-filled" width="13" height="13" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
+  </button>
+  <div class="recipe-card-body">
+    <div class="recipe-card-title">{{ r.title }}</div>
+    {% if r.intro %}<div class="recipe-card-intro">{{ r.intro }}</div>{% endif %}
+    <div class="recipe-card-uses">
+      {% for name in r.uses_names[:2] %}<span class="recipe-use-pill">{{ name }}</span>{% endfor %}
+      {% if r.uses_names | length > 2 %}<span class="recipe-use-pill">+{{ r.uses_names | length - 2 }}</span>{% endif %}
+    </div>
+  </div>
+</div>
+{% endmacro %}
+
+{# ── Category card macro ─────────────────────────────────── #}
+{% macro cat_card(key, name, img, count) %}
+<div class="category-card" onclick="showCategory('{{ key }}', '{{ name }}')">
+  {% if img %}<img src="{{ img }}" alt="{{ name }}" loading="lazy" />
+  {% else %}<div class="category-card-no-img"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg></div>{% endif %}
+  <div class="category-card-overlay">
+    <div class="category-card-name">{{ name }}</div>
+    <div class="category-card-count">{{ count }} recipe{{ 's' if count != 1 else '' }}</div>
+  </div>
+</div>
+{% endmacro %}
+
+<div style="padding-top: 8px; padding-bottom: 56px;">
+
+  <!-- Search -->
+  <div class="browse-search-wrap">
+    <span class="browse-search-icon">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+    </span>
+    <input type="text" id="browse-search" placeholder="Search recipes…" autocomplete="off" oninput="searchInput()" onfocus="searchInput()" />
+    <div id="search-dropdown" class="search-dropdown"></div>
+  </div>
+
+  <!-- ══ Main view ══════════════════════════════════════════ -->
+  <div id="browse-main">
+
+    <!-- Favorites (shown first) -->
+    <div class="browse-section" id="favorites-section">
+      <div class="browse-section-heading">Your Favorites</div>
+      <div class="recipe-grid" id="favorites-grid"></div>
+      <p id="favorites-empty" style="display:none;color:var(--text-3);font-size:.875rem;margin:0;">No favorites yet.</p>
+    </div>
+    <hr class="browse-divider" id="favorites-divider" />
+
+    <!-- Featured accordion -->
+    <div class="browse-section">
+      <div class="browse-section-heading">We think you'd like</div>
+      <div class="accordion-slider" id="featured-accordion">
+        {% for r in featured %}
+        <div class="accordion-item{% if loop.first %} open{% endif %}" onclick="featuredAccordionClick(this,'{{ r.id }}')">
+          {% if r.image %}
+          <div class="accordion-item-bg" style="background-image:url('{{ r.image }}')"></div>
+          {% else %}
+          <div class="accordion-item-bg" style="background:linear-gradient(135deg,#2d2d2d,#1a1a1a);"></div>
+          {% endif %}
+          <div class="accordion-item-overlay"></div>
+          <button class="fav-btn{% if r.id in favorite_ids %} active{% endif %}" data-id="{{ r.id }}" onclick="toggleFav(event,'{{ r.id }}')" aria-label="Favorite">
+            <svg class="heart-outline" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
+            <svg class="heart-filled" width="13" height="13" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
+          </button>
+          <div class="accordion-item-label"><span>{{ r.title }}</span></div>
+          <div class="accordion-item-content">
+            <div class="accordion-item-title">{{ r.title }}</div>
+            {% if r.intro %}<div class="accordion-item-sub">{{ r.intro }}</div>{% endif %}
+            <button class="accordion-item-btn" onclick="event.stopPropagation();openModal('{{ r.id }}')">
+              View recipe
+              <svg width="26" height="14" viewBox="0 0 26 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1 7.5 C5 6.5 13 8 20 7.5"/><path d="M16 4 L20.5 7.5 L16 11"/></svg>
+            </button>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <hr class="browse-divider" />
+
+    <!-- Browse by Meal Type -->
+    <div class="browse-section">
+      <div class="browse-section-heading">Browse by meal type</div>
+      <div class="meal-type-grid">
+        {{ cat_card('meal:breakfast', 'Breakfast', meal_covers.breakfast, groups.breakfast | length) }}
+        {{ cat_card('meal:lunch',     'Lunch',     meal_covers.lunch,     groups.lunch | length) }}
+        {{ cat_card('meal:dinner',    'Dinner',    meal_covers.dinner,    groups.dinner | length) }}
+      </div>
+    </div>
+
+    <hr class="browse-divider" />
+
+    <!-- Browse by Cuisine accordion -->
+    <div class="browse-section">
+      <div class="browse-section-heading">Browse by cuisine</div>
+      <div class="accordion-slider" id="cuisine-accordion">
+
+        {% macro cuisine_item(key, name, img, count, open=false) %}
+        <div class="accordion-item{{ ' open' if open else '' }}" onclick="cuisineAccordionClick(this,'cuisine:{{ key }}','{{ name }}')">
+          {% if img %}<div class="accordion-item-bg" style="background-image:url('{{ img }}')"></div>
+          {% else %}<div class="accordion-item-bg" style="background:linear-gradient(135deg,#2d2d2d,#1a1a1a);"></div>{% endif %}
+          <div class="accordion-item-overlay"></div>
+          <div class="accordion-item-label"><span>{{ name }}</span></div>
+          <div class="accordion-item-content">
+            <div class="accordion-item-title">{{ name }}</div>
+            <div class="accordion-item-sub">{{ count }} recipe{{ 's' if count != 1 else '' }}</div>
+            <button class="accordion-item-btn" onclick="event.stopPropagation();showCategory('cuisine:{{ key }}','{{ name }}')">
+              Browse <svg width="26" height="14" viewBox="0 0 26 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1 7.5 C5 6.5 13 8 20 7.5"/><path d="M16 4 L20.5 7.5 L16 11"/></svg>
+            </button>
+          </div>
+        </div>
+        {% endmacro %}
+
+        {{ cuisine_item('American',      'American',      cuisine_covers.American,      cuisine_groups.American      | length, true) }}
+        {{ cuisine_item('Italian',       'Italian',       cuisine_covers.Italian,       cuisine_groups.Italian       | length) }}
+        {{ cuisine_item('Mexican',       'Mexican',       cuisine_covers.Mexican,       cuisine_groups.Mexican       | length) }}
+        {{ cuisine_item('Japanese',      'Japanese',      cuisine_covers.Japanese,      cuisine_groups.Japanese      | length) }}
+        {{ cuisine_item('Chinese',       'Chinese',       cuisine_covers.Chinese,       cuisine_groups.Chinese       | length) }}
+        {{ cuisine_item('French',        'French',        cuisine_covers.French,        cuisine_groups.French        | length) }}
+        {{ cuisine_item('Korean',        'Korean',        cuisine_covers.Korean,        cuisine_groups.Korean        | length) }}
+        {{ cuisine_item('Mediterranean', 'Mediterranean', cuisine_covers.Mediterranean, cuisine_groups.Mediterranean | length) }}
+        {{ cuisine_item('Indian',        'Indian',        cuisine_covers.Indian,        cuisine_groups.Indian        | length) }}
+        {{ cuisine_item('Spanish',       'Spanish',       cuisine_covers.Spanish,       cuisine_groups.Spanish       | length) }}
+        {{ cuisine_item('Vietnamese',    'Vietnamese',    cuisine_covers.Vietnamese,    cuisine_groups.Vietnamese    | length) }}
+
+      </div>
+    </div>
+
+  </div><!-- /browse-main -->
+
+  <!-- ══ Category sub-view ══════════════════════════════════ -->
+  <div id="browse-category">
+    <button class="back-btn" onclick="showMain()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+      Back to browse
+    </button>
+    <div id="category-title"></div>
+    <div class="recipe-grid" id="category-grid"></div>
+  </div>
+
+</div>
+
+<!-- ── Modal ─────────────────────────────────────────────── -->
+<div class="recipe-modal-backdrop" id="modal-backdrop" onclick="closeModalOnBackdrop(event)">
+  <div class="recipe-modal" id="recipe-modal" style="position:relative;">
+    <button class="recipe-modal-close" onclick="closeModal()" aria-label="Close" style="position:absolute;top:12px;right:12px;z-index:10;">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+    <img class="recipe-modal-img" id="modal-img" src="" alt="" style="display:none;" />
+    <div class="recipe-modal-header">
+      <div class="recipe-modal-title" id="modal-title"></div>
+    </div>
+    <p class="recipe-modal-intro" id="modal-intro"></p>
+    <div class="recipe-modal-body">
+      <div><div class="recipe-section-label">What you'll prep</div><ul class="recipe-ingredient-list" id="modal-ingredients"></ul></div>
+      <div><div class="recipe-section-label">Steps</div><ol class="recipe-steps-list" id="modal-steps"></ol></div>
+      <div id="modal-uses-section">
+        <div class="recipe-section-label">Ways to serve it this week</div>
+        <div class="recipe-uses-grid" id="modal-uses"></div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+var RECIPE_DATA   = {{ recipe_data_json | safe }};
+var CATEGORY_IDS  = {{ category_ids_json | safe }};
+var FAVORITES     = new Set({{ favorite_ids | tojson }});
+var _allRecipes   = Object.values(RECIPE_DATA);
+var _searchEl     = document.getElementById('browse-search');
+var _dropdownEl   = document.getElementById('search-dropdown');
+
+/* ── Search ─────────────────────────────────────────────── */
+function searchInput() {
+  var q = _searchEl.value.toLowerCase().trim();
+  if (!q) { _dropdownEl.classList.remove('open'); return; }
+  var matches = _allRecipes.filter(function(r) {
+    return r.title.toLowerCase().indexOf(q) !== -1;
+  }).slice(0, 8);
+  _dropdownEl.innerHTML = '';
+  if (matches.length === 0) {
+    _dropdownEl.innerHTML = '<div class="search-no-results">No recipes found</div>';
+  } else {
+    matches.forEach(function(r) {
+      var item = document.createElement('div');
+      item.className = 'search-result';
+      item.onclick = function() { openModal(r.id); _dropdownEl.classList.remove('open'); _searchEl.value = ''; };
+      item.innerHTML = (r.image
+        ? '<img class="search-result-img" src="' + esc(r.image) + '" alt="" />'
+        : '<div class="search-result-img-ph"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2v7c0 1.1.9 2 2 2h4a2 2 0 002-2V2"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="21" y1="15" x2="21" y2="22"/><path d="M21 2a5 5 0 00-5 5v8h5"/></svg></div>') +
+        '<div><div class="search-result-title">' + esc(r.title) + '</div>' +
+        (r.intro ? '<div class="search-result-sub">' + esc(r.intro) + '</div>' : '') + '</div>';
+      _dropdownEl.appendChild(item);
+    });
+  }
+  _dropdownEl.classList.add('open');
+}
+document.addEventListener('click', function(e) {
+  if (!document.querySelector('.browse-search-wrap').contains(e.target))
+    _dropdownEl.classList.remove('open');
+});
+
+/* ── Category sub-view ───────────────────────────────────── */
+function showCategory(key, name) {
+  document.getElementById('browse-main').style.display = 'none';
+  document.getElementById('browse-category').style.display = 'block';
+  document.getElementById('category-title').textContent = name;
+  var ids  = CATEGORY_IDS[key] || [];
+  var grid = document.getElementById('category-grid');
+  grid.innerHTML = '';
+  if (ids.length === 0) {
+    grid.innerHTML = '<p style="color:var(--text-3);grid-column:1/-1;">No recipes in this category yet.</p>';
+    return;
+  }
+  ids.forEach(function(id) { var r = RECIPE_DATA[id]; if (r) grid.appendChild(makeCard(r)); });
+  window.scrollTo(0, 0);
+}
+function showMain() {
+  document.getElementById('browse-category').style.display = 'none';
+  document.getElementById('browse-main').style.display = 'block';
+  renderFavorites();
+  window.scrollTo(0, 0);
+}
+
+/* ── Favorites ───────────────────────────────────────────── */
+function renderFavorites() {
+  var grid    = document.getElementById('favorites-grid');
+  var empty   = document.getElementById('favorites-empty');
+  var divider = document.getElementById('favorites-divider');
+  grid.innerHTML = '';
+  if (FAVORITES.size === 0) {
+    empty.style.display = 'block';
+    grid.style.display = 'none';
+    divider.style.display = 'none';
+  } else {
+    empty.style.display = 'none';
+    grid.style.display = 'grid';
+    divider.style.display = 'block';
+    FAVORITES.forEach(function(id) { var r = RECIPE_DATA[id]; if (r) grid.appendChild(makeCard(r)); });
+  }
+}
+
+function heartSVG(filled) {
+  var f = filled ? 'currentColor' : 'none', cls = filled ? 'heart-filled' : 'heart-outline';
+  return '<svg class="' + cls + '" width="13" height="13" viewBox="0 0 24 24" fill="' + f + '" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>';
+}
+
+function makeCard(r) {
+  var isFav = FAVORITES.has(r.id);
+  var imgHtml = r.image
+    ? '<img class="recipe-card-img" src="' + esc(r.image) + '" alt="' + esc(r.title) + '" loading="lazy" />'
+    : '<div class="recipe-card-img-placeholder"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2v7c0 1.1.9 2 2 2h4a2 2 0 002-2V2"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="21" y1="15" x2="21" y2="22"/><path d="M21 2a5 5 0 00-5 5v8h5"/></svg></div>';
+  var pillsHtml = '';
+  (r.uses || []).slice(0, 2).forEach(function(u) { pillsHtml += '<span class="recipe-use-pill">' + esc(u.name) + '</span>'; });
+  if ((r.uses || []).length > 2) pillsHtml += '<span class="recipe-use-pill">+' + ((r.uses || []).length - 2) + '</span>';
+  var div = document.createElement('div');
+  div.className = 'recipe-card'; div.dataset.id = r.id;
+  div.onclick = function() { openModal(r.id); };
+  div.innerHTML = imgHtml +
+    '<button class="fav-btn' + (isFav ? ' active' : '') + '" data-id="' + esc(r.id) + '" onclick="toggleFav(event,\'' + esc(r.id) + '\')" aria-label="Favorite">' +
+    heartSVG(false) + heartSVG(true) + '</button>' +
+    '<div class="recipe-card-body">' +
+    '<div class="recipe-card-title">' + esc(r.title) + '</div>' +
+    (r.intro ? '<div class="recipe-card-intro">' + esc(r.intro) + '</div>' : '') +
+    '<div class="recipe-card-uses">' + pillsHtml + '</div></div>';
+  return div;
+}
+
+async function toggleFav(event, id) {
+  event.stopPropagation();
+  var wasFav = FAVORITES.has(id);
+  if (wasFav) FAVORITES.delete(id); else FAVORITES.add(id);
+  document.querySelectorAll('.fav-btn[data-id="' + id + '"]').forEach(function(btn) {
+    btn.classList.toggle('active', !wasFav);
+  });
+  renderFavorites();
+  try {
+    await fetch('/favorite/' + encodeURIComponent(id), { method: 'POST' });
+  } catch(e) {
+    if (wasFav) FAVORITES.add(id); else FAVORITES.delete(id);
+    document.querySelectorAll('.fav-btn[data-id="' + id + '"]').forEach(function(btn) {
+      btn.classList.toggle('active', wasFav);
+    });
+    renderFavorites();
+  }
+}
+
+/* ── Modal ───────────────────────────────────────────────── */
+function openModal(id) {
+  var r = RECIPE_DATA[id];
+  if (!r) return;
+  var img = document.getElementById('modal-img');
+  if (r.image) { img.src = r.image; img.alt = r.title; img.style.display = 'block'; } else { img.style.display = 'none'; }
+  document.getElementById('modal-title').textContent = r.title;
+  document.getElementById('modal-intro').textContent = r.intro || '';
+  var ingList = document.getElementById('modal-ingredients'); ingList.innerHTML = '';
+  (r.ingredients || []).forEach(function(ing) { var li = document.createElement('li'); li.textContent = ing; ingList.appendChild(li); });
+  var stepsList = document.getElementById('modal-steps'); stepsList.innerHTML = '';
+  (r.steps || []).forEach(function(step) { var li = document.createElement('li'); li.textContent = step; stepsList.appendChild(li); });
+  var usesGrid = document.getElementById('modal-uses'), usesSection = document.getElementById('modal-uses-section');
+  usesGrid.innerHTML = '';
+  if (r.uses && r.uses.length) {
+    usesSection.style.display = 'block';
+    r.uses.forEach(function(use) {
+      var card = document.createElement('div'); card.className = 'recipe-use-card';
+      var html = '';
+      if (use.image) html += '<img src="' + esc(use.image) + '" alt="' + esc(use.name) + '" style="width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:8px;margin-bottom:10px;" />';
+      html += '<div class="recipe-use-name">' + esc(use.name) + '</div>';
+      if (use.subtitle) html += '<div class="recipe-use-subtitle">' + esc(use.subtitle) + '</div>';
+      if (use.extras && use.extras.length) { html += '<ul class="recipe-use-extras">'; use.extras.forEach(function(e) { html += '<li>' + esc(e) + '</li>'; }); html += '</ul>'; }
+      if (use.steps && use.steps.length) { html += '<ol class="recipe-steps-list" style="margin-top:8px;">'; use.steps.forEach(function(s) { html += '<li>' + esc(s) + '</li>'; }); html += '</ol>'; }
+      if (use.tip) html += '<div class="recipe-use-tip">Tip: ' + esc(use.tip) + '</div>';
+      card.innerHTML = html; usesGrid.appendChild(card);
+    });
+  } else { usesSection.style.display = 'none'; }
+  document.getElementById('modal-backdrop').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+function closeModal() { document.getElementById('modal-backdrop').classList.remove('open'); document.body.style.overflow = ''; }
+function closeModalOnBackdrop(e) { if (e.target === document.getElementById('modal-backdrop')) closeModal(); }
+function esc(str) { return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') { closeModal(); _dropdownEl.classList.remove('open'); }
+});
+
+/* ── Accordion ───────────────────────────────────────────── */
+function featuredAccordionClick(el, id) {
+  if (el.classList.contains('open')) return;
+  document.querySelectorAll('#featured-accordion .accordion-item').forEach(function(i) { i.classList.remove('open'); });
+  el.classList.add('open');
+}
+function cuisineAccordionClick(el, key, name) {
+  if (el.classList.contains('open')) return;
+  document.querySelectorAll('#cuisine-accordion .accordion-item').forEach(function(i) { i.classList.remove('open'); });
+  el.classList.add('open');
+}
+
+/* ── Init ────────────────────────────────────────────────── */
+renderFavorites();
+(function() {
+  var params = new URLSearchParams(window.location.search);
+  var openId = params.get('open');
+  if (openId && RECIPE_DATA[openId]) {
+    openModal(openId);
+    history.replaceState(null, '', '/browse');
+  }
+})();
+</script>
+{% endblock %}

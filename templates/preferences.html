@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+{% block title %} · Preferences{% endblock %}
+
+{% block content %}
+<div style="max-width:560px;margin:0 auto;padding-top:8px;">
+
+  <div style="margin-bottom:28px;">
+    <a href="/landing" class="btn btn-ghost btn-sm" style="display:inline-flex;align-items:center;gap:4px;margin-bottom:12px;">← Back</a>
+    <h1 class="page-heading" style="margin:0;font-family:'Kalam',cursive;font-weight:700;">Preferences</h1>
+  </div>
+
+  <form action="/save-preferences" method="post" id="prefs-form" autocomplete="off">
+
+    <!-- Meal types -->
+    <div class="form-card" style="margin-bottom:16px;">
+      <div class="form-card-title">Which meals do you want to plan?</div>
+      <div class="meal-type-stack">
+        <label class="meal-type-row{% if 'breakfast' in (preferences.mealTypes or []) %} checked{% endif %}" id="label-breakfast">
+          <input type="checkbox" name="meal_types" value="breakfast"
+            {% if 'breakfast' in (preferences.mealTypes or []) %}checked{% endif %} />
+          <div class="meal-row-icon">
+            <svg class="icon icon-md" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+              <circle cx="12" cy="12" r="4"/>
+              <line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/>
+              <line x1="4.22" y1="4.22" x2="6.34" y2="6.34"/><line x1="17.66" y1="17.66" x2="19.78" y2="19.78"/>
+              <line x1="2" y1="12" x2="5" y2="12"/><line x1="19" y1="12" x2="22" y2="12"/>
+              <line x1="4.22" y1="19.78" x2="6.34" y2="17.66"/><line x1="17.66" y1="6.34" x2="19.78" y2="4.22"/>
+            </svg>
+          </div>
+          <span class="meal-row-name">Breakfast</span>
+          <div class="meal-row-check"><svg class="icon icon-xs" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
+        </label>
+        <label class="meal-type-row{% if 'lunch' in (preferences.mealTypes or []) %} checked{% endif %}" id="label-lunch">
+          <input type="checkbox" name="meal_types" value="lunch"
+            {% if 'lunch' in (preferences.mealTypes or []) %}checked{% endif %} />
+          <div class="meal-row-icon">
+            <svg class="icon icon-md" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+              <path d="M3 2v7c0 1.1.9 2 2 2h4a2 2 0 002-2V2"/><line x1="7" y1="2" x2="7" y2="22"/>
+              <line x1="21" y1="15" x2="21" y2="22"/><path d="M21 2a5 5 0 00-5 5v8h5"/>
+            </svg>
+          </div>
+          <span class="meal-row-name">Lunch</span>
+          <div class="meal-row-check"><svg class="icon icon-xs" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
+        </label>
+        <label class="meal-type-row{% if 'dinner' in (preferences.mealTypes or []) %} checked{% endif %}" id="label-dinner">
+          <input type="checkbox" name="meal_types" value="dinner"
+            {% if 'dinner' in (preferences.mealTypes or []) %}checked{% endif %} />
+          <div class="meal-row-icon">
+            <svg class="icon icon-md" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+              <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
+            </svg>
+          </div>
+          <span class="meal-row-name">Dinner</span>
+          <div class="meal-row-check"><svg class="icon icon-xs" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
+        </label>
+      </div>
+    </div>
+
+    <!-- Servings -->
+    <div class="form-card" style="margin-bottom:16px;">
+      <div class="form-card-title">How many people are you cooking for?</div>
+      <div class="form-card-subtitle">We will scale ingredient amounts on your grocery list.</div>
+      <div style="display:flex;align-items:center;gap:16px;margin-top:4px;">
+        <div class="stepper">
+          <button class="stepper-btn" type="button" id="servings-dec">-</button>
+          <div class="stepper-value" id="servings-display">{{ preferences.servings or 2 }}</div>
+          <button class="stepper-btn" type="button" id="servings-inc">+</button>
+        </div>
+        <input type="hidden" name="servings" id="servings-hidden" value="{{ preferences.servings or 2 }}" />
+        <span style="font-size:.875rem;color:var(--text-3);">people per meal</span>
+      </div>
+    </div>
+
+    <!-- Dietary needs -->
+    <div class="form-card" style="margin-bottom:16px;">
+      <div class="form-card-title">Any dietary needs or preferences?</div>
+      <div class="form-card-subtitle">Leave blank if none.</div>
+      <input type="text" name="dietary_needs" class="input"
+        placeholder="e.g. vegetarian, gluten-free, nut allergy, low-carb"
+        value="{{ preferences.dietaryNeeds or '' }}"
+        autocomplete="off" />
+    </div>
+
+    <!-- Adventure level -->
+    <div class="form-card" style="margin-bottom:16px;">
+      <div class="form-card-title">How adventurous are you?</div>
+      <div class="form-card-subtitle">This shapes the variety of flavors and ingredients we suggest.</div>
+      {% set adv_map = {'familiar': 0, 'curious': 1, 'bold': 2} %}
+      {% set cur_adv = preferences.adventureLevel or 'curious' %}
+      <div class="adventure-slider-wrap">
+        <input type="range" min="0" max="2" value="{{ adv_map.get(cur_adv, 1) }}"
+          class="adventure-slider" id="adventure-slider" />
+        <div class="adventure-ticks" id="adventure-ticks">
+          <span>Familiar</span><span>Curious</span><span>Bold</span>
+        </div>
+        <input type="hidden" name="adventure_level" id="adventure-level-hidden" value="{{ cur_adv }}" />
+      </div>
+    </div>
+
+    <!-- Meal prep days -->
+    <div class="form-card" style="margin-bottom:28px;">
+      <div class="form-card-title">Which days are you meal prepping?</div>
+      <div class="form-card-subtitle">Select the days that you are planning to cook.</div>
+      {% set saved_days = preferences.mealPrepDays or ['Mon','Tue','Wed','Thu','Fri'] %}
+      <div class="day-picker" style="margin-top:12px;">
+        {% for day in ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'] %}
+        <label class="day-chip">
+          <input type="checkbox" name="meal_prep_days" value="{{ day }}"
+            {% if day in saved_days %}checked{% endif %} />
+          <span>{{ day }}</span>
+        </label>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div style="display:flex;gap:10px;flex-wrap:wrap;">
+      <button type="submit" class="btn btn-primary">Save preferences</button>
+      <a href="/landing" class="btn btn-ghost">Cancel</a>
+    </div>
+
+  </form>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function() {
+  var ADV_LEVELS = ['familiar', 'curious', 'bold'];
+  var slider  = document.getElementById('adventure-slider');
+  var ticks   = document.querySelectorAll('#adventure-ticks span');
+  var hidden  = document.getElementById('adventure-level-hidden');
+  if (!slider) return;
+
+  function update() {
+    var i   = parseInt(slider.value);
+    var pct = (i / 2) * 100;
+    slider.style.background =
+      'linear-gradient(to right, var(--green) 0%, var(--green) ' + pct + '%, var(--border-dk) ' + pct + '%, var(--border-dk) 100%)';
+    if (hidden) hidden.value = ADV_LEVELS[i];
+    ticks.forEach(function(t, idx) {
+      t.style.fontWeight = idx === i ? '700' : '400';
+      t.style.color      = idx === i ? 'var(--black)' : 'var(--text-3)';
+    });
+  }
+  slider.addEventListener('input', update);
+  update();
+})();
+</script>
+{% endblock %}

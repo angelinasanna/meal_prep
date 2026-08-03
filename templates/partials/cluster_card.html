@@ -1,7 +1,5 @@
 {% set difficulty_colors = {'Easy': 'difficulty-easy', 'Medium': 'difficulty-medium', 'Hard': 'difficulty-hard'} %}
 {% set diff_class = difficulty_colors[cluster.difficulty] if cluster.difficulty in difficulty_colors else 'difficulty-easy' %}
-{% set search_query = cluster.clusterName ~ " recipe" %}
-{% set search_url = "https://www.google.com/search?q=" ~ search_query | replace(" ", "+") %}
 
 <div
   class="cluster-card {% if cluster.accepted %}accepted{% endif %}"
@@ -21,10 +19,6 @@
         <div class="cluster-name">{{ cluster.clusterName }}</div>
         <div class="cluster-tagline">{{ cluster.tagline }}</div>
       </div>
-      <a href="{{ search_url }}" target="_blank" rel="noopener" class="search-link">
-        <svg class="icon icon-xs" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-        Search
-      </a>
     </div>
 
     <div class="meals-label">Meals from this set</div>

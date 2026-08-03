@@ -1,140 +1,25 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Mise · Setup</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link href="https://fonts.googleapis.com/css2?family=Sacramento&family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400;1,600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/css/style.css" />
-  <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
-  <style>
-    html, body { margin: 0; background: var(--bg); }
+{% extends "base.html" %}
+{% block title %} · Setup{% endblock %}
 
-    /* ── Banner ── */
-    #mise-banner {
-      position: fixed;
-      top: 0; left: 0; right: 0;
-      z-index: 5;
-      height: 100px;
-      background: var(--green);
-      display: flex;
-      align-items: center;
-      padding: 0 clamp(24px, 6vw, 52px);
-    }
-    #mise-banner-text {
-      font-family: 'Sacramento', cursive;
-      font-size: clamp(2.2rem, 6vw, 3rem);
-      color: white;
-      line-height: 1;
-      margin: 0;
-    }
+{% block extra_styles %}
+<style>
+  .setup-wrap {
+    max-width: 540px;
+    margin: 0 auto;
+    padding: clamp(28px, 5vw, 48px) clamp(20px, 5vw, 40px) clamp(48px, 8vw, 80px);
+  }
+  .setup-heading {
+    font-family: 'Cormorant Garamond', Georgia, serif;
+    font-size: clamp(1.3rem, 3.5vw, 1.65rem);
+    font-weight: 600;
+    font-style: italic;
+    color: var(--black);
+    margin-bottom: 24px;
+  }
+</style>
+{% endblock %}
 
-    /* ── Form ── */
-    .setup-wrap {
-      max-width: 540px;
-      margin: 0 auto;
-      padding: calc(100px + clamp(24px, 4vw, 40px)) clamp(20px, 5vw, 40px) clamp(48px, 8vw, 80px);
-    }
-    .setup-heading {
-      font-family: 'Cormorant Garamond', Georgia, serif;
-      font-size: clamp(1.3rem, 3.5vw, 1.65rem);
-      font-weight: 600;
-      font-style: italic;
-      color: var(--black);
-      margin-bottom: 24px;
-    }
-
-    /* ── Splash ── */
-    #splash {
-      position: fixed;
-      inset: 0;
-      z-index: 20;
-      background: var(--green);
-      display: flex;
-      flex-direction: column;
-      justify-content: center;
-      padding: clamp(32px, 8vw, 72px) clamp(28px, 7vw, 60px) 80px;
-      will-change: transform;
-      overflow: hidden;
-    }
-
-    #mise-stage {
-      display: block;
-      width: min(74vw, 420px);
-      overflow: visible;
-      flex-shrink: 0;
-    }
-    .mise-text {
-      fill: white;
-      fill-opacity: 0;
-      stroke: white;
-      stroke-width: 1.4;
-      stroke-linejoin: round;
-      stroke-linecap: round;
-    }
-
-    #splash-tagline {
-      font-family: 'Cormorant Garamond', Georgia, serif;
-      font-size: clamp(1.2rem, 3.5vw, 1.8rem);
-      font-weight: 600;
-      font-style: italic;
-      color: white;
-      line-height: 1.25;
-      margin: clamp(10px, 2.5vw, 20px) 0 8px;
-      opacity: 0;
-      transform: translateY(8px);
-    }
-    #splash-sub {
-      font-family: 'Cormorant Garamond', Georgia, serif;
-      font-size: clamp(.9rem, 2.2vw, 1.1rem);
-      color: rgba(255,255,255,0.7);
-      line-height: 1.65;
-      margin: 0;
-      max-width: 400px;
-      opacity: 0;
-      transform: translateY(8px);
-    }
-
-    /* ── Scroll indicator ── */
-    #scroll-indicator {
-      position: absolute;
-      bottom: clamp(28px, 5vw, 44px);
-      left: 50%;
-      transform: translateX(-50%);
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 6px;
-      opacity: 0;
-      transition: opacity 500ms ease;
-      pointer-events: none;
-    }
-    #scroll-indicator span {
-      font-family: 'Cormorant Garamond', Georgia, serif;
-      font-size: .8rem;
-      color: rgba(255,255,255,0.55);
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-    }
-    #scroll-indicator svg {
-      animation: scroll-bounce 1.6s cubic-bezier(0.45, 0, 0.55, 1) infinite;
-    }
-    @keyframes scroll-bounce {
-      0%   { transform: translateY(-4px); opacity: 0.4; }
-      50%  { transform: translateY(5px);  opacity: 1;   }
-      100% { transform: translateY(-4px); opacity: 0.4; }
-    }
-  </style>
-</head>
-<body>
-
-<!-- Banner (z-index: 5, always beneath the splash) -->
-<header id="mise-banner">
-  <p id="mise-banner-text">Mise</p>
-</header>
-
-<!-- Form -->
+{% block content %}
 <div class="setup-wrap">
   <h1 class="setup-heading">Let's get you set up</h1>
 
@@ -229,16 +114,16 @@
       </div>
     </div>
 
-    <!-- Step 4 -->
+    <!-- Step 4 (Budget) -->
     <div class="step-section form-card" id="step-3">
-      <div class="form-card-title">How adventurous are you?</div>
-      <div class="form-card-subtitle">This shapes the variety of flavors and ingredients we suggest.</div>
+      <div class="form-card-title">What's your weekly budget?</div>
+      <div class="form-card-subtitle">We'll keep the same recipes but trim optional or pricier ingredients to fit.</div>
       <div class="adventure-slider-wrap">
-        <input type="range" min="0" max="2" value="1" class="adventure-slider" id="adventure-slider" />
-        <div class="adventure-ticks" id="adventure-ticks">
-          <span>Familiar</span><span>Curious</span><span>Bold</span>
+        <input type="range" min="0" max="2" value="1" class="adventure-slider" id="budget-slider" />
+        <div class="adventure-ticks" id="budget-ticks">
+          <span>Budget</span><span>Moderate</span><span>Flexible</span>
         </div>
-        <input type="hidden" name="adventure_level" id="adventure-level-hidden" value="curious" />
+        <input type="hidden" name="budget_level" id="budget-level-hidden" value="moderate" />
       </div>
       <div style="margin-top:22px;display:flex;gap:8px;justify-content:space-between;">
         <button type="button" class="btn btn-ghost" data-prev-step>Back</button>
@@ -267,132 +152,15 @@
 
   </form>
 </div>
+{% endblock %}
 
-<!-- Splash overlay -->
-<div id="splash">
-  <svg id="mise-stage" viewBox="0 0 500 160" preserveAspectRatio="xMinYMid meet">
-    <text id="mise-text" class="mise-text" x="8" y="138"
-      text-anchor="start" font-family="Sacramento, cursive" font-size="150">Mise</text>
-  </svg>
-  <h1 id="splash-tagline">Everything in its place.</h1>
-  <p id="splash-sub">Smart meal suggestions that share ingredients — less shopping, less waste, more variety.</p>
-
-  <!-- Scroll down indicator -->
-  <div id="scroll-indicator">
-    <span>scroll</span>
-    <svg class="icon icon-md" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <line x1="12" y1="5" x2="12" y2="19"/>
-      <polyline points="19 12 12 19 5 12"/>
-    </svg>
-  </div>
-</div>
-
-<script src="/static/js/main.js"></script>
+{% block extra_js %}
 <script>
-document.fonts.ready.then(function() {
-  var textEl    = document.getElementById('mise-text');
-  var splash    = document.getElementById('splash');
-  var tagline   = document.getElementById('splash-tagline');
-  var sub       = document.getElementById('splash-sub');
-  var indicator = document.getElementById('scroll-indicator');
-  var miseStage = document.getElementById('mise-stage');
-
-  var bbox      = textEl.getBBox();
-  var strokeLen = Math.ceil((bbox.width + bbox.height) * 8);
-  textEl.style.strokeDasharray  = strokeLen;
-  textEl.style.strokeDashoffset = strokeLen;
-
-  var drawDelay    = 120;
-  var drawDuration = 950;
-  var fillDelay    = drawDelay + drawDuration;
-  var fillDuration = 260;
-  var infoDelay    = fillDelay + fillDuration + 80;
-  var stagger      = 100;
-  // show scroll indicator after info has faded in
-  var indicatorDelay = infoDelay + stagger + 500;
-
-  var bannerH  = 100;
-  var fadeDur  = 300;
-  var slideDur = 1000; // slower, smoother
-
-  // Draw
-  setTimeout(function() {
-    textEl.style.transition = 'stroke-dashoffset ' + drawDuration + 'ms cubic-bezier(0.3,0,0.6,1)';
-    textEl.style.strokeDashoffset = '0';
-  }, drawDelay);
-
-  // Fill
-  setTimeout(function() {
-    textEl.style.transition += ', fill-opacity ' + fillDuration + 'ms ease';
-    textEl.style.fillOpacity = '1';
-  }, fillDelay);
-
-  // Info fade in
-  var fadeInStyle = 'opacity 450ms ease, transform 450ms cubic-bezier(0.16,1,0.3,1)';
-  [tagline, sub].forEach(function(el, i) {
-    setTimeout(function() {
-      el.style.transition = fadeInStyle;
-      el.style.opacity    = '1';
-      el.style.transform  = 'translateY(0)';
-    }, infoDelay + i * stagger);
-  });
-
-  // Show scroll indicator
-  setTimeout(function() {
-    indicator.style.opacity = '1';
-  }, indicatorDelay);
-
-  // Slide trigger — fires once on scroll or swipe down
-  var triggered = false;
-  function triggerSlide() {
-    if (triggered) return;
-    triggered = true;
-
-    // Hide indicator and splash content
-    indicator.style.opacity = '0';
-    [tagline, sub, miseStage].forEach(function(el) {
-      el.style.transition = 'opacity ' + fadeDur + 'ms ease';
-      el.style.opacity    = '0';
-    });
-
-    // Slide splash up after content fades enough
-    setTimeout(function() {
-      var vh = window.innerHeight;
-      splash.style.transition = 'transform ' + slideDur + 'ms cubic-bezier(0.25, 1, 0.35, 1)';
-      splash.style.transform  = 'translateY(-' + (vh - bannerH) + 'px)';
-      splash.addEventListener('transitionend', function() {
-        splash.style.display = 'none';
-      }, { once: true });
-    }, 120);
-  }
-
-  // Mouse wheel (desktop)
-  window.addEventListener('wheel', function(e) {
-    if (e.deltaY > 0) triggerSlide();
-  }, { passive: true, once: true });
-
-  // Touch swipe up (mobile)
-  var touchY = 0;
-  window.addEventListener('touchstart', function(e) {
-    touchY = e.touches[0].clientY;
-  }, { passive: true });
-  window.addEventListener('touchmove', function(e) {
-    if (!triggered && e.touches[0].clientY < touchY - 20) triggerSlide();
-  }, { passive: true });
-});
-
-document.querySelectorAll('.meal-type-row').forEach(function(row) {
-  var cb = row.querySelector('input[type="checkbox"]');
-  if (!cb) return;
-  cb.checked = false;
-  row.classList.remove('checked');
-});
-
 (function() {
-  var LEVELS = ['familiar', 'curious', 'bold'];
-  var slider = document.getElementById('adventure-slider');
-  var ticks  = document.querySelectorAll('#adventure-ticks span');
-  var hidden = document.getElementById('adventure-level-hidden');
+  var LEVELS = ['budget', 'moderate', 'flexible'];
+  var slider = document.getElementById('budget-slider');
+  var ticks  = document.querySelectorAll('#budget-ticks span');
+  var hidden = document.getElementById('budget-level-hidden');
   if (!slider) return;
   function update() {
     var i   = parseInt(slider.value);
@@ -408,6 +176,13 @@ document.querySelectorAll('.meal-type-row').forEach(function(row) {
   slider.addEventListener('input', update);
   update();
 })();
+
+document.querySelectorAll('.meal-type-row').forEach(function(row) {
+  var cb = row.querySelector('input[type="checkbox"]');
+  if (!cb) return;
+  cb.checked = false;
+  row.classList.remove('checked');
+});
+
 </script>
-</body>
-</html>
+{% endblock %}

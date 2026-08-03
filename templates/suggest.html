@@ -12,7 +12,7 @@
 
   <div id="suggestions-container" data-meal-types="{{ meal_types | join(',') }}" data-mode="{{ mode }}">
 
-    <!-- Single loading screen — hidden once all sections are ready -->
+    <!-- Single loading screen [ hidden once all sections are ready -->
     <div id="suggest-loading" style="text-align:center;padding:72px 24px 40px;">
       <div class="spinner" style="margin:0 auto 22px;"></div>
       <p id="suggest-loading-text" style="font-size:1rem;font-weight:500;color:var(--text-2);">Finding ideas…</p>
@@ -155,7 +155,7 @@
     }
   }
 
-  // Use fetch() for initial section loading — more reliable than htmx.ajax()
+  // Use fetch() for initial section loading ] more reliable than htmx.ajax()
   function loadSection(mt) {
     var section = document.getElementById('mt-section-' + mt);
     if (!section) { markSettled(mt); return; }
@@ -181,7 +181,7 @@
   }
 
   // Update count after any HTMX interaction (toggle, skip).
-  // Must use htmx:afterSettle, not htmx:afterSwap — htmx temporarily copies the
+  // Must use htmx:afterSettle, not htmx:afterSwap - htmx temporarily copies the
   // old element's attributes (including class) onto the new element during the swap,
   // so the "accepted" class isn't present until afterSettle fires (~20ms later).
   document.addEventListener('htmx:afterSettle', function() { updateAcceptedCount(); });

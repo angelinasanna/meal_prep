@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+{% block title %} · Grocery lists{% endblock %}
+
+{% block content %}
+{% set meal_labels = {'breakfast': 'Breakfast', 'lunch': 'Lunch', 'dinner': 'Dinner'} %}
+<div style="padding-top:20px;">
+
+  {% if not weeks %}
+  <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:40vh;gap:16px;text-align:center;">
+    <div style="width:52px;height:52px;background:var(--bg);border:1px solid var(--border);border-radius:14px;display:flex;align-items:center;justify-content:center;color:var(--text-3);">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2L3 6v14a2 2 0 002 2h14a2 2 0 002-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 01-8 0"/></svg>
+    </div>
+    <p style="font-size:1rem;font-weight:700;color:var(--black);">No plans yet</p>
+    <p style="font-size:.875rem;color:var(--text-3);">Plan a week to see your grocery list here.</p>
+    <a href="/mode" class="btn btn-primary" style="margin-top:4px;">Start planning</a>
+  </div>
+
+  {% else %}
+
+  <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:16px;">
+    <h1 class="plan-section-title">Grocery lists</h1>
+  </div>
+
+  <!-- Global controls: view toggle + store selector -->
+  <div class="grocery-controls" style="margin-bottom:8px;">
+    <div class="grocery-view-toggle">
+      <button class="grocery-view-btn active" id="btn-by-cat" onclick="setView('cat')">By category</button>
+      <button class="grocery-view-btn" id="btn-by-recipe" onclick="setView('recipe')">By recipe</button>
+    </div>
+    <select class="grocery-store-select" id="store-select" onchange="updatePrice()">
+      <option value="1.00">Trader Joe's</option>
+      <option value="1.40">Whole Foods</option>
+      <option value="0.85">Kroger</option>
+      <option value="0.90">Target</option>
+      <option value="0.78">Walmart</option>
+      <option value="0.70">Costco</option>
+    </select>
+  </div>
+  <p class="grocery-price-est" id="price-est" style="margin-bottom:16px;"></p>
+
+  <!-- Week tabs -->
+  <div class="grocery-tabs" id="grocery-tabs">
+    {% for w in weeks %}
+    <button class="grocery-tab{% if w.week_key == active_week %} active{% endif %}"
+      data-week="{{ w.week_key }}" onclick="switchTab('{{ w.week_key }}')">{{ w.week_range }}</button>
+    {% endfor %}
+  </div>
+
+  <!-- Week panels -->
+  {% for w in weeks %}
+  <div class="grocery-panel" id="panel-{{ w.week_key }}" style="display:{% if w.week_key == active_week %}block{% else %}none{% endif %};">
+
+    {% if w.grocery_by_category %}
+    <p style="font-size:.8rem;color:var(--text-3);margin:16px 0 4px;">
+      {{ w.grocery_list | length }} items ·
+      {% set checked_count = w.checked_items | length %}
+      {% if checked_count == 0 %}tap to check off as you shop{% else %}{{ checked_count }} checked{% endif %}
+    </p>
+
+    <!-- By category -->
+    <div class="grocery-list view-cat" id="view-cat-{{ w.week_key }}">
+      {% for category, items in w.grocery_by_category.items() %}
+      <div class="grocery-category-header">{{ category }}</div>
+      {% for item in items %}
+      {% set is_checked = item.key in w.checked_items %}
+      <div class="grocery-item {{ 'done' if is_checked else '' }}" data-category="{{ item.get('category','Pantry') }}">
+        <input type="checkbox" class="grocery-checkbox"
+          data-key="{{ item.key }}" data-week="{{ w.week_key }}"
+          {{ 'checked' if is_checked else '' }} onchange="toggleGrocery(this)" />
+        <span class="grocery-name">{{ item.name | capitalize }}</span>
+        <span class="grocery-amount">{{ item.amount }} {{ item.unit }}</span>
+      </div>
+      {% endfor %}
+      {% endfor %}
+    </div>
+
+    <!-- By recipe -->
+    <div class="grocery-list view-recipe" id="view-recipe-{{ w.week_key }}" style="display:none;">
+      {% for cluster in w.grocery_by_recipe %}
+      <div class="grocery-category-header">
+        {{ cluster.name }}
+        <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:.7rem;margin-left:6px;opacity:.7;">{{ meal_labels.get(cluster.meal_type, cluster.meal_type) }}</span>
+      </div>
+      {% for item in cluster.items %}
+      {% set is_checked = item.key in w.checked_items %}
+      <div class="grocery-item {{ 'done' if is_checked else '' }}" data-category="{{ item.get('category','Pantry') }}">
+        <input type="checkbox" class="grocery-checkbox"
+          data-key="{{ item.key }}" data-week="{{ w.week_key }}"
+          {{ 'checked' if is_checked else '' }} onchange="toggleGrocery(this)" />
+        <span class="grocery-name">{{ item.name | capitalize }}</span>
+        <span class="grocery-amount">{{ item.amount }} {{ item.unit }}</span>
+      </div>
+      {% endfor %}
+      {% endfor %}
+    </div>
+
+    {% else %}
+    <div class="card card-body" style="text-align:center;color:var(--text-3);font-size:.875rem;margin-top:20px;">
+      You already have everything you need.
+    </div>
+    {% endif %}
+
+  </div>
+  {% endfor %}
+
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+var BASE_PRICE = {'Produce':4.00,'Meat & Seafood':12.00,'Dairy & Eggs':4.50,'Bakery':3.50,'Frozen':4.50,'Pantry':2.75};
+var _activePanel = '{{ active_week }}';
+
+function updatePrice() {
+  var mult = parseFloat(document.getElementById('store-select').value);
+  var panel = document.getElementById('panel-' + _activePanel);
+  var total = 0;
+  if (panel) {
+    panel.querySelectorAll('.grocery-item').forEach(function(el) {
+      var cat = el.dataset.category || 'Pantry';
+      total += (BASE_PRICE[cat] || 3.00) * mult;
+    });
+  }
+  var sel = document.getElementById('store-select');
+  var label = sel.options[sel.selectedIndex].text;
+  var el = document.getElementById('price-est');
+  if (el) el.textContent = total > 0 ? 'Estimated total at ' + label + ': ~$' + total.toFixed(0) : '';
+}
+
+function setView(v) {
+  document.querySelectorAll('.view-cat').forEach(function(el) { el.style.display = v === 'cat' ? 'block' : 'none'; });
+  document.querySelectorAll('.view-recipe').forEach(function(el) { el.style.display = v === 'recipe' ? 'block' : 'none'; });
+  document.getElementById('btn-by-cat').classList.toggle('active', v === 'cat');
+  document.getElementById('btn-by-recipe').classList.toggle('active', v === 'recipe');
+}
+
+function switchTab(weekKey) {
+  document.querySelectorAll('.grocery-panel').forEach(function(p) { p.style.display = 'none'; });
+  document.querySelectorAll('.grocery-tab').forEach(function(t) { t.classList.remove('active'); });
+  var panel = document.getElementById('panel-' + weekKey);
+  if (panel) panel.style.display = 'block';
+  document.querySelectorAll('.grocery-tab[data-week="' + weekKey + '"]').forEach(function(t) { t.classList.add('active'); });
+  _activePanel = weekKey;
+  updatePrice();
+}
+
+function toggleGrocery(cb) {
+  cb.closest('.grocery-item').classList.toggle('done', cb.checked);
+  var key = cb.dataset.key;
+  document.querySelectorAll('.grocery-checkbox[data-key="' + key + '"]').forEach(function(c) {
+    c.checked = cb.checked;
+    c.closest('.grocery-item').classList.toggle('done', cb.checked);
+  });
+  var url = '/grocery/toggle/' + key + (cb.dataset.week ? '?week=' + encodeURIComponent(cb.dataset.week) : '');
+  fetch(url, {method: 'POST'});
+}
+
+updatePrice();
+</script>
+{% endblock %}

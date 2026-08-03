@@ -5,180 +5,389 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Mise</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link href="https://fonts.googleapis.com/css2?family=Sacramento&family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400;1,600&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Kalam:wght@400;700&family=Sacramento&family=Caveat:wght@400;600;700&family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400;1,600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/css/style.css" />
-  <style>
-    html, body { margin: 0; background: var(--bg); }
-
-    /* ── Banner ── */
-    .landing-banner {
-      background: var(--green);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: clamp(40px, 8vw, 72px) 24px;
-    }
-
-    #mise-stage {
-      width: min(80vw, 520px);
-      display: block;
-    }
-
-    .mise-text {
-      fill: white;
-      fill-opacity: 0;
-      stroke: white;
-      stroke-width: 1.4;
-      stroke-linejoin: round;
-      stroke-linecap: round;
-      filter: drop-shadow(0 0 12px rgba(255,255,255,0.22));
-    }
-
-    /* ── Content below banner ── */
-    .landing-content {
-      text-align: center;
-      padding: clamp(36px, 6vw, 60px) 24px clamp(48px, 8vw, 80px);
-      max-width: 480px;
-      margin: 0 auto;
-    }
-
-    .landing-title {
-      font-family: 'Cormorant Garamond', Georgia, serif;
-      font-size: clamp(1.75rem, 5vw, 2.75rem);
-      font-weight: 600;
-      font-style: italic;
-      color: var(--black);
-      line-height: 1.2;
-      margin-bottom: 14px;
-      opacity: 0;
-      transform: translateY(12px);
-    }
-
-    .landing-sub {
-      font-family: 'Cormorant Garamond', Georgia, serif;
-      font-size: clamp(1rem, 2.5vw, 1.2rem);
-      color: var(--text-3);
-      line-height: 1.7;
-      margin-bottom: 32px;
-      opacity: 0;
-      transform: translateY(12px);
-    }
-
-    .landing-btns {
-      display: flex;
-      gap: 12px;
-      justify-content: center;
-      flex-wrap: wrap;
-      opacity: 0;
-      transform: translateY(12px);
-    }
-
-    .btn-landing {
-      display: inline-block;
-      font-family: 'Cormorant Garamond', Georgia, serif;
-      font-weight: 600;
-      font-size: 1.1rem;
-      letter-spacing: 0.03em;
-      padding: 13px 44px;
-      border-radius: 6px;
-      text-decoration: none;
-      transition: background 150ms ease, transform 150ms ease, color 150ms ease;
-    }
-    .btn-landing-primary {
-      background: var(--green);
-      color: white;
-    }
-    .btn-landing-primary:hover {
-      background: var(--green-2);
-      transform: translateY(-1px);
-      text-decoration: none;
-      color: white;
-    }
-    .btn-landing-ghost {
-      background: transparent;
-      color: var(--text-3);
-      border: 1.5px solid var(--border-dk);
-    }
-    .btn-landing-ghost:hover {
-      background: var(--border);
-      color: var(--black);
-      transform: translateY(-1px);
-      text-decoration: none;
-    }
-  </style>
 </head>
 <body>
 
-<!-- Banner -->
-<div class="landing-banner">
-  <svg id="mise-stage" viewBox="0 0 800 240" preserveAspectRatio="xMidYMid meet">
-    <text
-      id="mise-text"
-      class="mise-text"
-      x="400"
-      y="195"
-      text-anchor="middle"
-      font-family="Sacramento, cursive"
-      font-size="210"
-    >Mise</text>
-  </svg>
-</div>
+<!-- Sidebar overlay -->
+<div class="sidebar-overlay" id="sidebar-overlay"></div>
 
-<!-- Info -->
-<div class="landing-content">
-  <h1 class="landing-title" id="landing-title">Everything in its place.</h1>
-  <p class="landing-sub" id="landing-sub">Smart meal suggestions that share ingredients — less shopping, less waste, more variety.</p>
-  <div class="landing-btns" id="landing-btn">
-    {% if has_prefs %}
-      <a href="/dashboard" class="btn-landing btn-landing-primary">View my plan</a>
-      <a href="/onboarding" class="btn-landing btn-landing-ghost">Start over</a>
+<div class="sidebar" id="sidebar">
+  <div class="sidebar-head">
+    <img src="/static/handwriting-static.png" class="sidebar-logo" alt="Mise" />
+    <button class="sidebar-close" id="sidebar-close" aria-label="Close">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+
+  <nav class="sidebar-nav">
+    <a href="/landing" class="sidebar-nav-item">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+      Home
+    </a>
+    <a href="/preferences" class="sidebar-nav-item">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="6" x2="20" y2="6"/><line x1="8" y1="12" x2="20" y2="12"/><line x1="12" y1="18" x2="20" y2="18"/><circle cx="2" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="6" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="10" cy="18" r="1" fill="currentColor" stroke="none"/></svg>
+      Preferences
+    </a>
+    <a href="/grocery" class="sidebar-nav-item">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2L3 6v14a2 2 0 002 2h14a2 2 0 002-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 01-8 0"/></svg>
+      Grocery list
+    </a>
+    <a href="/browse" class="sidebar-nav-item">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 016.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/></svg>
+      Browse recipes
+    </a>
+  </nav>
+
+  <div class="sidebar-footer">
+    {% if request.session.get('user_id') %}
+    <div class="sidebar-profile">
+      <div class="sidebar-avatar">{{ (request.session.get('user_name') or 'U')[0] | upper }}</div>
+      <div class="sidebar-profile-info">
+        <span class="sidebar-profile-name">{{ request.session.get('user_name', '') }}</span>
+        <span class="sidebar-profile-email">{{ request.session.get('user_email', '') }}</span>
+      </div>
+      <form action="/logout" method="post" style="margin:0;">
+        <button type="submit" class="sidebar-logout-btn" title="Sign out">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        </button>
+      </form>
+    </div>
     {% else %}
-      <a href="/onboarding" class="btn-landing btn-landing-primary">Get started</a>
+    <a href="/login" class="sidebar-nav-item">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+      Sign in
+    </a>
     {% endif %}
   </div>
 </div>
 
+<!-- ── Banner ───────────────────────────────────────────────────── -->
+<div class="landing-banner">
+  <button class="menu-btn" id="menu-btn" aria-label="Open menu">
+    <span></span><span></span><span></span>
+  </button>
+  <img src="/static/handwriting.gif" class="landing-gif" alt="Mise" />
+</div>
+
+<!-- ── Full-width carousel hero ─────────────────────────────────── -->
+<div class="carousel-hero">
+  <div class="carousel-inner">
+    <button class="carousel-arrow carousel-arrow-prev" id="carousel-prev" aria-label="Previous recipe">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+    </button>
+
+    <div class="carousel-track-wrap">
+      <div class="carousel-track" id="carousel-track">
+        {% for recipe in carousel_recipes %}
+        <div class="carousel-card{% if recipe.image %} has-image{% endif %}" data-index="{{ loop.index0 }}" data-recipe-id="{{ recipe.id }}"{% if recipe.image %} style="--card-img: url('{{ recipe.image }}');cursor:pointer;"{% endif %} onclick="if(this.dataset.recipeId)window.location='/browse?open='+this.dataset.recipeId">
+          <div class="carousel-card-inner">
+            <p class="carousel-card-name">{{ recipe.name }}</p>
+            <p class="carousel-card-caption">{{ recipe.caption }}</p>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <button class="carousel-arrow carousel-arrow-next" id="carousel-next" aria-label="Next recipe">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+    </button>
+  </div>
+
+  <div class="carousel-dots" id="carousel-dots">
+    {% for recipe in carousel_recipes %}
+    <button class="carousel-dot{% if loop.first %} active{% endif %}" data-index="{{ loop.index0 }}" aria-label="Recipe {{ loop.index }}"></button>
+    {% endfor %}
+  </div>
+</div>
+
+<!-- ── Main page section ───────────────────────────────────────── -->
+<section class="main-page" id="main-page">
+
+  <!-- Week plan section -->
+  <div class="landing-plan-section">
+
+    <!-- Left: current week plan -->
+    <div class="landing-plan-main">
+      <div class="dash-section-head">
+        <svg class="icon icon-sm" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-3);">
+          <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>
+        </svg>
+        <h2 class="dash-section-title">
+          {% if week_range %}{{ week_range }}{% else %}This week{% endif %}
+        </h2>
+        {% if selected_week and selected_week == current_week %}
+          <span class="dash-week-pill">Current week</span>
+        {% endif %}
+      </div>
+
+      {% if has_prefs %}
+        {% if has_plan and calendar_data %}
+          <div class="day-list">
+            {% for day in calendar_data %}
+            <div class="day-row{% if day.is_today %} day-today{% endif %}{% if day.is_past %} day-past{% endif %}" style="animation-delay:{{ loop.index0 * 55 }}ms">
+              <div class="day-row-left">
+                <span class="day-row-name">{{ day.full }}</span>
+                <span class="day-row-sub">{{ day.meal_count }} meal{{ 's' if day.meal_count != 1 else '' }} planned</span>
+              </div>
+              <div class="day-row-right">
+                {% if day.date_str %}
+                <button
+                  class="day-status-btn {{ 'complete' if day.is_complete else 'planned' }}"
+                  onclick="toggleDay(this,'{{ day.date_str }}')">
+                  {{ 'Complete' if day.is_complete else 'Planned' }}
+                </button>
+                {% endif %}
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+          <div class="dash-plan-cta">
+            <a href="/recipes" class="btn btn-primary btn-sm">View recipes</a>
+            <a href="/plan" class="btn btn-secondary btn-sm">Grocery list</a>
+            <a href="/update-plan" class="btn btn-ghost btn-sm">Edit plan</a>
+          </div>
+
+        {% elif has_plan and not calendar_data %}
+          <div class="day-list-empty">
+            <p class="day-list-empty-text">Your plan is for a different week.</p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <a href="/landing" class="btn btn-ghost btn-sm">Go to current week</a>
+              <a href="/mode" class="btn btn-secondary btn-sm">Start new plan</a>
+            </div>
+          </div>
+
+        {% else %}
+          <div class="day-list-empty">
+            <div class="day-list-empty-icon">
+              <svg class="icon icon-lg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+            </div>
+            <p class="day-list-empty-title">No plan yet</p>
+            <p class="day-list-empty-text">Pick your meals and build your week.</p>
+            <a href="/mode" class="btn btn-primary">Start planning</a>
+          </div>
+        {% endif %}
+
+      {% else %}
+        <div class="day-list-empty">
+          <p class="day-list-empty-title">Set up your preferences to get started</p>
+          <a href="/onboarding" class="btn btn-primary" style="margin-top:12px;">Get started</a>
+        </div>
+      {% endif %}
+    </div>
+
+    <!-- Right: month calendar -->
+    <div class="landing-plan-sidebar">
+      <div class="month-cal">
+        <div class="month-cal-head">
+          <form action="/calendar-nav" method="post" style="display:contents;">
+            <input type="hidden" name="year" value="{{ prev_year }}">
+            <input type="hidden" name="month" value="{{ prev_month }}">
+            <input type="hidden" name="next_url" value="/landing">
+            <button type="submit" class="month-cal-nav" aria-label="Previous month">
+              <svg class="icon icon-xs" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="15 18 9 12 15 6"/></svg>
+            </button>
+          </form>
+          <span class="month-cal-title">{{ cal_month_name }} {{ cal_year }}</span>
+          <form action="/calendar-nav" method="post" style="display:contents;">
+            <input type="hidden" name="year" value="{{ next_year }}">
+            <input type="hidden" name="month" value="{{ next_month }}">
+            <input type="hidden" name="next_url" value="/landing">
+            <button type="submit" class="month-cal-nav" aria-label="Next month">
+              <svg class="icon icon-xs" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+            </button>
+          </form>
+        </div>
+        <div class="month-cal-dow">
+          {% for d in ['M','T','W','T','F','S','S'] %}
+          <span>{{ d }}</span>
+          {% endfor %}
+        </div>
+        {% for wk_key, wk_dates in month_weeks %}
+        <form action="/select-week" method="post">
+          <input type="hidden" name="week" value="{{ wk_key }}">
+          <input type="hidden" name="cal_year" value="{{ cal_year }}">
+          <input type="hidden" name="cal_month" value="{{ cal_month }}">
+          <input type="hidden" name="next_url" value="/landing">
+          <button type="submit" class="month-cal-week{% if wk_key == selected_week %} selected{% endif %}">
+            {% for d in wk_dates %}
+            <span class="month-cal-day{% if d.month != cal_month %} other-month{% endif %}{% if d.isoformat() == today_str %} today{% endif %}">
+              {{ d.day }}
+            </span>
+            {% endfor %}
+          </button>
+        </form>
+        {% endfor %}
+      </div>
+    </div>
+
+  </div>
+
+</section>
+
+<!-- Footer -->
+<footer class="site-footer-section">
+  <div class="footer-columns">
+    <div class="footer-col">
+      <h3 class="footer-col-heading">FAQ</h3>
+      <ul class="footer-col-list">
+        <li><span class="footer-placeholder-link"></span></li>
+        <li><span class="footer-placeholder-link" style="width:72%"></span></li>
+        <li><span class="footer-placeholder-link" style="width:58%"></span></li>
+        <li><span class="footer-placeholder-link" style="width:80%"></span></li>
+      </ul>
+    </div>
+
+    <div class="footer-col">
+      <h3 class="footer-col-heading">Contact</h3>
+      <ul class="footer-col-list">
+        <li><span class="footer-placeholder-link"></span></li>
+        <li><span class="footer-placeholder-link" style="width:65%"></span></li>
+        <li><span class="footer-placeholder-link" style="width:50%"></span></li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="footer-bottom">
+    <span class="footer-copy">© 2026 Mise</span>
+  </div>
+</footer>
+
 <script>
-document.fonts.ready.then(function() {
-  var textEl = document.getElementById('mise-text');
+// ── Sidebar ──────────────────────────────────────────────────────
+(function() {
+  var menuBtn = document.getElementById('menu-btn');
+  var sidebar = document.getElementById('sidebar');
+  var overlay = document.getElementById('sidebar-overlay');
+  var closeBtn = document.getElementById('sidebar-close');
 
-  var bbox      = textEl.getBBox();
-  var strokeLen = Math.ceil((bbox.width + bbox.height) * 8);
-  textEl.style.strokeDasharray  = strokeLen;
-  textEl.style.strokeDashoffset = strokeLen;
+  function openSidebar() {
+    sidebar.classList.add('open');
+    overlay.classList.add('open');
+    document.body.style.overflow = 'hidden';
+  }
+  function closeSidebar() {
+    sidebar.classList.remove('open');
+    overlay.classList.remove('open');
+    document.body.style.overflow = '';
+  }
 
-  var drawDelay    = 180;
-  var drawDuration = 1100;
-  var fillDelay    = drawDelay + drawDuration;
-  var fillDuration = 320;
-  var contentDelay = fillDelay + fillDuration + 200;
-  var stagger      = 110;
+  if (menuBtn) menuBtn.addEventListener('click', openSidebar);
+  if (closeBtn) closeBtn.addEventListener('click', closeSidebar);
+  if (overlay)  overlay.addEventListener('click', closeSidebar);
+})();
 
-  setTimeout(function() {
-    textEl.style.transition = 'stroke-dashoffset ' + drawDuration + 'ms cubic-bezier(0.3, 0, 0.6, 1)';
-    textEl.style.strokeDashoffset = '0';
-  }, drawDelay);
+// ── Carousel ─────────────────────────────────────────────────────
+(function() {
+  var track   = document.getElementById('carousel-track');
+  var dots    = document.querySelectorAll('.carousel-dot');
+  var prevBtn = document.getElementById('carousel-prev');
+  var nextBtn = document.getElementById('carousel-next');
+  if (!track || !dots.length) return;
 
-  setTimeout(function() {
-    textEl.style.transition += ', fill-opacity ' + fillDuration + 'ms ease';
-    textEl.style.fillOpacity = '1';
-  }, fillDelay);
+  var total = dots.length;
+  var current = 0;
+  var timer = null;
+  var TRANS = 'transform 0.5s cubic-bezier(0.4, 0, 0.2, 1)';
 
-  var els = [
-    document.getElementById('landing-title'),
-    document.getElementById('landing-sub'),
-    document.getElementById('landing-btn'),
-  ];
-
-  var fadeIn = 'opacity 550ms ease, transform 550ms cubic-bezier(0.16, 1, 0.3, 1)';
-  els.forEach(function(el, i) {
-    setTimeout(function() {
-      el.style.transition = fadeIn;
-      el.style.opacity    = '1';
-      el.style.transform  = 'translateY(0)';
-    }, contentDelay + i * stagger);
+  // Append clones of all slides so we can loop rightward infinitely
+  Array.from(track.children).forEach(function(card) {
+    track.appendChild(card.cloneNode(true));
   });
-});
+
+  function updateDots(pos) {
+    var rel = pos % total;
+    dots.forEach(function(d, i) { d.classList.toggle('active', i === rel); });
+  }
+
+  function setPos(pos, animate) {
+    track.style.transition = animate ? TRANS : 'none';
+    if (!animate) track.getBoundingClientRect(); // force reflow before snap
+    current = pos;
+    track.style.transform = 'translateX(-' + (pos * 100) + '%)';
+    updateDots(pos);
+  }
+
+  // After sliding into a clone, silently snap back to the real slide
+  track.addEventListener('transitionend', function() {
+    if (current >= total) {
+      setPos(current - total, false);
+    }
+  });
+
+  function next() { setPos(current + 1, true); }
+
+  function prev() {
+    if (current === 0) {
+      // Jump silently to the clone of slide 0, then slide left to the real last slide
+      setPos(total, false);
+      requestAnimationFrame(function() {
+        requestAnimationFrame(function() { setPos(total - 1, true); });
+      });
+    } else {
+      setPos(current - 1, true);
+    }
+  }
+
+  function startTimer() {
+    clearInterval(timer);
+    timer = setInterval(next, 4000);
+  }
+
+  dots.forEach(function(dot) {
+    dot.addEventListener('click', function() {
+      setPos(parseInt(this.getAttribute('data-index'), 10), true);
+      startTimer();
+    });
+  });
+
+  if (prevBtn) prevBtn.addEventListener('click', function() { prev(); startTimer(); });
+  if (nextBtn) nextBtn.addEventListener('click', function() { next(); startTimer(); });
+
+  startTimer();
+})();
+
+// ── Scroll-position preservation across calendar nav ────────────
+(function() {
+  var SCROLL_KEY = 'mise_landing_scroll';
+
+  // On load: restore saved position if we just did a calendar nav
+  var saved = sessionStorage.getItem(SCROLL_KEY);
+  if (saved !== null) {
+    sessionStorage.removeItem(SCROLL_KEY);
+    window.scrollTo(0, parseInt(saved, 10));
+  }
+
+  // Before any calendar form submits: save current scroll Y
+  document.querySelectorAll(
+    'form[action="/calendar-nav"], form[action="/select-week"]'
+  ).forEach(function(form) {
+    form.addEventListener('submit', function() {
+      sessionStorage.setItem(SCROLL_KEY, window.scrollY);
+    });
+  });
+})();
+
+// ── Day toggle (same as dashboard) ──────────────────────────────
+function toggleDay(btn, dateStr) {
+  var r = document.createElement('span');
+  r.className = 'ripple-el';
+  var rect = btn.getBoundingClientRect();
+  r.style.left = (event.clientX - rect.left - 10) + 'px';
+  r.style.top  = (event.clientY - rect.top  - 10) + 'px';
+  btn.appendChild(r);
+  r.addEventListener('animationend', function() { r.remove(); });
+
+  btn.classList.add('btn-popping');
+  btn.addEventListener('animationend', function() { btn.classList.remove('btn-popping'); }, { once: true });
+
+  fetch('/day/complete/' + dateStr, { method: 'POST' })
+    .then(function(res) { return res.text(); })
+    .then(function(html) { btn.outerHTML = html; });
+}
+
 </script>
 </body>
 </html>

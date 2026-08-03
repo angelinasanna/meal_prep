@@ -3,8 +3,13 @@
 
 {% block content %}
 <div style="padding-top:12px;">
-  <h1 class="page-heading">What are you craving?</h1>
-  <p class="page-heading-sub">Choose the cuisines you're in the mood for and your current season. We'll suggest meals that match your taste and what's fresh right now.</p>
+
+  <div style="margin-bottom:24px;">
+    <a href="/mode" class="btn btn-ghost btn-sm" style="display:inline-flex;align-items:center;gap:4px;margin-bottom:12px;">← Back</a>
+    <h1 class="page-heading" style="margin:0;font-family:'Kalam',cursive;font-weight:700;">What are you craving?</h1>
+  </div>
+
+  <p class="page-heading-sub" style="margin-top:0;margin-bottom:20px;">Choose the cuisines you're in the mood for and your current season. We'll suggest meals that match your taste and what's fresh right now.</p>
 
   <form action="/cuisine" method="post" class="form-card">
 
@@ -28,8 +33,7 @@
       {% endfor %}
     </div>
 
-    <div style="margin-top:32px;display:flex;gap:8px;justify-content:space-between;align-items:center;">
-      <a href="/mode" class="btn btn-ghost">Back</a>
+    <div style="margin-top:32px;">
       <button type="submit" class="btn btn-primary">Get suggestions</button>
     </div>
   </form>

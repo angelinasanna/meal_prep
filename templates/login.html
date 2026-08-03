@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sign in · Mise</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Sacramento&family=Caveat:wght@400;600;700&family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400;1,600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body style="background:var(--bg);min-height:100vh;display:flex;flex-direction:column;">
+
+  <!-- Green banner with centered logo -->
+  <div style="background:var(--green);width:100%;display:flex;align-items:center;justify-content:center;padding:clamp(28px,6vw,56px) 24px;">
+    <img src="/static/handwriting.gif" alt="Mise" style="width:min(52vw,220px);" />
+  </div>
+
+  <!-- Form centered below -->
+  <div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:clamp(24px,5vw,48px) 24px;">
+    <div style="width:100%;max-width:380px;">
+      <div style="background:white;border:1px solid var(--border);border-radius:var(--r-lg);padding:clamp(24px,5vw,40px);box-shadow:var(--shadow-sm);">
+        <h1 style="font-size:1.25rem;font-weight:800;color:var(--black);margin-bottom:4px;letter-spacing:-0.02em;">Sign in</h1>
+        <p style="font-size:.875rem;color:var(--text-3);margin-bottom:24px;">Your plans are saved to your account.</p>
+
+        <form action="/login" method="post" style="display:flex;flex-direction:column;gap:14px;">
+          <div style="display:flex;flex-direction:column;gap:6px;">
+            <label style="font-size:.8rem;font-weight:600;color:var(--text-2);">Name</label>
+            <input type="text" name="name" placeholder="Your name" autocomplete="name"
+              style="border:1px solid var(--border);border-radius:8px;padding:10px 14px;font-size:.9rem;background:var(--bg);color:var(--black);outline:none;width:100%;box-sizing:border-box;" />
+          </div>
+          <div style="display:flex;flex-direction:column;gap:6px;">
+            <label style="font-size:.8rem;font-weight:600;color:var(--text-2);">Email</label>
+            <input type="email" name="email" placeholder="you@example.com" autocomplete="email" required
+              style="border:1px solid var(--border);border-radius:8px;padding:10px 14px;font-size:.9rem;background:var(--bg);color:var(--black);outline:none;width:100%;box-sizing:border-box;" />
+          </div>
+          <button type="submit" class="btn btn-primary" style="width:100%;margin-top:4px;">Continue</button>
+        </form>
+      </div>
+
+      <p style="text-align:center;font-size:.8rem;color:var(--text-3);margin-top:20px;">
+        <a href="/landing" style="color:var(--text-3);">Skip for now</a>
+      </p>
+    </div>
+  </div>
+
+</body>
+</html>
