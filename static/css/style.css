@@ -1,35 +1,66 @@
 /* ── Variables ─────────────────────────────────────────────── */
 :root {
-  --bg:        #f0ebe0;
-  --card:      #faf6ed;
-  --border:    #d8ceba;
-  --border-dk: #c0aa8e;
+  /* ── Core palette — sampled from the reference kitchens ───── */
+  --plaster:      #EDE6DA;   /* page background, walls */
+  --plaster-deep: #DDD2C0;   /* recessed areas, shadow side */
+  --grout:        #CFC0A8;   /* tile grout, hairline dividers */
+  --olive:        #6E7B4F;   /* primary tile field, primary action */
+  --sage:         #A3B189;   /* lighter tile field */
+  --terra:        #B5623C;   /* accent tile, CTAs */
+  --oxblood:      #8E4A44;   /* accent tile, destructive */
+  --ochre:        #C89442;   /* accent tile, highlights */
+  --slate:        #7C8E93;   /* accent tile, muted state */
+  --cream-tile:   #E4D6BC;   /* neutral tile field */
+  --walnut:       #6B4C33;   /* shelves, header, rails */
+  --walnut-lt:    #8A6540;   /* wood top edge, highlight */
+  --walnut-dk:    #4A3120;   /* wood shadow side */
+  --brass:        #A9843F;   /* fixtures, focus ring, small metal */
+  --ink:          #2B2018;   /* body text */
 
-  --text:      #2c2017;
-  --text-2:    #4a3a28;
-  --text-3:    #8a7862;
+  /* ── Legacy names remapped onto the palette (DO NOT rename;
+        40+ selectors depend on these) ────────────────────────── */
+  --bg:        var(--plaster);
+  --card:      #F4EEE2;       /* card sits a touch lighter than the wall */
+  --border:    var(--grout);
+  --border-dk: #BCA98A;
 
-  /* Sage green — links, tags, active chips, step dots */
-  --green:     #5e7d5c;
-  --green-2:   #4a6648;
-  --green-3:   #72966f;
-  --green-lt:  #eef4ec;
-  --green-mid: #cddecb;
+  --text:      var(--ink);
+  --text-2:    #4A3B2C;
+  --text-3:    #8A7A66;
 
-  /* Terracotta — primary buttons, header accent, CTAs */
-  --terra:     #b55a36;
-  --terra-2:   #9a4828;
-  --terra-lt:  #f6ece7;
+  /* the "green" family now reads olive — keeps every green selector alive */
+  --green:     var(--olive);
+  --green-2:   #5C6842;
+  --green-3:   #869072;
+  --green-lt:  #E7E9DC;
+  --green-mid: #CDD4BE;
 
-  --white:     #FFFFFF;
-  --black:     #2c2017;
+  --terra-2:   #9A4E2E;
+  --terra-lt:  #F1E4DB;
 
-  --r-sm:  6px;
-  --r-md:  10px;
-  --r-lg:  14px;
+  --white:     #F7F2E9;       /* warm off-white — no pure #fff */
+  --black:     var(--ink);
 
-  --shadow-sm: 0 1px 3px rgba(0,0,0,.08);
-  --shadow-md: 0 3px 12px rgba(0,0,0,.10);
+  /* ── Type ─────────────────────────────────────────────────── */
+  --font-display: 'Cormorant Garamond', Georgia, 'Times New Roman', serif;
+  --font-body:    'Karla', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-hand:    'Caveat', 'Segoe Script', cursive;
+  --font-util:    'Karla', system-ui, sans-serif;
+
+  /* ── Radius ───────────────────────────────────────────────── */
+  --r-tile: 3px;
+  --r-sm:   6px;
+  --r-md:   10px;
+  --r-lg:   14px;
+
+  /* ── Spacing scale (8px rhythm) ───────────────────────────── */
+  --sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px; --sp-4: 16px;
+  --sp-5: 24px; --sp-6: 32px; --sp-7: 48px; --sp-8: 72px;
+
+  /* ── Shadows — warm, never pure black ─────────────────────── */
+  --shadow-sm:   0 1px 3px rgba(43,32,24,.10);
+  --shadow-md:   0 3px 12px rgba(43,32,24,.14);
+  --shadow-lift: 0 14px 26px -10px rgba(43,32,24,.40);
   --t: 140ms ease;
 }
 
@@ -58,10 +89,14 @@ html { font-size: 15px; -webkit-font-smoothing: antialiased; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
   background-color: var(--bg);
-  /* subtle linen/plaster texture */
+  /* plaster wall — directional window light from upper-left, fixed like a room */
   background-image:
-    repeating-linear-gradient(0deg, rgba(120,90,50,.028) 0px, rgba(120,90,50,.028) 1px, transparent 1px, transparent 30px),
-    repeating-linear-gradient(90deg, rgba(120,90,50,.02) 0px, rgba(120,90,50,.02) 1px, transparent 1px, transparent 30px);
+    linear-gradient(120deg, rgba(255,250,240,.50) 0%, rgba(255,250,240,0) 46%),
+    radial-gradient(120% 90% at 108% 112%, rgba(74,49,32,.14), transparent 55%),
+    radial-gradient(60% 40% at 22% 26%, rgba(221,210,192,.50), transparent 60%),
+    radial-gradient(52% 46% at 72% 60%, rgba(255,248,236,.36), transparent 60%);
+  background-attachment: fixed;
+  background-repeat: no-repeat;
   color: var(--text);
   min-height: 100vh;
   line-height: 1.55;
@@ -86,26 +121,41 @@ img, svg { display: block; }
 
 .page-content { padding: clamp(24px, 4vw, 52px) 0 clamp(48px, 6vw, 96px); }
 
-/* ── Header ────────────────────────────────────────────────── */
+/* ── Header — reclaimed-wood rail spanning the top ──────────── */
 .site-header {
   position: sticky;
   top: 0;
   z-index: 100;
-  background: #3d2e1e;
-  border-bottom: 3px solid var(--terra);
   width: 100%;
   display: flex;
   align-items: center;
   gap: clamp(10px, 1.5vw, 16px);
-  padding: 6px clamp(16px, 4vw, 48px);
+  padding: 8px clamp(16px, 4vw, 48px);
+  background-color: var(--walnut);
+  background-image:
+    /* two knots swirling the grain */
+    radial-gradient(26px 9px at 17% 62%, rgba(43,32,24,.34), transparent 72%),
+    radial-gradient(30px 11px at 73% 40%, rgba(43,32,24,.28), transparent 72%),
+    /* lit top lip of the plank */
+    linear-gradient(180deg, var(--walnut-lt) 0 2px, transparent 2px),
+    /* darker front under-edge */
+    linear-gradient(180deg, transparent 82%, var(--walnut-dk) 100%),
+    /* lengthwise tone drift, like a sawn board */
+    linear-gradient(90deg, rgba(74,49,32,.12) 0%, transparent 26%, rgba(43,32,24,.10) 52%, transparent 78%, rgba(74,49,32,.12) 100%),
+    /* soft grain running along the rail */
+    repeating-linear-gradient(0deg,
+      rgba(43,32,24,.12) 0 1px, transparent 1px 6px,
+      rgba(74,49,32,.07) 6px 7px, transparent 7px 14px);
+  /* real drop shadow onto the plaster below */
+  box-shadow: 0 6px 16px -6px rgba(43,32,24,.55);
 }
 
-/* ── Hamburger menu button ──────────────────────────────────── */
+/* ── Hamburger menu button — brass-edged control set into the wood ── */
 .menu-btn {
   width: clamp(34px, 4vw, 42px);
   height: clamp(34px, 4vw, 42px);
-  background: #3d2e1e;
-  border: none;
+  background: rgba(43,32,24,.32);
+  border: 1px solid rgba(169,132,63,.45);
   border-radius: clamp(7px, 1vw, 10px);
   cursor: pointer;
   display: flex;
@@ -115,14 +165,15 @@ img, svg { display: block; }
   gap: clamp(4px, 0.6vw, 6px);
   flex-shrink: 0;
   padding: 0;
-  transition: background var(--t);
+  box-shadow: inset 0 1px 2px rgba(43,32,24,.5), inset 0 -1px 0 rgba(255,240,220,.08);
+  transition: background var(--t), border-color var(--t);
 }
-.menu-btn:hover { background: #2c2013; }
+.menu-btn:hover { background: rgba(43,32,24,.5); border-color: rgba(169,132,63,.7); }
 .menu-btn span {
   display: block;
   width: clamp(14px, 1.8vw, 18px);
   height: 1.8px;
-  background: white;
+  background: var(--white);
   border-radius: 2px;
 }
 
@@ -144,22 +195,37 @@ img, svg { display: block; }
   left: -300px;
   width: min(280px, 88vw);
   height: 100vh;
-  background: var(--card);
+  /* plaster wall — same room as the page */
+  background-color: var(--bg);
+  background-image:
+    linear-gradient(160deg, rgba(255,250,240,.45) 0%, rgba(255,250,240,0) 42%),
+    radial-gradient(80% 40% at 30% 12%, rgba(255,248,236,.4), transparent 60%),
+    radial-gradient(90% 50% at 80% 108%, rgba(74,49,32,.12), transparent 55%);
   z-index: 1001;
   border-right: 1px solid var(--border);
-  box-shadow: 4px 0 32px rgba(0,0,0,0.10);
+  box-shadow: 4px 0 32px rgba(43,32,24,.16);
   transition: left 0.3s cubic-bezier(0.4,0,0.2,1);
   display: flex;
   flex-direction: column;
 }
 .sidebar.open { left: 0; }
 
+/* wood head strip — the white logo now reads against it */
 .sidebar-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 18px 16px 14px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--walnut-dk);
+  background-color: var(--walnut);
+  background-image:
+    radial-gradient(24px 8px at 24% 62%, rgba(43,32,24,.30), transparent 72%),
+    linear-gradient(180deg, var(--walnut-lt) 0 2px, transparent 2px),
+    linear-gradient(180deg, transparent 84%, var(--walnut-dk) 100%),
+    repeating-linear-gradient(0deg,
+      rgba(43,32,24,.10) 0 1px, transparent 1px 6px,
+      rgba(74,49,32,.06) 6px 7px, transparent 7px 14px);
+  box-shadow: 0 4px 10px -6px rgba(43,32,24,.5);
 }
 .sidebar-logo {
   height: 26px;
@@ -169,14 +235,14 @@ img, svg { display: block; }
   background: none;
   border: none;
   cursor: pointer;
-  color: var(--text-3);
+  color: rgba(247,242,233,.82);
   padding: 6px;
   display: flex;
   align-items: center;
   border-radius: 6px;
-  transition: background var(--t);
+  transition: background var(--t), color var(--t);
 }
-.sidebar-close:hover { background: var(--bg); }
+.sidebar-close:hover { background: rgba(255,240,220,.14); color: var(--white); }
 
 /* Nav items */
 .sidebar-nav {
@@ -202,7 +268,7 @@ img, svg { display: block; }
   width: 100%;
   text-align: left;
 }
-.sidebar-nav-item:hover { background: var(--bg); color: var(--black); }
+.sidebar-nav-item:hover { background: var(--green-lt); color: var(--black); }
 .sidebar-nav-item svg { flex-shrink: 0; color: var(--text-3); }
 .sidebar-nav-item:hover svg { color: var(--green); }
 
@@ -224,7 +290,8 @@ img, svg { display: block; }
   gap: 10px;
   padding: 10px 10px;
   border-radius: 10px;
-  background: var(--bg);
+  background: var(--card);
+  border: 1px solid var(--border);
 }
 .sidebar-avatar {
   width: 34px;
@@ -2693,8 +2760,17 @@ kbd {
 
 /* ── Site footer ────────────────────────────────────────────── */
 .site-footer-section {
-  background: #3d2e1e;
-  border-top: 3px solid var(--terra);
+  background-color: var(--walnut);
+  background-image:
+    /* lit top lip (this plank faces up) */
+    linear-gradient(180deg, var(--walnut-lt) 0 2px, transparent 2px),
+    radial-gradient(30px 11px at 22% 30%, rgba(43,32,24,.28), transparent 72%),
+    linear-gradient(90deg, rgba(74,49,32,.12) 0%, transparent 30%, rgba(43,32,24,.10) 58%, transparent 82%, rgba(74,49,32,.12) 100%),
+    repeating-linear-gradient(0deg,
+      rgba(43,32,24,.10) 0 1px, transparent 1px 7px,
+      rgba(74,49,32,.06) 7px 8px, transparent 8px 16px);
+  /* brass hairline along the top edge */
+  box-shadow: inset 0 2px 0 rgba(169,132,63,.38);
   padding: 48px clamp(16px, 6vw, 80px) 32px;
   margin-top: auto;
 }
@@ -2712,10 +2788,10 @@ kbd {
 
 .footer-col-heading {
   font-family: 'Cormorant Garamond', serif;
-  font-size: 1.15rem;
+  font-size: 1.2rem;
   font-weight: 600;
   font-style: italic;
-  color: rgba(255,255,255,.75);
+  color: rgba(247,242,233,.85);
   margin-bottom: 14px;
   letter-spacing: 0.02em;
 }
@@ -2727,25 +2803,28 @@ kbd {
   gap: 10px;
 }
 
-.footer-placeholder-link {
-  display: inline-block;
-  width: 90%;
-  height: 9px;
-  background: rgba(255,255,255,.15);
-  border-radius: 4px;
+/* real footer links (replaced the placeholder bars) */
+.footer-col-list a {
+  color: rgba(247,242,233,.70);
+  font-size: .875rem;
+  text-decoration: none;
+  transition: color var(--t);
 }
+.footer-col-list a:hover { color: var(--brass); text-decoration: none; }
 
 .footer-bottom {
   max-width: 860px;
   margin: 0 auto;
   padding-top: 16px;
-  border-top: 1px solid rgba(255,255,255,.12);
+  border-top: 1px solid rgba(247,242,233,.14);
   text-align: center;
 }
 
 .footer-copy {
-  font-size: 0.8rem;
-  color: rgba(255,255,255,.45);
+  font-family: 'Cormorant Garamond', serif;
+  font-style: italic;
+  font-size: 0.95rem;
+  color: rgba(247,242,233,.58);
 }
 
 @media (max-width: 480px) {
@@ -2898,4 +2977,182 @@ kbd {
   font-size: 0.95rem;
   color: var(--text);
   text-align: right;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   MATERIALS — foundation surfaces
+   Additive + self-contained. Nothing on existing pages uses these
+   classes yet; safe to preview before wiring into templates.
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── Zellige tile ─────────────────────────────────────────────
+   Real DOM tiles in a grid; warm grout shows through the gaps.
+   Per-tile colour and glaze position vary on CO-PRIME nth-child
+   cycles (7 for colour, 11 for the highlight) so the field reads
+   hand-glazed and doesn't visibly repeat until 77 tiles. Pure CSS,
+   no image files. Works bounded (.zellige--panel) or full-bleed
+   (.zellige--bleed).                                              */
+.zellige {
+  --tile: 46px;              /* tile edge length */
+  --grout-w: 3px;            /* grout gap */
+  --h: 80; --s: 22; --l: 40; /* field HSL — set by variant */
+  display: grid;
+  grid-template-columns: repeat(auto-fill, var(--tile));
+  grid-auto-rows: var(--tile);
+  gap: var(--grout-w);
+  justify-content: center;
+  align-content: center;
+  overflow: hidden;
+  padding: var(--grout-w);
+  /* grout: warm sand, unevenly lit across the field */
+  background-color: var(--grout);
+  background-image:
+    radial-gradient(140% 120% at 18% -5%,  rgba(255,248,235,.38), transparent 46%),
+    radial-gradient(150% 130% at 95% 105%, rgba(74,49,32,.20),   transparent 52%);
+}
+
+.zellige__tile {
+  --dh: 0; --dl: 0;          /* per-tile colour deltas */
+  --gx: 30%; --gy: 24%;      /* glaze sheen origin — clustered upper-left */
+  border-radius: var(--r-tile);
+  background:
+    /* faint wet diagonal sheen, consistent light direction, low contrast */
+    linear-gradient(125deg, hsl(var(--h) 18% 95% / .12) 0%, transparent 34%),
+    /* broad soft glaze wash — opaque stops read as glaze depth, not a blob */
+    radial-gradient(155% 135% at var(--gx) var(--gy),
+      hsl(calc(var(--h) + var(--dh)) calc((var(--s) - 2) * 1%) calc((var(--l) + var(--dl) + 13) * 1%)) 0%,
+      hsl(calc(var(--h) + var(--dh)) calc(var(--s) * 1%)       calc((var(--l) + var(--dl) + 3)  * 1%)) 42%,
+      hsl(calc(var(--h) + var(--dh)) calc((var(--s) + 3) * 1%) calc((var(--l) + var(--dl) - 8)  * 1%)) 100%),
+    /* base tile colour */
+    hsl(calc(var(--h) + var(--dh)) calc(var(--s) * 1%) calc((var(--l) + var(--dl)) * 1%));
+  box-shadow:
+    inset 0 0 0 1px  rgba(74,49,32,.05),   /* faint hand-cut edge */
+    inset 0 -3px 5px rgba(43,32,24,.09);   /* soft foot — flat, not pillowed */
+  transition: filter var(--t);
+}
+
+/* colour variation — 7-cycle */
+.zellige__tile:nth-child(7n+1){ --dh:-4; --dl: 6; }
+.zellige__tile:nth-child(7n+2){ --dh: 3; --dl:-5; }
+.zellige__tile:nth-child(7n+3){ --dh:-2; --dl: 3; }
+.zellige__tile:nth-child(7n+4){ --dh: 5; --dl:-2; }
+.zellige__tile:nth-child(7n+5){ --dh:-5; --dl:-4; }
+.zellige__tile:nth-child(7n+6){ --dh: 2; --dl: 5; }
+.zellige__tile:nth-child(7n)  { --dh: 4; --dl:-6; }
+
+/* glaze-origin variation — 11-cycle (co-prime with 7). All clustered in the
+   upper-left so the light direction stays consistent, like one window. */
+.zellige__tile:nth-child(11n+1){  --gx:28%; --gy:24%; }
+.zellige__tile:nth-child(11n+2){  --gx:34%; --gy:20%; }
+.zellige__tile:nth-child(11n+3){  --gx:24%; --gy:28%; }
+.zellige__tile:nth-child(11n+4){  --gx:38%; --gy:26%; }
+.zellige__tile:nth-child(11n+5){  --gx:30%; --gy:30%; }
+.zellige__tile:nth-child(11n+6){  --gx:22%; --gy:22%; }
+.zellige__tile:nth-child(11n+7){  --gx:36%; --gy:32%; }
+.zellige__tile:nth-child(11n+8){  --gx:26%; --gy:18%; }
+.zellige__tile:nth-child(11n+9){  --gx:40%; --gy:26%; }
+.zellige__tile:nth-child(11n+10){ --gx:32%; --gy:34%; }
+.zellige__tile:nth-child(11n)   { --gx:27%; --gy:21%; }
+
+/* field variants */
+.zellige--olive { --h:80; --s:22; --l:40; }
+.zellige--sage  { --h:79; --s:22; --l:62; }
+.zellige--terra { --h:19; --s:50; --l:47; }
+.zellige--cream { --h:39; --s:34; --l:82; }
+
+/* calm — variation dialled right down; reads near-single-colour, for
+   full-bleed fields that sit behind text (keeps contrast honest) */
+.zellige--calm .zellige__tile { --dh: 0; }
+.zellige--calm .zellige__tile:nth-child(7n+1){ --dl: 2; }
+.zellige--calm .zellige__tile:nth-child(7n+2){ --dl:-2; }
+.zellige--calm .zellige__tile:nth-child(7n+3){ --dl: 1; }
+.zellige--calm .zellige__tile:nth-child(7n+4){ --dl:-1; }
+.zellige--calm .zellige__tile:nth-child(7n+5){ --dl: 2; }
+.zellige--calm .zellige__tile:nth-child(7n+6){ --dl:-1; }
+.zellige--calm .zellige__tile:nth-child(7n)  { --dl: 1; }
+
+/* usage helpers */
+.zellige--panel { border-radius: var(--r-md); box-shadow: var(--shadow-md); }
+.zellige--bleed { position: absolute; inset: 0; z-index: 0; }
+
+/* gloss shifts a touch on hover, as if the light moved */
+@media (hover: hover) {
+  .zellige:hover .zellige__tile { filter: brightness(1.04); }
+}
+
+/* ── Wood shelf ───────────────────────────────────────────────
+   Thick reclaimed plank: grain, a knot, a lit top edge, and a real
+   drop shadow onto the surface behind it. Objects placed in
+   .shelf-deck get their own contact shadow via .shelf-object.     */
+.shelf { position: relative; width: 100%; }
+
+.shelf-deck {
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  gap: var(--sp-6);
+  min-height: 120px;
+  padding: 0 var(--sp-5) 2px;
+  z-index: 1;
+}
+
+.shelf-plank {
+  position: relative;
+  height: 34px;
+  border-radius: 3px 3px 5px 5px;
+  background-color: var(--walnut);
+  background-image:
+    /* two knots swirling the grain */
+    radial-gradient(22px 9px at 68% 58%, rgba(43,32,24,.42), transparent 72%),
+    radial-gradient(10px 5px at 67% 56%, rgba(74,49,32,.55), transparent 72%),
+    radial-gradient(16px 7px at 28% 46%, rgba(43,32,24,.28), transparent 74%),
+    /* top face catching the light */
+    linear-gradient(180deg, var(--walnut-lt) 0 3px, transparent 3px),
+    /* under-edge shadow */
+    linear-gradient(180deg, transparent 76%, var(--walnut-dk) 100%),
+    /* lengthwise tone drift, like sawn boards */
+    linear-gradient(90deg, rgba(74,49,32,.10) 0%, transparent 22%, rgba(43,32,24,.10) 48%, transparent 74%, rgba(74,49,32,.12) 100%),
+    /* grain: soft horizontal streaks running along the plank */
+    repeating-linear-gradient(0deg,
+      rgba(43,32,24,.13) 0 1px, transparent 1px 5px,
+      rgba(74,49,32,.08) 5px 6px, transparent 6px 12px,
+      rgba(43,32,24,.10) 12px 13px, transparent 13px 21px);
+  box-shadow:
+    inset 0 2px 0 rgba(255,240,220,.16),   /* lit top lip */
+    var(--shadow-lift);                    /* real drop shadow behind/below */
+  z-index: 2;
+}
+
+/* an object resting on the shelf: gets a soft contact shadow */
+.shelf-object { position: relative; }
+.shelf-object::after {
+  content: "";
+  position: absolute;
+  left: 50%; bottom: -3px;
+  width: 86%; height: 11px;
+  transform: translateX(-50%);
+  background: radial-gradient(50% 100% at 50% 0%, rgba(43,32,24,.40), transparent 74%);
+  filter: blur(1.5px);
+  z-index: -1;
+}
+
+/* ── Plaster wall ─────────────────────────────────────────────
+   Warm putty, trowel variation, directional window light from the
+   upper-left. Cheap (background only), full-bleed capable.        */
+.plaster {
+  position: relative;
+  background-color: var(--plaster);
+  background-image:
+    linear-gradient(120deg, rgba(255,250,240,.55) 0%, rgba(255,250,240,0) 46%),   /* window light */
+    radial-gradient(120% 100% at 108% 112%, rgba(74,49,32,.16), transparent 55%), /* shadow pool */
+    radial-gradient(60% 40% at 25% 30%, rgba(221,210,192,.55), transparent 60%),  /* trowel swipes */
+    radial-gradient(52% 46% at 70% 55%, rgba(255,248,236,.40), transparent 60%),
+    radial-gradient(46% 36% at 45% 82%, rgba(221,210,192,.50), transparent 60%);
+}
+
+/* Motion honours the accessibility floor */
+@media (prefers-reduced-motion: reduce) {
+  .zellige__tile { transition: none; }
+  .zellige:hover .zellige__tile { filter: none; }
 }
