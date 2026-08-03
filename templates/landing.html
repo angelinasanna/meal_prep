@@ -1,76 +1,6 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Mise</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link href="https://fonts.googleapis.com/css2?family=Kalam:wght@400;700&family=Sacramento&family=Caveat:wght@400;600;700&family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400;1,600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/css/style.css" />
-</head>
-<body>
+{% extends "base.html" %}
 
-<!-- Sidebar overlay -->
-<div class="sidebar-overlay" id="sidebar-overlay"></div>
-
-<div class="sidebar" id="sidebar">
-  <div class="sidebar-head">
-    <img src="/static/handwriting-static.png" class="sidebar-logo" alt="Mise" />
-    <button class="sidebar-close" id="sidebar-close" aria-label="Close">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-    </button>
-  </div>
-
-  <nav class="sidebar-nav">
-    <a href="/landing" class="sidebar-nav-item">
-      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
-      Home
-    </a>
-    <a href="/preferences" class="sidebar-nav-item">
-      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="6" x2="20" y2="6"/><line x1="8" y1="12" x2="20" y2="12"/><line x1="12" y1="18" x2="20" y2="18"/><circle cx="2" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="6" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="10" cy="18" r="1" fill="currentColor" stroke="none"/></svg>
-      Preferences
-    </a>
-    <a href="/grocery" class="sidebar-nav-item">
-      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2L3 6v14a2 2 0 002 2h14a2 2 0 002-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 01-8 0"/></svg>
-      Grocery list
-    </a>
-    <a href="/browse" class="sidebar-nav-item">
-      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 016.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/></svg>
-      Browse recipes
-    </a>
-  </nav>
-
-  <div class="sidebar-footer">
-    {% if request.session.get('user_id') %}
-    <div class="sidebar-profile">
-      <div class="sidebar-avatar">{{ (request.session.get('user_name') or 'U')[0] | upper }}</div>
-      <div class="sidebar-profile-info">
-        <span class="sidebar-profile-name">{{ request.session.get('user_name', '') }}</span>
-        <span class="sidebar-profile-email">{{ request.session.get('user_email', '') }}</span>
-      </div>
-      <form action="/logout" method="post" style="margin:0;">
-        <button type="submit" class="sidebar-logout-btn" title="Sign out">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
-        </button>
-      </form>
-    </div>
-    {% else %}
-    <a href="/login" class="sidebar-nav-item">
-      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-      Sign in
-    </a>
-    {% endif %}
-  </div>
-</div>
-
-<!-- ── Banner ───────────────────────────────────────────────────── -->
-<div class="landing-banner">
-  <button class="menu-btn" id="menu-btn" aria-label="Open menu">
-    <span></span><span></span><span></span>
-  </button>
-  <img src="/static/handwriting.gif" class="landing-gif" alt="Mise" />
-</div>
-
+{% block content %}
 <!-- ── Full-width carousel hero ─────────────────────────────────── -->
 <div class="carousel-hero">
   <div class="carousel-inner">
@@ -226,59 +156,10 @@
   </div>
 
 </section>
+{% endblock %}
 
-<!-- Footer -->
-<footer class="site-footer-section">
-  <div class="footer-columns">
-    <div class="footer-col">
-      <h3 class="footer-col-heading">FAQ</h3>
-      <ul class="footer-col-list">
-        <li><span class="footer-placeholder-link"></span></li>
-        <li><span class="footer-placeholder-link" style="width:72%"></span></li>
-        <li><span class="footer-placeholder-link" style="width:58%"></span></li>
-        <li><span class="footer-placeholder-link" style="width:80%"></span></li>
-      </ul>
-    </div>
-
-    <div class="footer-col">
-      <h3 class="footer-col-heading">Contact</h3>
-      <ul class="footer-col-list">
-        <li><span class="footer-placeholder-link"></span></li>
-        <li><span class="footer-placeholder-link" style="width:65%"></span></li>
-        <li><span class="footer-placeholder-link" style="width:50%"></span></li>
-      </ul>
-    </div>
-  </div>
-
-  <div class="footer-bottom">
-    <span class="footer-copy">© 2026 Mise</span>
-  </div>
-</footer>
-
+{% block extra_js %}
 <script>
-// ── Sidebar ──────────────────────────────────────────────────────
-(function() {
-  var menuBtn = document.getElementById('menu-btn');
-  var sidebar = document.getElementById('sidebar');
-  var overlay = document.getElementById('sidebar-overlay');
-  var closeBtn = document.getElementById('sidebar-close');
-
-  function openSidebar() {
-    sidebar.classList.add('open');
-    overlay.classList.add('open');
-    document.body.style.overflow = 'hidden';
-  }
-  function closeSidebar() {
-    sidebar.classList.remove('open');
-    overlay.classList.remove('open');
-    document.body.style.overflow = '';
-  }
-
-  if (menuBtn) menuBtn.addEventListener('click', openSidebar);
-  if (closeBtn) closeBtn.addEventListener('click', closeSidebar);
-  if (overlay)  overlay.addEventListener('click', closeSidebar);
-})();
-
 // ── Carousel ─────────────────────────────────────────────────────
 (function() {
   var track   = document.getElementById('carousel-track');
@@ -387,7 +268,5 @@ function toggleDay(btn, dateStr) {
     .then(function(res) { return res.text(); })
     .then(function(html) { btn.outerHTML = html; });
 }
-
 </script>
-</body>
-</html>
+{% endblock %}
