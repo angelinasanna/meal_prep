@@ -1,61 +1,620 @@
 {% extends "base.html" %}
 {% block title %} · Recipe suggestions{% endblock %}
 
-{% set meal_order = ['breakfast', 'lunch', 'dinner'] %}
-{% set meal_labels = {'breakfast': 'Breakfast', 'lunch': 'Lunch', 'dinner': 'Dinner'} %}
-{% set badge_class = {'breakfast': 'badge-breakfast', 'lunch': 'badge-lunch', 'dinner': 'badge-dinner'} %}
+{% block extra_styles %}
+<style>
+/* ── GIF loading screen ── */
+.gif-loader {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: clamp(40px, 8vw, 80px) 24px;
+  margin-bottom: 24px;
+  min-height: 300px;
+}
+.gif-loader img {
+  max-height: 220px;
+  max-width: 100%;
+  border-radius: 12px;
+  object-fit: contain;
+}
+.gif-loader-text {
+  margin-top: 20px;
+  font-family: 'Caveat', cursive;
+  font-size: 1.4rem;
+  font-weight: 600;
+  font-style: italic;
+  color: var(--text-3);
+  letter-spacing: .01em;
+}
+.gif-loader-dots span {
+  display: inline-block;
+  animation: gif-dot-pulse 1.4s ease-in-out infinite;
+}
+.gif-loader-dots span:nth-child(2) { animation-delay: .2s; }
+.gif-loader-dots span:nth-child(3) { animation-delay: .4s; }
+@keyframes gif-dot-pulse { 0%,80%,100%{opacity:.2} 40%{opacity:1} }
+
+/* ── Week planner grid ── */
+.planner-wrap {
+  background: white;
+  border: 1.5px solid var(--border);
+  border-radius: 18px;
+  padding: 20px 20px 24px;
+  margin-bottom: 28px;
+  overflow: hidden;
+}
+.planner-heading {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--black);
+  margin-bottom: 2px;
+}
+.planner-sub {
+  font-size: .78rem;
+  color: var(--text-3);
+  margin-bottom: 18px;
+}
+.planner-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.planner-grid {
+  display: grid;
+  grid-template-columns: 28px repeat(var(--planner-cols, 7), minmax(108px, 1fr));
+  gap: 6px;
+  min-width: 860px;
+}
+
+/* Header row */
+.planner-day-header {
+  text-align: center;
+  padding-bottom: 6px;
+}
+.planner-day-name {
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: .65rem;
+  font-weight: 700;
+  color: var(--black);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.planner-day-date {
+  font-size: .7rem;
+  color: var(--text-3);
+  margin-top: 1px;
+}
+.planner-label-empty { /* top-left corner spacer */ }
+
+/* Row label pills */
+.planner-row-pill {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: .58rem;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  padding: 6px 0;
+  writing-mode: vertical-lr;
+  transform: rotate(180deg);
+  align-self: stretch;
+  white-space: nowrap;
+}
+.planner-row-pill.pill-breakfast { background: #FEF9E0; color: #8B6500; border: 1px solid #F0D050; }
+.planner-row-pill.pill-lunch     { background: var(--green-lt); color: var(--green-2); border: 1px solid var(--green-mid); }
+.planner-row-pill.pill-dinner    { background: var(--pond-lt); color: var(--pond-dk); border: 1px solid var(--pond); }
+
+/* Drop cells */
+.planner-cell {
+  border-radius: 12px;
+  min-height: 100px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: default;
+  transition: border-color .12s, background .12s, box-shadow .12s;
+  position: relative;
+  overflow: hidden;
+}
+.planner-cell.empty {
+  border: 2px dashed var(--border);
+  background: transparent;
+}
+.planner-cell.empty:hover { border-color: #94a3b8; }
+.planner-cell.drag-over {
+  border-style: solid !important;
+  background: #f0fdf4 !important;
+  box-shadow: 0 0 0 2px #81c994;
+}
+
+/* Filled cells per slot type */
+.planner-cell.filled-breakfast {
+  border: 2px solid #F0D050;
+  background: #FEF9E0;
+}
+.planner-cell.filled-lunch {
+  border: 2px solid var(--green-mid);
+  background: var(--green-lt);
+}
+.planner-cell.filled-dinner {
+  border: 2px solid var(--pond);
+  background: var(--pond-lt);
+}
+
+.planner-cell-inner {
+  padding: 10px 10px 10px 12px;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+}
+.planner-cell-name {
+  font-size: .82rem;
+  font-weight: 700;
+  color: var(--black);
+  line-height: 1.25;
+}
+.planner-cell-remove {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: rgba(0,0,0,.08);
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: .8rem;
+  color: #64748b;
+  line-height: 1;
+  transition: background .12s, color .12s;
+  padding: 0;
+}
+.planner-cell-remove:hover { background: rgba(0,0,0,.16); color: var(--black); }
+
+.planner-drop-hint {
+  font-size: .72rem;
+  color: #cbd5e1;
+  text-align: center;
+  line-height: 1.4;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* Gap rows between Breakfast/Lunch/Dinner (spans all 8 cols) */
+.planner-row-gap {
+  grid-column: 1 / -1;
+  height: 4px;
+}
+
+/* ── Cluster section headers ── */
+.cluster-section { margin-bottom: 8px; }
+.cluster-section-label {
+  font-size: .7rem;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.cluster-section-label::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+/* ── Cluster card meals list (display only, not draggable) ── */
+.cluster-meals-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+  margin-bottom: 4px;
+}
+.cluster-meal-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--surface, #f4f0e8);
+  border: 1.5px solid var(--border);
+  border-radius: 10px;
+  font-size: .875rem;
+  font-weight: 600;
+  color: var(--black);
+  cursor: default;
+  user-select: none;
+}
+
+/* ── Draggable meal chips (palette only) ── */
+.meal-chips-drag { display: flex; flex-direction: column; gap: 6px; margin-bottom: 4px; }
+.meal-chip-drag {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: white;
+  border: 1.5px solid var(--border);
+  border-radius: 10px;
+  cursor: grab;
+  user-select: none;
+  font-size: .875rem;
+  font-weight: 600;
+  color: var(--black);
+  transition: border-color .12s, box-shadow .12s, transform .1s;
+  width: 100%;
+}
+.meal-chip-drag:hover { border-color: var(--terra); box-shadow: 0 2px 8px rgba(0,0,0,.1); }
+.meal-chip-drag:active { cursor: grabbing; transform: scale(.98); }
+.meal-chip-drag.dragging { opacity: .4; transform: scale(.97); }
+.chip-badge { font-size: .6rem !important; padding: 2px 7px !important; flex-shrink: 0; border-radius: 6px !important; }
+.chip-name { flex: 1; min-width: 0; }
+.chip-drag-icon { flex-shrink: 0; opacity: .3; margin-left: auto; }
+
+/* Calorie badge on meal items */
+.meal-cal-badge {
+  margin-left: auto;
+  font-size: .68rem;
+  font-weight: 600;
+  color: var(--text-3);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* Empty palette state */
+.palette-empty {
+  font-size: .8rem;
+  color: var(--text-3);
+  font-style: italic;
+  padding: 8px 0;
+}
+
+/* ── Cluster carousel ── */
+.cluster-carousel-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+#all-clusters {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  padding-bottom: 8px;
+  flex: 1;
+  min-width: 0;
+}
+#all-clusters::-webkit-scrollbar { display: none; }
+#all-clusters .cluster-card {
+  flex: 0 0 clamp(260px, 40vw, 320px);
+  scroll-snap-align: start;
+  margin-bottom: 0;
+}
+.cluster-arrow {
+  flex-shrink: 0;
+  width: 34px; height: 34px;
+  border-radius: 50%;
+  background: var(--card);
+  border: 1.5px solid var(--border);
+  box-shadow: 0 2px 6px rgba(0,0,0,.1);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--black);
+  transition: background .15s, box-shadow .15s;
+}
+.cluster-arrow:hover { background: var(--bg); box-shadow: 0 4px 12px rgba(0,0,0,.14); }
+
+/* ── Cluster scroll fade ── */
+.clusters-fade-wrap {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+.clusters-fade-wrap::before,
+.clusters-fade-wrap::after {
+  content: '';
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 72px;
+  pointer-events: none;
+  z-index: 3;
+}
+.clusters-fade-wrap::before {
+  left: 0;
+  background: linear-gradient(to right, var(--bg) 0%, transparent 100%);
+}
+.clusters-fade-wrap::after {
+  right: 0;
+  background: linear-gradient(to left, var(--bg) 0%, transparent 100%);
+}
+
+/* ── Dessert picker ── */
+.dessert-scroll {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  padding-bottom: 12px;
+  padding-top: 8px;
+  scroll-snap-type: x mandatory;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.dessert-scroll::-webkit-scrollbar { display: none; }
+.dessert-card {
+  flex: 0 0 clamp(110px, 20vw, 148px);
+  scroll-snap-align: start;
+  cursor: pointer;
+  border-radius: 12px;
+  background: white;
+  border: 2px solid var(--border);
+  overflow: hidden;
+  position: relative;
+  transition: border-color .15s, transform .12s, box-shadow .12s;
+  user-select: none;
+}
+.dessert-card:hover { border-color: var(--terra); margin-top: -3px; margin-bottom: 3px; box-shadow: 0 6px 16px rgba(0,0,0,.1); }
+.dessert-card.selected { border-color: var(--terra); box-shadow: 0 0 0 2px rgba(228,112,75,.25); }
+.dessert-img-wrap { position: relative; }
+.dessert-img-wrap img { width: 100%; aspect-ratio: 4/5; object-fit: cover; display: block; }
+.dessert-img-wrap .dessert-img-ph { width: 100%; aspect-ratio: 4/5; background: var(--bg); display: flex; align-items: center; justify-content: center; color: var(--text-3); }
+.dessert-check {
+  position: absolute; top: 6px; right: 6px;
+  width: 22px; height: 22px; border-radius: 50%;
+  background: var(--terra); color: white;
+  display: flex; align-items: center; justify-content: center;
+  font-size: .8rem; font-weight: 800;
+  opacity: 0; transition: opacity .15s;
+  pointer-events: none;
+}
+.dessert-card.selected .dessert-check { opacity: 1; }
+.dessert-card-name {
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  background: linear-gradient(to top, rgba(0,0,0,.72) 0%, rgba(0,0,0,0) 100%);
+  color: white;
+  padding: 32px 8px 9px;
+  line-height: 1.25;
+  font-family: 'Caveat', cursive;
+  font-size: .9rem;
+  font-weight: 700;
+}
+.dessert-arrow {
+  flex-shrink: 0;
+  width: 30px; height: 30px; border-radius: 50%;
+  background: white; border: 1.5px solid var(--border);
+  box-shadow: 0 2px 6px rgba(0,0,0,.1);
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; color: var(--black);
+  transition: background .15s, box-shadow .15s;
+  z-index: 2;
+}
+.dessert-arrow:hover { background: var(--bg); box-shadow: 0 4px 12px rgba(0,0,0,.14); }
+
+</style>
+{% endblock %}
 
 {% block content %}
 <div style="padding-top:12px;">
-  <h1 class="page-heading">Recipe suggestions</h1>
-  <p class="page-heading-sub">Each set gives you 2–3 meals from the same core ingredients. Select 2 sets per meal to build your week.</p>
+  <div id="page-heading-wrap" {% if not has_clusters %}style="display:none;"{% endif %}>
+    <h1 class="page-heading">Plan your week</h1>
+    <p class="page-heading-sub">Add meal sets below, then drag meals onto the calendar.</p>
+  </div>
 
-  <div id="suggestions-container" data-meal-types="{{ meal_types | join(',') }}" data-mode="{{ mode }}">
+  <div id="suggestions-container" data-mode="{{ mode }}">
 
-    <!-- Single loading screen [ hidden once all sections are ready -->
-    <div id="suggest-loading" style="text-align:center;padding:72px 24px 40px;">
-      <div class="spinner" style="margin:0 auto 22px;"></div>
-      <p id="suggest-loading-text" style="font-size:1rem;font-weight:500;color:var(--text-2);">Finding ideas…</p>
-    </div>
-
-    <!-- All sections revealed at once when loading finishes -->
-    <div id="sections-wrapper" style="display:none;opacity:0;">
-      {% for mt in meal_order %}
-      {% if mt in meal_types %}
-      <div id="mt-section-{{ mt }}" style="margin-bottom:28px;">
-        {% if has_clusters_by_mt.get(mt) %}
-          {% set mt_clusters = clusters | selectattr('mealType', 'equalto', mt) | rejectattr('reserve') | rejectattr('skipped') | list %}
-          <div class="section-header">
-            <span class="section-badge {{ badge_class[mt] }}">{{ meal_labels[mt] }}</span>
-            <span class="section-title">{{ mt_clusters | length }} suggestion{{ 's' if mt_clusters | length != 1 }}</span>
-          </div>
-          {% for cluster in mt_clusters %}
-            {% include "partials/cluster_card.html" %}
-          {% endfor %}
-        {% endif %}
+    <!-- Loading: chalkboard brainstorm -->
+    <div id="suggest-loading" {% if has_clusters %}style="display:none;"{% endif %}>
+      <div class="gif-loader">
+        <img id="loading-gif" src="" alt="Loading…" />
+        <div class="gif-loader-text">Building your week<span class="gif-loader-dots"><span>.</span><span>.</span><span>.</span></span></div>
       </div>
-      {% endif %}
-      {% endfor %}
     </div>
 
-    <!-- Sticky CTA bar -->
-    {% set total_needed = meal_types | length * sets_per_type %}
+    <!-- Main content (shown after clusters load) -->
+    <div id="clusters-wrapper" {% if not has_clusters %}style="display:none;opacity:0;"{% endif %}>
+
+      <!-- ── Cluster cards ── -->
+      <div style="font-size:.6rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--text-3);padding-bottom:6px;border-bottom:1.5px solid var(--border-dk);margin-bottom:10px;">Meal sets</div>
+      <div class="cluster-carousel-wrap" style="margin-bottom:28px;">
+        <button class="cluster-arrow" id="cluster-prev" onclick="scrollClusters(-1)" aria-label="Previous" style="display:none;">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+        </button>
+        <div class="clusters-fade-wrap">
+          <div id="all-clusters">
+            {% if has_clusters %}
+              {% for cluster in clusters %}
+                {% if not cluster.get('reserve') and not cluster.get('skipped') %}
+                  {% include "partials/cluster_card.html" %}
+                {% endif %}
+              {% endfor %}
+            {% endif %}
+          </div>
+        </div>
+        <button class="cluster-arrow" id="cluster-next" onclick="scrollClusters(1)" aria-label="Next">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+        </button>
+      </div>
+
+      <!-- ── Available meals palette (from accepted clusters) ── -->
+      <div id="meal-palette" style="margin-bottom:20px;">
+        <div style="font-size:.6rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--text-3);padding-bottom:6px;border-bottom:1.5px solid var(--border-dk);margin-bottom:10px;">Your meals</div>
+        <div id="palette-chips" style="display:flex;flex-wrap:wrap;gap:8px;">
+          {% set has_accepted = false %}
+          {% if has_clusters %}
+            {% for cluster in clusters %}
+              {% if cluster.accepted and not cluster.get('reserve') %}
+                {% set has_accepted = true %}
+                {% for meal in cluster.meals %}
+                {% set mt_labels = {'breakfast': 'Breakfast', 'lunch': 'Lunch', 'dinner': 'Dinner'} %}
+                {% set mt_badge  = {'breakfast': 'badge-breakfast', 'lunch': 'badge-lunch', 'dinner': 'badge-dinner'} %}
+                <div class="meal-chip-drag"
+                     draggable="true"
+                     data-meal="{{ meal.name | e }}"
+                     data-type="{{ meal.mealType or 'dinner' }}"
+                     ondragstart="dragChip(event)"
+                     ondragend="dragChipEnd(event)"
+                     style="width:auto;padding:6px 12px 6px 8px;">
+                  <span class="section-badge {{ mt_badge.get(meal.mealType or 'dinner', 'badge-dinner') }} chip-badge">{{ mt_labels.get(meal.mealType or 'dinner', '') }}</span>
+                  <span class="chip-name">{{ meal.name }}</span>
+                </div>
+                {% endfor %}
+              {% endif %}
+            {% endfor %}
+          {% endif %}
+          {% if not has_accepted %}
+          <div class="palette-empty" id="palette-empty-msg">Add a meal set above to start building your week.</div>
+          {% endif %}
+        </div>
+      </div>
+
+      <!-- ── Week planner calendar ── -->
+      <div class="planner-wrap">
+        <div class="planner-scroll">
+          {% set _day_full = {'Mon':'Monday','Tue':'Tuesday','Wed':'Wednesday','Thu':'Thursday','Fri':'Friday','Sat':'Saturday','Sun':'Sunday'} %}
+          <div class="planner-grid" id="planner-grid" style="--planner-cols: {{ week_days | length }};">
+
+            <!-- Header: empty corner + day columns -->
+            <div class="planner-label-empty"></div>
+            {% for d_short in week_days %}
+            <div class="planner-day-header">
+              <div class="planner-day-name">{{ _day_full[d_short] }}</div>
+              <div class="planner-day-date" data-day-key="{{ d_short }}"></div>
+            </div>
+            {% endfor %}
+
+            <!-- Breakfast row -->
+            <div class="planner-row-pill pill-breakfast">Breakfast</div>
+            {% for d in week_days %}
+            {% set meal_in_cell = planner.get(d, {}).get('breakfast', '') %}
+            <div class="planner-cell {% if meal_in_cell %}filled-breakfast{% else %}empty{% endif %}"
+                 data-day="{{ d }}" data-slot="breakfast"
+                 ondragover="plannerDragOver(event)"
+                 ondragleave="plannerDragLeave(event)"
+                 ondrop="plannerDrop(event)">
+              {% if meal_in_cell %}
+              <div class="planner-cell-inner">
+                <span class="planner-cell-name">{{ meal_in_cell }}</span>
+              </div>
+              <button class="planner-cell-remove" onclick="clearPlannerCell('{{ d }}','breakfast',this)" title="Remove">×</button>
+              {% else %}
+              <span class="planner-drop-hint">Drop meal<br>here</span>
+              {% endif %}
+            </div>
+            {% endfor %}
+
+            <!-- Gap -->
+            <div class="planner-row-gap"></div>
+
+            <!-- Lunch row -->
+            <div class="planner-row-pill pill-lunch">Lunch</div>
+            {% for d in week_days %}
+            {% set meal_in_cell = planner.get(d, {}).get('lunch', '') %}
+            <div class="planner-cell {% if meal_in_cell %}filled-lunch{% else %}empty{% endif %}"
+                 data-day="{{ d }}" data-slot="lunch"
+                 ondragover="plannerDragOver(event)"
+                 ondragleave="plannerDragLeave(event)"
+                 ondrop="plannerDrop(event)">
+              {% if meal_in_cell %}
+              <div class="planner-cell-inner">
+                <span class="planner-cell-name">{{ meal_in_cell }}</span>
+              </div>
+              <button class="planner-cell-remove" onclick="clearPlannerCell('{{ d }}','lunch',this)" title="Remove">×</button>
+              {% else %}
+              <span class="planner-drop-hint">Drop meal<br>here</span>
+              {% endif %}
+            </div>
+            {% endfor %}
+
+            <!-- Gap -->
+            <div class="planner-row-gap"></div>
+
+            <!-- Dinner row -->
+            <div class="planner-row-pill pill-dinner">Dinner</div>
+            {% for d in week_days %}
+            {% set meal_in_cell = planner.get(d, {}).get('dinner', '') %}
+            <div class="planner-cell {% if meal_in_cell %}filled-dinner{% else %}empty{% endif %}"
+                 data-day="{{ d }}" data-slot="dinner"
+                 ondragover="plannerDragOver(event)"
+                 ondragleave="plannerDragLeave(event)"
+                 ondrop="plannerDrop(event)">
+              {% if meal_in_cell %}
+              <div class="planner-cell-inner">
+                <span class="planner-cell-name">{{ meal_in_cell }}</span>
+              </div>
+              <button class="planner-cell-remove" onclick="clearPlannerCell('{{ d }}','dinner',this)" title="Remove">×</button>
+              {% else %}
+              <span class="planner-drop-hint">Drop meal<br>here</span>
+              {% endif %}
+            </div>
+            {% endfor %}
+
+          </div><!-- /planner-grid -->
+        </div><!-- /planner-scroll -->
+      </div><!-- /planner-wrap -->
+
+      <!-- ── Dessert picker ── -->
+      <div id="dessert-picker" style="margin-top:28px;margin-bottom:28px;">
+        <div style="font-size:.7rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-3);margin-bottom:10px;display:flex;align-items:center;gap:8px;">
+          Desserts this week <span style="font-size:.6rem;font-weight:400;text-transform:none;letter-spacing:0;color:var(--text-3);font-style:italic;">(pick as many as you like)</span><span style="flex:1;height:1px;background:var(--border);display:block;"></span>
+        </div>
+        <div style="position:relative;display:flex;align-items:center;gap:6px;">
+          <button class="dessert-arrow dessert-arrow-prev" id="dessert-prev" onclick="scrollDesserts(-1)" aria-label="Previous" style="display:none;">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+          </button>
+          <div class="dessert-scroll" id="dessert-scroll">
+            {% for r in dessert_recipes %}
+            <div class="dessert-card {% if r.selected %}selected{% endif %}"
+                 id="dessert-card-{{ r.id }}"
+                 onclick="toggleDessert('{{ r.id | e }}', this)">
+              <div class="dessert-img-wrap">
+                {% if r.image %}
+                <img src="{{ r.image }}" alt="{{ r.title }}" loading="lazy" />
+                {% else %}
+                <div class="dessert-img-ph">
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8h1a4 4 0 0 1 0 8h-1"/><path d="M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z"/><line x1="6" y1="1" x2="6" y2="4"/><line x1="10" y1="1" x2="10" y2="4"/><line x1="14" y1="1" x2="14" y2="4"/></svg>
+                </div>
+                {% endif %}
+                <div class="dessert-check">✓</div>
+              </div>
+              <div class="dessert-card-name">{{ r.title }}</div>
+            </div>
+            {% endfor %}
+          </div>
+          <button class="dessert-arrow dessert-arrow-next" id="dessert-next" onclick="scrollDesserts(1)" aria-label="Next" style="display:none;">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+          </button>
+        </div>
+      </div>
+
+    </div><!-- /clusters-wrapper -->
+
+    <!-- Sticky CTA -->
     <div style="position:sticky;bottom:0;background:rgba(244,240,232,0.94);backdrop-filter:blur(8px);border-top:1px solid var(--border);padding:14px 0;margin:0 -20px;padding-left:20px;padding-right:20px;" id="plan-cta">
       <div style="max-width:680px;margin:0 auto;position:relative;display:flex;align-items:center;justify-content:space-between;">
 
         {% if mode == 'existing' %}
-        <a href="/ingredients" class="btn btn-ghost btn-sm">Edit ingredients</a>
+        <a href="/ingredients" class="btn btn-pond btn-back">Edit ingredients</a>
         {% else %}
-        <a href="/cuisine" class="btn btn-ghost btn-sm">Edit preferences</a>
+        <a href="/cuisine" class="btn btn-pond btn-back">Edit preferences</a>
         {% endif %}
 
-        <span id="accepted-count-label"
-          style="position:absolute;left:50%;transform:translateX(-50%);font-size:.875rem;color:var(--text-2);font-weight:500;white-space:nowrap;pointer-events:none;visibility:hidden;">
-          {{ total_needed }} sets still needed
-        </span>
-
         {% if can_view_plan %}
-        <a id="plan-cta-btn" href="/plan" class="btn btn-primary">View my plan</a>
+        <a id="plan-cta-btn" href="/grocery" class="btn btn-primary">View my plan</a>
         {% else %}
         <button id="plan-cta-btn" class="btn btn-primary" disabled>View my plan</button>
         {% endif %}
@@ -70,147 +629,340 @@
 {% block extra_js %}
 <script>
 (function() {
-  var MEAL_ORDER = ['breakfast', 'lunch', 'dinner'];
-  var container  = document.getElementById('suggestions-container');
-  var mealTypes  = (container.getAttribute('data-meal-types') || '').split(',').filter(Boolean);
+  var HAS_CLUSTERS = {{ 'true' if has_clusters else 'false' }};
+  var INIT_PLANNED = {{ planned_count }};
 
-  var LABELS = {breakfast: 'Breakfast', lunch: 'Lunch', dinner: 'Dinner'};
-  var SETS_PER_TYPE = {{ sets_per_type }};
-  var mealTypeOrder = MEAL_ORDER.filter(function(mt) { return mealTypes.indexOf(mt) !== -1; });
-  var settledSet = {};
+  /* ── Date labels in column headers ── */
+  (function() {
+    var today = new Date();
+    var dayOfWeek = today.getDay(); // 0=Sun,1=Mon...
+    var diffToMon = (dayOfWeek === 0) ? -6 : 1 - dayOfWeek;
+    var monday = new Date(today);
+    monday.setDate(today.getDate() + diffToMon);
+    var days = document.querySelectorAll('[data-day-key]');
+    var MON_MAP = {Mon:0,Tue:1,Wed:2,Thu:3,Fri:4,Sat:5,Sun:6};
+    var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    days.forEach(function(el) {
+      var offset = MON_MAP[el.dataset.dayKey];
+      if (offset === undefined) return;
+      var d = new Date(monday);
+      d.setDate(monday.getDate() + offset);
+      el.textContent = MONTHS[d.getMonth()] + ' ' + d.getDate();
+    });
+  })();
 
-  function isSectionLoaded(mt) {
-    var el = document.getElementById('mt-section-' + mt);
-    return el && el.querySelector('.section-header') !== null;
+  /* ── GIF loader ── */
+  var LOADING_GIFS = [
+    '/static/images/sushi.gif',
+    '/static/images/hotdog.gif',
+    '/static/images/cat-eating-cat.gif',
+    '/static/images/butter.gif',
+    '/static/images/pool.gif',
+    '/static/images/bagel.gif',
+    '/static/images/dumpling.gif',
+    '/static/images/eggs.gif',
+    '/static/images/ramen.gif',
+    '/static/images/pancakes.gif',
+    '/static/images/bacon.gif',
+  ];
+
+  function pickLoadingGif() {
+    var key = 'mise_gif_index';
+    var idx = parseInt(localStorage.getItem(key) || '0', 10);
+    idx = isNaN(idx) ? 0 : idx % LOADING_GIFS.length;
+    var gif = document.getElementById('loading-gif');
+    if (gif) gif.src = LOADING_GIFS[idx];
+    localStorage.setItem(key, (idx + 1) % LOADING_GIFS.length);
   }
 
-  function allSectionsSettled() {
-    return mealTypeOrder.every(function(mt) { return settledSet[mt]; });
+  function startChalkAnimation() { pickLoadingGif(); }
+  function stopChalkAnimation() {}
+
+  /* ── Reveal clusters after fetch ── */
+  function revealContent(html) {
+    stopChalkAnimation();
+    var tmp = document.createElement('div');
+    tmp.innerHTML = html;
+
+    // Surface generation errors instead of silently showing empty MEAL SETS
+    var errorEl = tmp.querySelector('.error-msg');
+    if (errorEl) {
+      var loadEl = document.getElementById('suggest-loading');
+      loadEl.innerHTML = errorEl.outerHTML;
+      loadEl.style.display = '';
+      return;
+    }
+
+    document.getElementById('suggest-loading').style.display = 'none';
+    var headingWrap = document.getElementById('page-heading-wrap');
+    if (headingWrap) headingWrap.style.display = '';
+    var wrapper = document.getElementById('clusters-wrapper');
+    var allClusters = document.getElementById('all-clusters');
+    allClusters.innerHTML = '';
+    tmp.querySelectorAll('.cluster-card').forEach(function(card) {
+      allClusters.appendChild(card);
+    });
+    if (typeof htmx !== 'undefined') {
+      htmx.process(allClusters);
+    }
+    wrapper.style.display = '';
+    requestAnimationFrame(function() {
+      requestAnimationFrame(function() {
+        wrapper.style.transition = 'opacity 0.35s ease';
+        wrapper.style.opacity = '1';
+      });
+    });
+    showCountLabel();
+    updateAcceptedCount();
+    if (typeof updateClusterArrows === 'function') updateClusterArrows();
   }
 
-  function updateLoadingText() {
-    var textEl = document.getElementById('suggest-loading-text');
-    if (!textEl) return;
-    for (var i = 0; i < mealTypeOrder.length; i++) {
-      var mt = mealTypeOrder[i];
-      if (!settledSet[mt]) {
-        textEl.textContent = 'Finding ' + LABELS[mt] + ' ideas…';
-        return;
+  function loadSuggestions() {
+    startChalkAnimation();
+    fetch('/generate', { method: 'POST', credentials: 'same-origin' })
+      .then(function(r) { return r.text(); })
+      .then(function(html) { revealContent(html); })
+      .catch(function() {
+        stopChalkAnimation();
+        document.getElementById('suggest-loading').innerHTML =
+          '<p style="padding:20px;color:var(--text-3);font-size:.875rem;">Could not load suggestions. <a href="/suggest">Retry</a></p>';
+      });
+  }
+
+  if (HAS_CLUSTERS) {
+    showCountLabel();
+    updateAcceptedCount();
+  } else {
+    loadSuggestions();
+  }
+
+  /* ── CTA label ── */
+  function showCountLabel() {}
+
+  function updateAcceptedCount() {
+    var n = document.querySelectorAll('.cluster-card.accepted').length;
+    var planBtn = document.getElementById('plan-cta-btn');
+    if (planBtn) {
+      if (n > 0) {
+        if (planBtn.tagName === 'BUTTON') {
+          planBtn.outerHTML = '<a id="plan-cta-btn" href="/grocery" class="btn btn-primary">View my plan</a>';
+        }
+      } else {
+        if (planBtn.tagName === 'A') {
+          planBtn.outerHTML = '<button id="plan-cta-btn" class="btn btn-primary" disabled>View my plan</button>';
+        }
       }
+    }
+    rebuildPalette();
+  }
+
+  /* ── Palette: gather meals from accepted cluster cards ── */
+  function rebuildPalette() {
+    var palette = document.getElementById('palette-chips');
+    if (!palette) return;
+    palette.innerHTML = '';
+    var found = false;
+    document.querySelectorAll('.cluster-card.accepted').forEach(function(card) {
+      card.querySelectorAll('.cluster-meal-item[data-meal]').forEach(function(item) {
+        var clone = document.createElement('div');
+        clone.className = 'meal-chip-drag';
+        clone.draggable = true;
+        clone.dataset.meal = item.dataset.meal;
+        clone.dataset.type = item.dataset.type || 'dinner';
+        clone.style.cssText = 'width:auto;padding:6px 12px 6px 8px;';
+        clone.innerHTML = item.innerHTML;
+        clone.addEventListener('dragstart', dragChip);
+        clone.addEventListener('dragend', dragChipEnd);
+        palette.appendChild(clone);
+        found = true;
+      });
+    });
+    if (!found) {
+      var msg = document.createElement('div');
+      msg.className = 'palette-empty';
+      msg.textContent = 'Add a meal set above to start planning.';
+      palette.appendChild(msg);
     }
   }
 
-  function revealContent() {
-    var loadingEl = document.getElementById('suggest-loading');
-    var wrapper   = document.getElementById('sections-wrapper');
-    if (loadingEl) loadingEl.style.display = 'none';
-    if (wrapper) {
-      wrapper.style.display = '';
-      // Fade in
-      requestAnimationFrame(function() {
-        requestAnimationFrame(function() {
-          wrapper.style.transition = 'opacity 0.35s ease';
-          wrapper.style.opacity = '1';
+  /* Track meals being removed so calendar cells can be cleared */
+  var _pendingRemovals = [];
+
+  document.addEventListener('htmx:beforeRequest', function(evt) {
+    var elt = evt.detail && evt.detail.elt;
+    if (!elt) return;
+    if (elt.classList.contains('btn-accept')) {
+      elt.classList.add('popping');
+      elt.addEventListener('animationend', function() { elt.classList.remove('popping'); }, { once: true });
+    }
+    if (elt.classList.contains('btn-accept') || elt.classList.contains('btn-skip') || elt.classList.contains('btn-undo')) {
+      elt.disabled = true;
+    }
+    // Capture meals from clusters about to be skipped or removed from plan
+    if (elt.classList.contains('btn-skip') || elt.classList.contains('btn-undo')) {
+      var card = elt.closest('.cluster-card');
+      _pendingRemovals = [];
+      if (card) {
+        card.querySelectorAll('.cluster-meal-item[data-meal]').forEach(function(item) {
+          _pendingRemovals.push(item.dataset.meal);
+        });
+      }
+    }
+  });
+
+  document.addEventListener('htmx:afterSettle', function() {
+    updateAcceptedCount();
+    // Clear calendar cells whose meal was in a skipped/removed cluster
+    if (_pendingRemovals.length > 0) {
+      var toRemove = _pendingRemovals.slice();
+      _pendingRemovals = [];
+      toRemove.forEach(function(mealName) {
+        document.querySelectorAll('.planner-cell').forEach(function(cell) {
+          var nameEl = cell.querySelector('.planner-cell-name');
+          if (nameEl && nameEl.textContent.trim() === mealName) {
+            var day  = cell.dataset.day;
+            var slot = cell.dataset.slot;
+            cell.className = 'planner-cell empty';
+            cell.innerHTML = '<span class="planner-drop-hint">Drop meal<br>here</span>';
+            fetch('/planner/clear', {
+              method: 'POST',
+              credentials: 'same-origin',
+              body: new URLSearchParams({day: day, slot: slot})
+            });
+          }
         });
       });
     }
-    showCountLabel();
-    updateAcceptedCount();
-  }
-
-  function showCountLabel() {
-    var label = document.getElementById('accepted-count-label');
-    if (label) label.style.visibility = 'visible';
-  }
-
-  function updateAcceptedCount() {
-    var counts = {};
-    mealTypes.forEach(function(mt) { counts[mt] = 0; });
-    document.querySelectorAll('.cluster-card.accepted').forEach(function(card) {
-      var mt = card.getAttribute('data-meal-type');
-      if (mt && counts.hasOwnProperty(mt)) counts[mt]++;
-    });
-
-    var needed = 0;
-    mealTypes.forEach(function(mt) { needed += Math.max(0, SETS_PER_TYPE - (counts[mt] || 0)); });
-    var totalNeeded = mealTypes.length * SETS_PER_TYPE;
-    var allMet = mealTypes.length === 0
-      ? document.querySelectorAll('.cluster-card.accepted').length > 0
-      : needed === 0;
-
-    var label   = document.getElementById('accepted-count-label');
-    var planBtn = document.getElementById('plan-cta-btn');
-    if (!label) return;
-
-    if (allMet) {
-      label.textContent = totalNeeded + ' of ' + totalNeeded + ' sets selected';
-      if (planBtn && planBtn.tagName === 'BUTTON') {
-        planBtn.outerHTML = '<a id="plan-cta-btn" href="/plan" class="btn btn-primary">View my plan</a>';
-      }
-    } else {
-      label.textContent = needed + (needed === 1 ? ' set' : ' sets') + ' still needed';
-      if (planBtn && planBtn.tagName === 'A') {
-        planBtn.outerHTML = '<button id="plan-cta-btn" class="btn btn-primary" disabled>View my plan</button>';
-      }
-    }
-  }
-
-  // Use fetch() for initial section loading ] more reliable than htmx.ajax()
-  function loadSection(mt) {
-    var section = document.getElementById('mt-section-' + mt);
-    if (!section) { markSettled(mt); return; }
-
-    fetch('/generate/' + mt, {method: 'POST', credentials: 'same-origin'})
-      .then(function(resp) { return resp.text(); })
-      .then(function(html) {
-        section.innerHTML = html;
-        if (typeof htmx !== 'undefined') htmx.process(section);
-      })
-      .catch(function() {
-        section.innerHTML = '<p style="padding:12px;color:var(--text-3);">Could not load suggestions. Try refreshing.</p>';
-      })
-      .finally(function() {
-        markSettled(mt);
-      });
-  }
-
-  function markSettled(mt) {
-    settledSet[mt] = true;
-    updateLoadingText();
-    if (allSectionsSettled()) revealContent();
-  }
-
-  // Update count after any HTMX interaction (toggle, skip).
-  // Must use htmx:afterSettle, not htmx:afterSwap - htmx temporarily copies the
-  // old element's attributes (including class) onto the new element during the swap,
-  // so the "accepted" class isn't present until afterSettle fires (~20ms later).
-  document.addEventListener('htmx:afterSettle', function() { updateAcceptedCount(); });
-
-  // Disable action buttons while their request is in flight to prevent double-clicks
-  document.addEventListener('htmx:beforeRequest', function(evt) {
-    var elt = evt.detail && evt.detail.elt;
-    if (elt && (elt.classList.contains('btn-accept') || elt.classList.contains('btn-skip') || elt.classList.contains('btn-undo'))) {
-      elt.disabled = true;
-    }
   });
+
   document.addEventListener('htmx:afterRequest', function(evt) {
     var elt = evt.detail && evt.detail.elt;
     if (elt) elt.disabled = false;
   });
+})();
 
-  document.addEventListener('DOMContentLoaded', function() {
-    updateLoadingText();
+/* ── Drag chip ── */
+var _draggedMeal = null;
+var _draggedType = 'dinner';
 
-    mealTypeOrder.forEach(function(mt) {
-      if (isSectionLoaded(mt)) {
-        settledSet[mt] = true;
-        return;
-      }
-      loadSection(mt);
-    });
+function dragChip(event) {
+  var chip = event.currentTarget || event.target.closest('.meal-chip-drag');
+  _draggedMeal = chip.dataset.meal;
+  _draggedType = chip.dataset.type || 'dinner';
+  event.dataTransfer.setData('text/plain', _draggedMeal);
+  event.dataTransfer.setData('application/x-meal-type', _draggedType);
+  event.dataTransfer.effectAllowed = 'copy';
+  chip.classList.add('dragging');
+}
 
-    if (allSectionsSettled()) revealContent();
+function dragChipEnd(event) {
+  var chip = event.currentTarget || event.target.closest('.meal-chip-drag');
+  if (chip) chip.classList.remove('dragging');
+  _draggedMeal = null;
+}
+
+/* ── Planner grid drop ── */
+function plannerDragOver(event) {
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'copy';
+  event.currentTarget.classList.add('drag-over');
+}
+
+function plannerDragLeave(event) {
+  event.currentTarget.classList.remove('drag-over');
+}
+
+function plannerDrop(event) {
+  event.preventDefault();
+  var cell = event.currentTarget;
+  cell.classList.remove('drag-over');
+  var meal = event.dataTransfer.getData('text/plain') || _draggedMeal;
+  var mtype = event.dataTransfer.getData('application/x-meal-type') || _draggedType || 'dinner';
+  if (!meal) return;
+
+  var day  = cell.dataset.day;
+  var slot = cell.dataset.slot;
+
+  // Determine filled class from slot
+  var filledClass = 'filled-' + slot;
+
+  // Rebuild cell contents
+  cell.className = 'planner-cell ' + filledClass;
+  cell.innerHTML =
+    '<div class="planner-cell-inner"><span class="planner-cell-name">' + escHtml(meal) + '</span></div>' +
+    '<button class="planner-cell-remove" onclick="clearPlannerCell(\'' + escHtml(day) + '\',\'' + escHtml(slot) + '\',this)" title="Remove">\xd7</button>';
+
+  // Persist
+  fetch('/planner/set', {
+    method: 'POST',
+    credentials: 'same-origin',
+    body: new URLSearchParams({day: day, slot: slot, meal_name: meal})
   });
+}
+
+function clearPlannerCell(day, slot, btn) {
+  var cell = btn.closest('.planner-cell');
+  cell.className = 'planner-cell empty';
+  cell.innerHTML = '<span class="planner-drop-hint">Drop meal<br>here</span>';
+  fetch('/planner/clear', {
+    method: 'POST',
+    credentials: 'same-origin',
+    body: new URLSearchParams({day: day, slot: slot})
+  });
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+/* ── Dessert picker ── */
+function toggleDessert(id, card) {
+  card.classList.toggle('selected');
+  fetch('/dessert/toggle/' + encodeURIComponent(id), { method: 'POST', credentials: 'same-origin' });
+}
+
+/* ── Cluster carousel ── */
+function scrollClusters(dir) {
+  var el = document.getElementById('all-clusters');
+  if (!el) return;
+  el.scrollBy({ left: dir * (el.offsetWidth * 0.8), behavior: 'smooth' });
+}
+
+function updateClusterArrows() {
+  var scroll = document.getElementById('all-clusters');
+  var prev = document.getElementById('cluster-prev');
+  var next = document.getElementById('cluster-next');
+  if (!scroll || !prev || !next) return;
+  prev.style.display = scroll.scrollLeft > 2 ? 'flex' : 'none';
+  next.style.display = scroll.scrollLeft + scroll.clientWidth < scroll.scrollWidth - 2 ? 'flex' : 'none';
+}
+
+(function() {
+  var scroll = document.getElementById('all-clusters');
+  if (!scroll) return;
+  updateClusterArrows();
+  scroll.addEventListener('scroll', updateClusterArrows);
+  window.addEventListener('resize', updateClusterArrows);
+})();
+
+function scrollDesserts(dir) {
+  var el = document.getElementById('dessert-scroll');
+  if (!el) return;
+  el.scrollBy({ left: dir * (el.offsetWidth * 0.75), behavior: 'smooth' });
+}
+
+(function() {
+  var scroll = document.getElementById('dessert-scroll');
+  var prev   = document.getElementById('dessert-prev');
+  var next   = document.getElementById('dessert-next');
+  if (!scroll || !prev || !next) return;
+  function updateArrows() {
+    prev.style.display = scroll.scrollLeft > 2 ? 'flex' : 'none';
+    next.style.display = scroll.scrollLeft + scroll.clientWidth < scroll.scrollWidth - 2 ? 'flex' : 'none';
+  }
+  updateArrows();
+  scroll.addEventListener('scroll', updateArrows);
+  window.addEventListener('resize', updateArrows);
 })();
 </script>
 {% endblock %}

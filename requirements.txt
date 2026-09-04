@@ -6,3 +6,5 @@ anthropic>=0.40.0
 python-dotenv==1.0.1
 itsdangerous==2.2.0
 starlette==0.38.4
+scikit-learn>=1.4.0
+numpy>=1.26.0

@@ -9,12 +9,55 @@
     padding: clamp(28px, 5vw, 48px) clamp(20px, 5vw, 40px) clamp(48px, 8vw, 80px);
   }
   .setup-heading {
-    font-family: 'Cormorant Garamond', Georgia, serif;
-    font-size: clamp(1.3rem, 3.5vw, 1.65rem);
-    font-weight: 600;
-    font-style: italic;
+    font-family: 'Caveat', cursive;
+    font-size: clamp(1.8rem, 4.5vw, 2.4rem);
+    font-weight: 700;
+    font-style: normal;
     color: var(--black);
     margin-bottom: 24px;
+  }
+  .form-card-title {
+    font-family: system-ui, -apple-system, sans-serif !important;
+    font-size: .75rem !important;
+    font-weight: 700 !important;
+    letter-spacing: .1em !important;
+    text-transform: uppercase !important;
+    font-style: normal !important;
+    color: var(--black) !important;
+  }
+  .mode-cards-row { display:flex; gap:16px; margin-top:12px; }
+  @media (max-width:560px) { .mode-cards-row { flex-direction:column; } }
+  .setup-mode-card {
+    position:relative; flex:1; cursor:pointer;
+    border:1.5px solid var(--border); background:#fff;
+    border-radius:14px; padding:22px 20px;
+    display:flex; flex-direction:column; justify-content:flex-start;
+    box-shadow:0 2px 10px rgba(0,0,0,.06);
+    transition:border-color .15s,border-width .15s,background .15s;
+    overflow:hidden; text-align:left;
+  }
+  .setup-mode-card:hover { border-color:var(--green-3); }
+  .setup-mode-card:hover .smc-title,
+  .setup-mode-card:hover .smc-sub { color:var(--green-3); }
+  .setup-mode-card.selected {
+    border-color:var(--green-2); border-width:2px;
+    background: linear-gradient(rgba(255,255,255,.78), rgba(255,255,255,.78)), url('/static/food-doodle.jpg') center/200px;
+  }
+  .setup-mode-card.selected .smc-title,
+  .setup-mode-card.selected .smc-sub { color:var(--green-2); }
+  .setup-mode-card .smc-label {
+    font-size:.6rem; font-weight:700; letter-spacing:.12em; text-transform:uppercase;
+    color:var(--text-3); margin-bottom:8px; position:relative; z-index:1;
+  }
+  .setup-mode-card .smc-title {
+    font-size:.9rem; font-weight:600; color:var(--black);
+    line-height:1.4; position:relative; z-index:1; margin-bottom:6px;
+    transition:color .15s;
+  }
+  .setup-mode-card .smc-sub {
+    font-size:.78rem; color:var(--text-3); line-height:1.55;
+    position:relative; z-index:1;
+    transition:color .15s;
   }
 </style>
 {% endblock %}
@@ -37,53 +80,7 @@
       <div class="step-dot" data-step-dot>5</div>
     </div>
 
-    <!-- Step 1 -->
-    <div class="step-section form-card" id="step-0">
-      <div class="form-card-title">Which meals do you want to plan?</div>
-      <div class="form-card-subtitle">Select all that apply.</div>
-      <div class="meal-type-stack">
-        <label class="meal-type-row" id="label-breakfast">
-          <input type="checkbox" name="meal_types" value="breakfast" />
-          <div class="meal-row-icon">
-            <svg class="icon icon-md" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
-              <circle cx="12" cy="12" r="4"/>
-              <line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/>
-              <line x1="4.22" y1="4.22" x2="6.34" y2="6.34"/><line x1="17.66" y1="17.66" x2="19.78" y2="19.78"/>
-              <line x1="2" y1="12" x2="5" y2="12"/><line x1="19" y1="12" x2="22" y2="12"/>
-              <line x1="4.22" y1="19.78" x2="6.34" y2="17.66"/><line x1="17.66" y1="6.34" x2="19.78" y2="4.22"/>
-            </svg>
-          </div>
-          <span class="meal-row-name">Breakfast</span>
-          <div class="meal-row-check"><svg class="icon icon-xs" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
-        </label>
-        <label class="meal-type-row" id="label-lunch">
-          <input type="checkbox" name="meal_types" value="lunch" />
-          <div class="meal-row-icon">
-            <svg class="icon icon-md" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
-              <path d="M3 2v7c0 1.1.9 2 2 2h4a2 2 0 002-2V2"/><line x1="7" y1="2" x2="7" y2="22"/>
-              <line x1="21" y1="15" x2="21" y2="22"/><path d="M21 2a5 5 0 00-5 5v8h5"/>
-            </svg>
-          </div>
-          <span class="meal-row-name">Lunch</span>
-          <div class="meal-row-check"><svg class="icon icon-xs" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
-        </label>
-        <label class="meal-type-row" id="label-dinner">
-          <input type="checkbox" name="meal_types" value="dinner" />
-          <div class="meal-row-icon">
-            <svg class="icon icon-md" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
-              <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
-            </svg>
-          </div>
-          <span class="meal-row-name">Dinner</span>
-          <div class="meal-row-check"><svg class="icon icon-xs" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
-        </label>
-      </div>
-      <div style="margin-top:22px;text-align:right;">
-        <button type="button" class="btn btn-primary" data-next-step>Next</button>
-      </div>
-    </div>
-
-    <!-- Step 2 -->
+    <!-- Step 1 (was Step 2) -->
     <div class="step-section form-card" id="step-1">
       <div class="form-card-title">How many people are you cooking for?</div>
       <div class="form-card-subtitle">We will scale ingredient amounts on your grocery list.</div>
@@ -96,8 +93,7 @@
         <input type="hidden" name="servings" id="servings-hidden" value="2" />
         <span style="font-size:.875rem;color:var(--text-3);">people per meal</span>
       </div>
-      <div style="margin-top:22px;display:flex;gap:8px;justify-content:space-between;">
-        <button type="button" class="btn btn-ghost" data-prev-step>Back</button>
+      <div style="margin-top:22px;display:flex;gap:8px;justify-content:flex-end;">
         <button type="button" class="btn btn-primary" data-next-step>Next</button>
       </div>
     </div>
@@ -109,7 +105,7 @@
       <input type="text" name="dietary_needs" class="input"
         placeholder="e.g. vegetarian, gluten-free, nut allergy, low-carb" autocomplete="off" />
       <div style="margin-top:22px;display:flex;gap:8px;justify-content:space-between;align-items:center;">
-        <button type="button" class="btn btn-ghost" data-prev-step>Back</button>
+        <button type="button" class="btn btn-pond btn-back" data-prev-step>Back</button>
         <button type="button" class="btn btn-primary" data-next-step>Next</button>
       </div>
     </div>
@@ -117,16 +113,14 @@
     <!-- Step 4 (Budget) -->
     <div class="step-section form-card" id="step-3">
       <div class="form-card-title">What's your weekly budget?</div>
-      <div class="form-card-subtitle">We'll keep the same recipes but trim optional or pricier ingredients to fit.</div>
-      <div class="adventure-slider-wrap">
-        <input type="range" min="0" max="2" value="1" class="adventure-slider" id="budget-slider" />
-        <div class="adventure-ticks" id="budget-ticks">
-          <span>Budget</span><span>Moderate</span><span>Flexible</span>
-        </div>
-        <input type="hidden" name="budget_level" id="budget-level-hidden" value="moderate" />
+      <div class="form-card-subtitle">We'll keep this in mind when suggesting ingredients and extras.</div>
+      <div style="position:relative;margin-top:8px;">
+        <span style="position:absolute;left:13px;top:50%;transform:translateY(-50%);font-size:.95rem;color:var(--text-3);pointer-events:none;">$</span>
+        <input type="number" name="budget_level" id="budget-level-input" min="0" placeholder="e.g. 150"
+               class="input" style="padding-left:26px;" />
       </div>
       <div style="margin-top:22px;display:flex;gap:8px;justify-content:space-between;">
-        <button type="button" class="btn btn-ghost" data-prev-step>Back</button>
+        <button type="button" class="btn btn-pond btn-back" data-prev-step>Back</button>
         <button type="button" class="btn btn-primary" data-next-step>Next</button>
       </div>
     </div>
@@ -145,8 +139,29 @@
         <label class="day-chip"><input type="checkbox" name="meal_prep_days" value="Sun" /><span>Sun</span></label>
       </div>
       <div style="margin-top:22px;display:flex;gap:8px;justify-content:space-between;align-items:center;">
-        <button type="button" class="btn btn-ghost" data-prev-step>Back</button>
-        <button type="submit" class="btn btn-primary btn-lg">Plan my week</button>
+        <button type="button" class="btn btn-pond btn-back" data-prev-step>Back</button>
+        <button type="button" class="btn btn-primary" data-next-step>Next</button>
+      </div>
+    </div>
+
+    <!-- Step 5: How do you want to plan? -->
+    <div class="step-section form-card" id="step-5">
+      <div class="form-card-title">How do you want to plan this week?</div>
+      <div class="form-card-subtitle">We'll suggest meals, or you can bring your own.</div>
+      <input type="hidden" name="mode" id="mode-hidden" value="suggestions">
+      <div class="mode-cards-row">
+        <div class="setup-mode-card" data-mode="suggestions" onclick="selectMode('suggestions')">
+          <div class="smc-title">Suggest meals for me</div>
+          <div class="smc-sub">We'll pick meals based on your preferences and build your grocery list automatically.</div>
+        </div>
+        <div class="setup-mode-card" data-mode="existing" onclick="selectMode('existing')">
+          <div class="smc-title">Suggest from my ingredients</div>
+          <div class="smc-sub">Tell us what you have and we'll find meals that fit, only listing the gaps.</div>
+        </div>
+      </div>
+      <div style="margin-top:22px;display:flex;gap:8px;justify-content:space-between;align-items:center;">
+        <button type="button" class="btn btn-pond btn-back" data-prev-step>Back</button>
+        <button type="submit" id="submit-btn" class="btn btn-primary btn-lg" disabled style="opacity:.4;cursor:not-allowed;">Submit</button>
       </div>
     </div>
 
@@ -157,24 +172,6 @@
 {% block extra_js %}
 <script>
 (function() {
-  var LEVELS = ['budget', 'moderate', 'flexible'];
-  var slider = document.getElementById('budget-slider');
-  var ticks  = document.querySelectorAll('#budget-ticks span');
-  var hidden = document.getElementById('budget-level-hidden');
-  if (!slider) return;
-  function update() {
-    var i   = parseInt(slider.value);
-    var pct = (i / 2) * 100;
-    slider.style.background =
-      'linear-gradient(to right, var(--green) 0%, var(--green) ' + pct + '%, var(--border-dk) ' + pct + '%, var(--border-dk) 100%)';
-    hidden.value = LEVELS[i];
-    ticks.forEach(function(t, idx) {
-      t.style.fontWeight = idx === i ? '700' : '400';
-      t.style.color      = idx === i ? 'var(--black)' : 'var(--text-3)';
-    });
-  }
-  slider.addEventListener('input', update);
-  update();
 })();
 
 document.querySelectorAll('.meal-type-row').forEach(function(row) {
@@ -184,5 +181,15 @@ document.querySelectorAll('.meal-type-row').forEach(function(row) {
   row.classList.remove('checked');
 });
 
+function selectMode(val) {
+  document.getElementById('mode-hidden').value = val;
+  document.querySelectorAll('.setup-mode-card').forEach(function(c) {
+    c.classList.toggle('selected', c.dataset.mode === val);
+  });
+  var btn = document.getElementById('submit-btn');
+  btn.disabled = false;
+  btn.style.opacity = '';
+  btn.style.cursor = '';
+}
 </script>
 {% endblock %}

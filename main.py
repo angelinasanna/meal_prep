@@ -1,9 +1,12 @@
-from fastapi import FastAPI, Request, Form, Query
+from fastapi import FastAPI, Request, Form, Query, BackgroundTasks
+import httpx
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
-import anthropic
+from authlib.integrations.starlette_client import OAuth
+from google import genai as google_genai
+from google.genai import types as google_genai_types
 import asyncio
 import calendar as _cal
 import hashlib
@@ -15,25 +18,319 @@ import random
 import re
 import secrets
 import uuid
-from collections import defaultdict
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+
 from datetime import date, timedelta
 from typing import List
 from dotenv import load_dotenv
 
 load_dotenv()
+_gemini_client = None
+
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        key = os.getenv("GEMINI_API_KEY", "")
+        if not key:
+            raise RuntimeError("GEMINI_API_KEY is not set in .env")
+        _gemini_client = google_genai.Client(api_key=key)
+    return _gemini_client
 
 app = FastAPI()
 app.add_middleware(
     SessionMiddleware,
     secret_key=os.getenv("SECRET_KEY", "mealprepped-dev-secret-change-in-prod"),
 )
+
+# ── Google OAuth ─────────────────────────────────────────────────────────────
+oauth = OAuth()
+oauth.register(
+    name="google",
+    client_id=os.getenv("GOOGLE_CLIENT_ID"),
+    client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+    client_kwargs={"scope": "openid email profile"},
+)
 app.mount("/static", StaticFiles(directory="static"), name="static")
+import time as _time
 templates = Jinja2Templates(directory="templates")
+templates.env.globals["css_v"] = str(int(_time.time()))
 
 # ── Server-side cluster store (avoids cookie size limits) ───────────────────
 _cluster_store: dict = {}
 _recipe_store: dict = {}  # session_key -> generated recipe content
 _cluster_locks: dict = {}  # session_key -> asyncio.Lock (guards concurrent per-meal-type writes)
+_plans_store: dict = {}   # session_key -> plans_by_week (kept server-side so cookie stays small)
+_persisted_state: dict = {}  # session_key -> last-persisted plan fingerprint, prevents redundant Supabase writes
+_usda_cache: dict = {}       # normalized food name -> per-100g nutrient dict (persistent in-process cache)
+_macro_store: dict = {}      # "{sk}:{cluster_id}" -> list[dict] per use, or "computing" sentinel
+
+# ── USDA FoodData Central ─────────────────────────────────────
+USDA_API_KEY: str = os.getenv("USDA_API_KEY", "")
+
+# Unicode fraction characters → float
+_UNICODE_FRACS: dict = {
+    "½": 0.5, "⅓": 1/3, "⅔": 2/3, "¼": 0.25, "¾": 0.75,
+    "⅛": 0.125, "⅜": 0.375, "⅝": 0.625, "⅞": 0.875,
+}
+
+# Weight units → grams
+_WEIGHT_G: dict = {
+    "g": 1, "gram": 1, "grams": 1,
+    "kg": 1000, "kilogram": 1000, "kilograms": 1000,
+    "oz": 28.35, "ounce": 28.35, "ounces": 28.35,
+    "lb": 453.6, "lbs": 453.6, "pound": 453.6, "pounds": 453.6,
+}
+
+# Count/display units — recognized for grocery display but no gram conversion
+_DISPLAY_UNITS: set = {
+    "clove", "cloves", "bunch", "bunches", "stalk", "stalks",
+    "head", "heads", "sprig", "sprigs", "slice", "slices",
+    "can", "cans", "jar", "jars", "package", "pkg", "packages",
+    "piece", "pieces", "fillet", "fillets", "sheet", "sheets",
+    "strip", "strips", "link", "links", "block", "blocks",
+}
+
+# Volume units → ml (treated as grams at water density; close enough for produce/sauces)
+_VOLUME_ML: dict = {
+    "cup": 240, "cups": 240,
+    "tbsp": 15, "tablespoon": 15, "tablespoons": 15,
+    "tsp": 5, "teaspoon": 5, "teaspoons": 5,
+    "ml": 1, "milliliter": 1, "milliliters": 1,
+    "l": 1000, "liter": 1000, "liters": 1000,
+    "fl oz": 29.57,
+}
+
+# Words to strip from ingredient strings before food-name lookup
+_STRIP_WORDS: set = {
+    "shredded", "diced", "chopped", "minced", "sliced", "cooked", "fresh",
+    "dried", "ground", "grated", "peeled", "boneless", "skinless", "frozen",
+    "canned", "drained", "rinsed", "raw", "large", "medium", "small", "extra",
+    "fine", "coarse", "organic", "halved", "quartered", "trimmed", "pitted",
+    "deveined", "butterflied", "cubed", "crumbled", "softened", "divided",
+    "plus", "more", "to", "taste", "or", "and", "of", "about", "approximately",
+    "packed", "heaping", "level", "hot", "cold", "warm", "room", "temperature",
+    "lightly", "well", "roughly", "thinly", "thickly", "finely",
+    "cut", "into", "strips", "florets", "pieces", "cubes", "rings", "wedges",
+    "lengthwise", "crosswise", "separated", "broken", "torn", "flaked",
+    "very", "as", "needed", "use", "reserved", "remaining",
+    "ripe", "firm", "lean", "whole",
+}
+
+# Approximate gram weights for common unit-count ingredients (1 unit → grams)
+_UNIT_GRAM_DEFAULTS: dict = {
+    "avocado": 150, "tomato": 120, "egg": 50, "lemon": 60, "lime": 60,
+    "onion": 110, "garlic": 5, "potato": 150, "sweet potato": 130,
+    "carrot": 80, "zucchini": 200, "pepper": 120, "bell pepper": 120,
+    "chicken breast": 175, "chicken thigh": 130, "salmon fillet": 150,
+    "apple": 180, "banana": 120, "orange": 150,
+    "can": 400, "tin": 400,
+}
+
+# USDA nutrient IDs we care about
+_USDA_NIDS: dict = {
+    1008: "calories",  # Energy (kcal)
+    1003: "protein_g", # Protein
+    1005: "carbs_g",   # Carbohydrate, by difference
+    1004: "fat_g",     # Total lipid (fat)
+}
+
+
+def _parse_qty(s: str) -> tuple:
+    """Extract leading numeric quantity from string. Returns (float, remainder)."""
+    for ch, val in _UNICODE_FRACS.items():
+        s = s.replace(ch, f" {val} ")
+    s = re.sub(r"\s+", " ", s).strip()
+    # Mixed number: "1 1/2"
+    m = re.match(r"^(\d+\.?\d*)\s+(\d+)\s*/\s*(\d+)", s)
+    if m:
+        return float(m[1]) + float(m[2]) / float(m[3]), s[m.end():].strip()
+    # Simple fraction: "1/2"
+    m = re.match(r"^(\d+)\s*/\s*(\d+)", s)
+    if m:
+        return float(m[1]) / float(m[2]), s[m.end():].strip()
+    # Decimal or integer (optionally followed by a range like "-4" which we ignore)
+    m = re.match(r"^(\d+\.?\d*)(?:\s*[-–]\s*\d+\.?\d*)?", s)
+    if m:
+        return float(m[1]), s[m.end():].strip()
+    return 1.0, s
+
+
+def _parse_ingredient(raw: str) -> dict:
+    """Parse ingredient string → {food_name, qty_g, qty, unit}."""
+    raw = raw.strip().lstrip("+-•* ").strip()
+    # Remove parenthetical notes e.g. "(optional)"
+    raw = re.sub(r"\(.*?\)", "", raw).strip()
+    qty, rest = _parse_qty(raw)
+    rest = rest.strip()
+    unit = None
+    qty_g = None
+    # Try longest unit match first (weight + volume → gives qty_g for USDA)
+    all_units = {**_WEIGHT_G, **_VOLUME_ML}
+    for u in sorted(all_units, key=len, reverse=True):
+        pat = re.compile(r"^" + re.escape(u) + r"(?:\s|$|\.)", re.IGNORECASE)
+        if pat.match(rest):
+            rest = rest[len(u):].lstrip(". ").strip()
+            unit = u
+            qty_g = qty * all_units[u.lower()]
+            break
+    # If no weight/volume unit found, try display-only count units
+    if unit is None:
+        for u in sorted(_DISPLAY_UNITS, key=len, reverse=True):
+            pat = re.compile(r"^" + re.escape(u) + r"(?:\s|$|\.)", re.IGNORECASE)
+            if pat.match(rest):
+                rest = rest[len(u):].lstrip(". ").strip()
+                unit = u
+                break
+    # Strip "of" connector
+    rest = re.sub(r"^of\s+", "", rest, flags=re.IGNORECASE)
+    # Build food name: stop at first comma (removes prep text like "cut into strips"),
+    # then keep non-stopword alphabetic words, max 4
+    rest_for_name = rest.split(",")[0].strip()
+    words = rest_for_name.split()
+    food_words = [w for w in words if w and w.lower() not in _STRIP_WORDS and re.match(r"[a-zA-Z]", w)]
+    food_name = " ".join(food_words[:4]).strip() or rest_for_name[:40]
+    return {"food_name": food_name, "qty_g": qty_g, "qty": qty, "unit": unit}
+
+
+async def _usda_lookup(food_name: str) -> dict:
+    """Return per-100g {calories, protein_g, carbs_g, fat_g} from USDA FDC, or {} on failure."""
+    key = food_name.lower().strip()
+    if key in _usda_cache:
+        return _usda_cache[key]
+    if not USDA_API_KEY:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://api.nal.usda.gov/fdc/v1/foods/search",
+                params={
+                    "query": food_name,
+                    "api_key": USDA_API_KEY,
+                    "dataType": "SR Legacy,Foundation,FNDDS",
+                    "pageSize": 1,
+                },
+            )
+        if resp.status_code != 200:
+            _usda_cache[key] = {}
+            return {}
+        foods = resp.json().get("foods", [])
+        if not foods:
+            _usda_cache[key] = {}
+            return {}
+        result: dict = {}
+        for n in foods[0].get("foodNutrients", []):
+            nid = n.get("nutrientId")
+            if nid in _USDA_NIDS:
+                result[_USDA_NIDS[nid]] = float(n.get("value", 0))
+        _usda_cache[key] = result
+        return result
+    except Exception:
+        return {}
+
+
+async def _macros_for_ingredients(ingredients: list, servings: int) -> dict:
+    """Sum USDA macros for a list of raw ingredient strings, scaled to per-serving."""
+    parsed = [_parse_ingredient(i) for i in ingredients if isinstance(i, str)]
+    lookups = await asyncio.gather(*[_usda_lookup(p["food_name"]) for p in parsed])
+    totals = {"calories": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0}
+    for p, per_100g in zip(parsed, lookups):
+        if not per_100g:
+            continue
+        qty_g = p["qty_g"]
+        if qty_g is None and p["qty"] is not None:
+            # Count-based ingredient (e.g. "1 avocado") — look up a known weight or use 100g default
+            food_lower = p["food_name"].lower()
+            default_g = next((v for k, v in _UNIT_GRAM_DEFAULTS.items() if k in food_lower), 100)
+            qty_g = p["qty"] * default_g
+        if not qty_g:
+            continue
+        scale = qty_g / 100.0
+        for k in totals:
+            totals[k] += per_100g.get(k, 0.0) * scale
+    sv = max(servings, 1)
+    return {k: round(v / sv, 1) for k, v in totals.items()}
+
+
+async def _compute_recipe_macros(recipe: dict, servings: int) -> list:
+    """Return list of per-use per-serving macro dicts for a recipe cluster."""
+    uses = recipe.get("uses", [])
+    if not uses:
+        return []
+    base_ings = [i for i in recipe.get("base", {}).get("ingredients", [])
+                 if not (isinstance(i, str) and i.startswith("[") and i.endswith("]"))]
+    # Base macros split across all uses
+    base_macros = await _macros_for_ingredients(base_ings, servings * len(uses))
+    use_macros = []
+    for use in uses:
+        extras = use.get("extras", [])
+        extras_macros = await _macros_for_ingredients(extras, servings) if extras else {}
+        use_macros.append({
+            "calories": round(base_macros.get("calories", 0) + extras_macros.get("calories", 0)),
+            "protein_g": round(base_macros.get("protein_g", 0) + extras_macros.get("protein_g", 0), 1),
+            "carbs_g": round(base_macros.get("carbs_g", 0) + extras_macros.get("carbs_g", 0), 1),
+            "fat_g": round(base_macros.get("fat_g", 0) + extras_macros.get("fat_g", 0), 1),
+        })
+    return use_macros
+
+
+async def _bg_compute_macros(mkey: str, recipe: dict, servings: int):
+    """Background task: compute macros for one recipe and store in _macro_store."""
+    try:
+        result = await _compute_recipe_macros(recipe, servings)
+        _macro_store[mkey] = result
+    except Exception:
+        _macro_store[mkey] = None  # signal failure so polling stops
+
+
+# ── Recipe variation name helpers ─────────────────────────────
+# Words too generic to count as "distinctive" when deciding whether to append
+# a recipe-title suffix to a variation name.
+_VAR_STOP: set = {
+    "easy", "simple", "quick", "classic", "homemade", "fresh", "light", "healthy",
+    "crispy", "crunchy", "baked", "roasted", "grilled", "sauteed", "fried", "spiced",
+    "smoked", "stuffed", "glazed", "braised", "marinated", "pickled", "whipped", "poached",
+    "pan", "one", "pot", "sheet", "slow", "instant", "air",
+    "with", "and", "the", "of", "in", "a", "an", "on", "for", "to", "by",
+    "style", "inspired",
+    "salad", "bowl", "plate", "dish", "meal", "soup", "stew", "wrap",
+    "sandwich", "toast", "taco", "burger", "sauce", "dressing",
+    "vegetable", "veggie",
+}
+
+
+def _content_words(segment: str) -> list:
+    """Non-stop, ≥3-char words from a title segment, split on spaces/hyphens/slashes."""
+    return [w for w in re.split(r"[\s\-/&,]+", segment)
+            if w and re.match(r"[a-zA-Z]{3,}", w) and w.lower() not in _VAR_STOP]
+
+
+def _recipe_name_context(title: str) -> dict:
+    """Analyse a recipe title and return the prefix to add to variation names.
+
+    Two formats:
+      • "with" recipe  (e.g. "Turmeric Salmon with Parsley Yogurt Sauce"):
+          with_key = "Turmeric Salmon"  → "{with_key} and {variation}"
+          ("Salmon with Pistachio Pesto") → with_key = "Pistachio Salmon" (1 from each side)
+      • plain recipe   (e.g. "Lemon-Marinated Bean and Vegetable Salad"):
+          full_ctx = "Lemon Bean"       → "{full_ctx} {variation}"
+    """
+    parts = re.split(r"\s+with\s+", title, flags=re.IGNORECASE)
+    if len(parts) >= 2:
+        before = _content_words(parts[0])
+        after  = _content_words(" ".join(parts[1:]))
+        if len(before) >= 2:
+            with_key = " ".join(before[:2])          # "Turmeric Salmon"
+        elif before and after:
+            with_key = f"{after[0]} {before[0]}"     # "Pistachio Salmon"
+        else:
+            with_key = " ".join((before or after)[:2])
+        return {"with_key": with_key, "full_ctx": ""}
+    words = _content_words(title)
+    full_ctx = " ".join(words[:2]) if words else ""  # "Lemon Bean"
+    return {"with_key": "", "full_ctx": full_ctx}
 
 
 def _get_cluster_lock(sk: str) -> asyncio.Lock:
@@ -54,7 +351,12 @@ def load_clusters(request: Request) -> list:
 
 
 def save_clusters(request: Request, clusters: list):
-    _cluster_store[_store_key(request)] = clusters
+    sk = _store_key(request)
+    _cluster_store[sk] = clusters
+    # Clear all per-week recipe cache entries for this session
+    for k in list(_recipe_store.keys()):
+        if k.startswith(sk):
+            del _recipe_store[k]
 
 
 def clear_clusters(request: Request):
@@ -63,11 +365,39 @@ def clear_clusters(request: Request):
     _cluster_locks.pop(sk, None)
 
 
+def get_plans_by_week(request: Request) -> dict:
+    sk = _store_key(request)
+    if sk in _plans_store:
+        return _plans_store[sk]
+    # If logged in, try loading from Supabase (handles server restart / eviction)
+    user_id = request.session.get("user_id")
+    if user_id:
+        try:
+            data = load_user_data(user_id)
+            saved = data.get("plans_by_week", {})
+            if saved:
+                _plans_store[sk] = saved
+                return saved
+        except Exception:
+            pass
+    # Fall back to session (non-logged-in users)
+    return request.session.get("plans_by_week", {})
+
+
+def save_plans_by_week(request: Request, plans: dict):
+    sk = _store_key(request)
+    _plans_store[sk] = plans
+    # Keep a lightweight copy in session for backward-compat reads only
+    request.session.pop("plans_by_week", None)
+    # Always persist to Supabase immediately for logged-in users
+    _persist_user(request)
+
+
 # ── Cuisine / season constants ───────────────────────────────────────────────
 CUISINES = [
     "Italian", "Mexican", "Japanese", "Chinese",
     "Indian", "Thai", "Korean", "French",
-    "Greek", "American", "Spanish", "Vietnamese",
+    "Mediterranean", "American", "Spanish", "Vietnamese",
 ]
 
 _SEASON_MAP = {
@@ -80,7 +410,7 @@ SEASONS = ["Spring", "Summer", "Fall", "Winter"]
 
 _SEASON_GUIDANCE = {
     "Spring": "seasonal spring produce (asparagus, peas, artichokes, radishes, spring greens, leeks). Light, fresh preparations.",
-    "Summer": "seasonal summer produce (tomatoes, zucchini, corn, peppers, basil, stone fruits, cucumbers, berries). Fresh, lighter meals [ grilling works well.",
+    "Summer": "seasonal summer produce (tomatoes, zucchini, corn, peppers, basil, stone fruits, cucumbers, berries). Fresh, lighter meals. Grilling works well.",
     "Fall":   "seasonal fall produce (butternut squash, sweet potato, apples, Brussels sprouts, mushrooms, root vegetables). Warming, hearty dishes.",
     "Winter": "seasonal winter produce (citrus, kale, root vegetables, cabbage, pears, dried legumes). Comforting soups, stews, and braises.",
 }
@@ -93,7 +423,7 @@ _ADVENTURE_GUIDANCE = {
         "lemon). No specialty varieties, no unusual items, no hard-to-find ingredients whatsoever."
     ),
     "curious": (
-        "More interesting recipes but still accessible ingredients ] things any grocery store stocks: "
+        "More interesting recipes but still accessible ingredients. Things any grocery store stocks: "
         "dijon mustard, capers, sun-dried tomatoes, fresh herbs, greek yogurt, sriracha, rice vinegar, "
         "tahini, smoked paprika, cumin, feta. No specialty imports or hard-to-source items."
     ),
@@ -104,7 +434,7 @@ _ADVENTURE_GUIDANCE = {
     ),
 }
 
-# ── Curated recipes per cuisine [ injected into AI prompt when that cuisine is selected ──
+# ── Curated recipes per cuisine. Injected into AI prompt when that cuisine is selected ──
 _RECIPE_MEAL_TYPES: dict[str, list[str]] = {
     # Breakfast
     "breakfast-taco-bowl":   ["breakfast"],
@@ -169,7 +499,21 @@ _RECIPE_MEAL_TYPES: dict[str, list[str]] = {
     "greek-egg-bites":         ["breakfast"],
     "shakshuka":               ["breakfast"],
     "turkish-eggs":            ["breakfast"],
-    "ground-turkey-pita":        ["lunch"],
+    "ground-turkey-pita":                  ["lunch"],
+    "mediterranean-tuna-salad":            ["lunch"],
+    "chicken-sweet-potato-bowls":          ["lunch"],
+    "mediterranean-quinoa-salad":          ["lunch"],
+    "chickpea-salad-sandwich":             ["lunch"],
+    "greek-black-eyed-pea-stew":           ["dinner"],
+    "mediterranean-chicken-salad":         ["lunch"],
+    "pan-bagnat":                          ["lunch"],
+    "stuffed-sweet-potatoes-chickpeas":    ["lunch", "dinner"],
+    "salmon-rice-bowls":                   ["lunch", "dinner"],
+    "greek-sheet-pan-chicken":             ["lunch", "dinner"],
+    "chicken-shawarma":                    ["lunch"],
+    "italian-chicken-meatballs":           ["dinner"],
+    "baked-salmon-vegetables":             ["dinner"],
+    "mediterranean-beef-bowl":             ["dinner"],
     "chicken-tandoori-bowls":   ["lunch"],
     "vegan-indian-curry":        ["dinner"],
     "paneer-tikka-bowl":         ["lunch", "dinner"],
@@ -178,6 +522,13 @@ _RECIPE_MEAL_TYPES: dict[str, list[str]] = {
     "coconut-lentil-curry":      ["dinner"],
     "indian-veggie-rice-bowl":   ["lunch"],
     "indian-savory-toast":       ["breakfast"],
+    "chana-masala":              ["lunch", "dinner"],
+    "aloo-gobi":                 ["lunch", "dinner"],
+    "palak-paneer":              ["dinner"],
+    "dal-tadka":                 ["lunch", "dinner"],
+    "bhindi-do-pyaza":           ["lunch", "dinner"],
+    "butter-chicken":            ["dinner"],
+    "tofu-tikka-masala":         ["dinner"],
     "spanish-breakfast-hash":    ["breakfast"],
     "spanish-scrambled-eggs":    ["breakfast"],
     "spanish-tortilla":          ["breakfast"],
@@ -186,6 +537,42 @@ _RECIPE_MEAL_TYPES: dict[str, list[str]] = {
     "gambas-al-ajillo":          ["dinner"],
     "spanish-garlic-soup":       ["dinner"],
     "spanish-beef-rice":         ["lunch"],
+    "ceviche":                   ["lunch", "dinner"],
+    "peruvian-chicken":          ["dinner"],
+    "brazilian-black-bean-stew": ["dinner"],
+    "venezuelan-chili":          ["lunch", "dinner"],
+    "dominican-chicken-rice":    ["dinner"],
+    "peruvian-steak":            ["dinner"],
+    "spanish-torrijas":          ["dessert"],
+    "round-steak-italiano":      ["dinner"],
+    "eggplant-parmesan":         ["dinner"],
+    "tuscan-ravioli":            ["lunch", "dinner"],
+    "bruschetta-chicken-wraps":  ["lunch"],
+    "sheet-pan-chicken-parm":    ["dinner"],
+    "squash-pasta-toss":         ["lunch", "dinner"],
+    "panzanella-burrata":        ["lunch"],
+    "italian-lentil-salad":      ["lunch"],
+    "corn-zucchini-salad":       ["lunch"],
+    "italian-meatball-soup":     ["lunch", "dinner"],
+    "roasted-garlic-soup":       ["lunch", "dinner"],
+    "pumpkin-spice-soup":        ["lunch", "dinner"],
+    "italian-lentil-soup":       ["lunch", "dinner"],
+    "herb-pork-tenderloin":      ["dinner"],
+    "italian-pork-chops":        ["dinner"],
+    "wine-braised-sausage":      ["dinner"],
+    "raspberry-ricotta-cake":    ["dessert"],
+    "apple-cinnamon-flatbread":  ["dessert"],
+    "peach-crostata":            ["dessert"],
+    "pumpkin-spice-muffins":     ["breakfast"],
+    "tiramisu-cake":             ["dessert"],
+    "banana-nut-muffins":        ["breakfast"],
+    "roasted-strawberries":      ["dessert"],
+    "lemon-poppy-seed-loaf":     ["dessert"],
+    "fruit-pizza-cookies":       ["dessert"],
+    "oatmeal-choc-chip-cookies": ["dessert"],
+    "vegan-banana-brownies":     ["dessert"],
+    "date-peanut-butter-cups":   ["dessert"],
+    "raspberry-choc-muffins":    ["breakfast"],
     "chipotle-rice-bowl":        ["lunch"],
     "mexican-chorizo-casserole": ["breakfast"],
     "mexican-street-corn":       ["lunch"],
@@ -200,33 +587,214 @@ _RECIPE_MEAL_TYPES: dict[str, list[str]] = {
     "tom-rim-shrimp":                 ["dinner"],
     "canh-chua-ca":                   ["dinner"],
     "grilled-pork-rice-paper-rolls":  ["lunch"],
+    "vietnamese-matcha-cookies":      ["dessert"],
+    "vietnamese-coffee-brownies":     ["dessert"],
+    "thai-chicken-bowls":   ["lunch"],
+    "khao-soi":             ["dinner"],
+    "pad-thai":             ["dinner"],
+    "drunken-noodles":      ["dinner"],
+    "pad-see-ew":           ["dinner"],
+    "thai-noodle-salad":    ["lunch"],
+    "massaman-curry":       ["dinner"],
+    "panang-curry":         ["dinner"],
+    "green-curry":          ["dinner"],
+    "thai-red-curry":            ["dinner"],
+    "thai-fish-curry":           ["dinner"],
+    "thai-pumpkin-curry":        ["dinner"],
+    "green-curry-noodle-soup":   ["dinner"],
+    "thai-pineapple-curry":      ["dinner"],
+    "tom-kha-gai":               ["dinner"],
+    "thai-sweet-potato-soup":    ["dinner"],
+    "thai-broccoli-soup":        ["dinner"],
+    "green-bean-stirfry":        ["lunch"],
+    "thai-basil-chicken":        ["dinner"],
+    "thai-basil-eggplant":       ["dinner"],
+    "thai-pineapple-fried-rice": ["lunch"],
+    "larb":                      ["lunch"],
+    "green-papaya-salad":        ["lunch"],
+    "thai-grilled-eggplant-salad": ["lunch"],
+    "thai-chicken-salad":        ["lunch"],
+    "chicken-satay":             ["dinner"],
+    "fresh-spring-rolls":        ["lunch"],
+    "thai-mango-sticky-rice":    ["dessert"],
+    # Japanese (new)
+    "edamame-onigiri":           ["lunch"],
+    "poached-chicken-sandwich":  ["lunch"],
+    "tonkotsu-ramen":            ["dinner"],
+    "yakisoba":                  ["lunch", "dinner"],
+    "tsukune-meatballs":         ["lunch"],
+    "okonomiyaki":               ["breakfast"],
+    "japanese-souffle-pancakes": ["breakfast"],
+    "korokke":                   ["lunch"],
+    "tamagoyaki":                ["breakfast"],
+    "japanese-milk-bread":       ["breakfast"],
+    "chili-crisp-mazemen":       ["dinner"],
+    "mochi-ice-cream":           ["dessert"],
+    "tamago-kake-gohan":         ["dinner"],
+    # French (new)
+    "ratatouille":               ["dinner"],
+    # Chinese (new)
+    "black-pepper-beef":         ["dinner"],
+    "cashew-chicken":            ["dinner"],
+    "black-pepper-chicken":      ["dinner"],
+    "black-pepper-tofu":         ["dinner"],
+    "teriyaki-poke-bowl":        ["lunch"],
+    "honey-soy-noodles":         ["lunch", "dinner"],
+    "honey-lemon-chicken":       ["lunch"],
+    "ginger-honey-salmon":       ["dinner"],
+    "orange-chicken":            ["dinner"],
+    "kung-pao-chicken":          ["dinner"],
+    "sweet-sour-chicken":        ["dinner"],
+    "honey-soy-tofu":            ["dinner"],
+    "sweet-sour-pork":           ["dinner"],
+    "hong-kong-egg-tarts":       ["dessert"],
+    # Vietnamese (new)
+    "lemongrass-beef-vermicelli": ["lunch"],
+    # Korean (new)
+    "gochujang-beef-kimchi":        ["lunch"],
+    "kimchi-scrambled-eggs":        ["breakfast"],
+    "korean-green-salad":           ["lunch"],
+    "kongnamul-guk":                ["dinner"],
+    "korean-mushroom-pancakes":     ["breakfast"],
+    "chicken-ginseng-soup":         ["dinner"],
+    "bulgogi-steamed-eggplant":     ["dinner"],
+    "korean-salmon-rice-bowl":      ["lunch", "dinner"],
+    "korean-braised-chicken":       ["dinner"],
+    "kimchi-tacos":                 ["breakfast"],
+    "spicy-cod-celery-salad":       ["dinner"],
+    "korean-curry-rice":            ["dinner"],
+    "bulgogi-chicken-multigrain":   ["lunch"],
+    "korean-hotteok":               ["dessert"],
+    # French (new)
+    "french-cucumber-salad":     ["lunch"],
+    "french-potato-bean-salad":  ["dinner"],
+    "quiche-lorraine":           ["lunch", "breakfast"],
+    "french-mac-and-cheese":     ["dinner"],
+    "eggplant-tomato-gratin":    ["dinner"],
+    "french-apple-cake":         ["dessert"],
+    "cherry-clafoutis":          ["dessert"],
+    "french-chocolate-mousse":   ["dessert"],
+    "french-chocolate-moelleux": ["dessert"],
+    "apple-tarte-tatin":         ["dessert"],
+    # Mexican (new)
+    "mexican-taquitos":          ["lunch"],
+    "mexican-empanadas":         ["lunch"],
+    "air-fryer-chicken-fajitas": ["dinner"],
+    "mexican-salad":             ["lunch"],
+    "mexican-molletes":          ["dinner"],
+    "taco-salad":                ["lunch"],
+    "pulled-pork-sandwich-mx":   ["dinner"],
+    "mexican-chicken-soup":      ["dinner"],
+    "mexican-bean-salad":        ["lunch"],
+    "pulled-pork-tacos":         ["dinner"],
+    "mexican-steak-sandwich":    ["dinner"],
 }
 
 _CUISINE_RECIPE_LIBRARY: dict[str, list[str]] = {
     "Italian": [
-        "Pasta con i Broccoli ] silky anchovy-garlic broccoli pasta; the same broccoli base also yields a Cream of Broccoli Soup (vellutata) and Crispy Toasted Breadcrumbs (pangrattato)",
-        "Spicy Italian Sausage and Tortellini Soup [ one-pot with fire-roasted tomatoes, kale, cheese tortellini, and a swirl of cream",
-        "Italian Couscous Salad ] roasted garlic couscous with salami, bocconcini, chickpeas, olives, cherry tomatoes, and red wine vinaigrette",
-        "Spicy Tuscan Chicken Pasta [ pan-seared chicken with sun-dried tomatoes, baby spinach, and a creamy Parmesan sauce over penne",
+        "Pasta con i Broccoli. Silky anchovy-garlic broccoli pasta; the same broccoli base also yields a Cream of Broccoli Soup (vellutata) and Crispy Toasted Breadcrumbs (pangrattato)",
+        "Spicy Italian Sausage and Tortellini Soup. One-pot with fire-roasted tomatoes, kale, cheese tortellini, and a swirl of cream",
+        "Italian Couscous Salad. Roasted garlic couscous with salami, bocconcini, chickpeas, olives, cherry tomatoes, and red wine vinaigrette",
+        "Spicy Tuscan Chicken Pasta. Pan-seared chicken with sun-dried tomatoes, baby spinach, and a creamy Parmesan sauce over penne",
+        "Italian Baked Chicken Meatballs. Tender herb-seasoned chicken meatballs baked until golden; serve with marinara over pasta, in a sub roll, or as a protein bowl",
     ],
     "Japanese": [
-        "Japanese Buddha Bowl ] mixed grains, baked tofu, roasted sweet potato, romaine, avocado, carrots, cucumber, corn, and wakame with a creamy sesame dressing; swap components for different bowl combos",
-        "Miso Maple Chili Crisp Chicken [ sticky miso-maple glazed chicken thighs with chili crisp; serves as a rice bowl, noodle bowl, or lemony kale salad",
-        "Chicken Katsu Don ] panko-crusted chicken cutlet over steamed rice with a dashi-soy egg sauce; same katsu works as a sando sandwich or a katsu salad",
-        "Teriyaki Salmon Udon [ soy-mirin glazed salmon over udon noodles with snap peas and edamame",
-        "Tuna Sushi ] sushi rice with tuna rolled into maki or served as a deconstructed tuna rice bowl with avocado, cucumber, and soy",
+        "Japanese Buddha Bowl. Mixed grains, baked tofu, roasted sweet potato, romaine, avocado, carrots, cucumber, corn, and wakame with a creamy sesame dressing; swap components for different bowl combos",
+        "Miso Maple Chili Crisp Chicken. Sticky miso-maple glazed chicken thighs with chili crisp; serves as a rice bowl, noodle bowl, or lemony kale salad",
+        "Chicken Katsu Don. Panko-crusted chicken cutlet over steamed rice with a dashi-soy egg sauce; same katsu works as a sando sandwich or a katsu salad",
+        "Teriyaki Salmon Udon. Soy-mirin glazed salmon over udon noodles with snap peas and edamame",
+        "Tuna Sushi. Sushi rice with tuna rolled into maki or served as a deconstructed tuna rice bowl with avocado, cucumber, and soy",
+        "Tonkotsu Ramen. Rich milky pork bone broth over ramen noodles with chashu pork, soft-boiled egg, bamboo shoots, and nori; also works as a spicy miso variation",
+        "Okonomiyaki. Japanese savory cabbage pancake with bacon or shrimp, topped with okonomiyaki sauce, Japanese mayo, and bonito flakes",
+        "Yakisoba. Stir-fried noodles with pork, cabbage, and carrots in a sweet-savory Worcestershire-based sauce; garnished with pickled ginger and aonori",
+        "Tsukune. Juicy Japanese chicken meatballs glazed with sticky tare sauce; served as skewers with dipping egg yolk or over rice as a bowl",
+        "Edamame Onigiri. Short-grain rice mixed with edamame, bonito flakes, and soy sauce shaped into portable rice balls; pairs with tamagoyaki or a cherry tomato side",
+    ],
+    "French": [
+        "Ratatouille. One-pot summer vegetable stew with eggplant, zucchini, peppers, and tomatoes; serves as a standalone dish, pasta sauce, or a base for baked eggs",
+        "Salade Niçoise. Classic French salad with tuna, hard-boiled eggs, green beans, olives, and potatoes in a Dijon vinaigrette; also works as a composed grain bowl",
+        "French Lentil Soup. Earthy green lentils with leeks, carrots, and herbes de Provence; serve as soup or a warm lentil salad over greens",
+        "Quiche Lorraine. Classic egg and bacon tart in a buttery shortcrust, serve warm for brunch or cold for a packed lunch",
+        "Provençal Eggplant Gratin. Sliced eggplant and tomatoes layered with herbes de Provence and baked until golden; serve as a main or a side",
+        "French Macaroni au Gratin. Béchamel-based mac and cheese with Gruyère, baked until bubbling and golden-topped",
+        "Apple Tarte Tatin. Caramelized upside-down apple tart in a buttery shortcrust or puff pastry, served warm with crème fraîche or vanilla ice cream",
     ],
     "Chinese": [
-        "Pork & Shrimp Wonton Soup [ hand-folded wontons with ground pork and shrimp in a clear ginger-sesame broth; same wontons served as a rice bowl with chili oil or in a spicy miso ramen",
-        "Dan Dan Noodles ] ground pork with Sichuan preserved mustard greens and fermented black beans in a sesame-chili sauce; served hot, chilled as a cold noodle salad, or over smashed cucumber",
-        "Honey Soy Chicken [ soy-ginger marinated wings (or breast) glazed with honey and sesame; served over rice, with wok-blistered green beans, or with garlic bok choy",
+        "Pork & Shrimp Wonton Soup. Hand-folded wontons with ground pork and shrimp in a clear ginger-sesame broth; same wontons served as a rice bowl with chili oil or in a spicy miso ramen",
+        "Dan Dan Noodles. Ground pork with Sichuan preserved mustard greens and fermented black beans in a sesame-chili sauce; served hot, chilled as a cold noodle salad, or over smashed cucumber",
+        "Honey Soy Chicken. Soy-ginger marinated wings (or breast) glazed with honey and sesame; served over rice, with wok-blistered green beans, or with garlic bok choy",
+        "Black Pepper Beef Stir Fry. Thin-sliced beef with bell peppers and onions in a bold black pepper sauce; served over steamed rice or fried rice",
+        "Kung Pao Chicken. Spicy Sichuan stir-fry with peanuts, dried chilies, and a tangy soy-vinegar sauce; serves over rice or noodles",
+        "Orange Chicken. Crispy chicken bites tossed in a bright, tangy orange sauce; great over rice or in meal-prep bowls",
+        "Honey Soy Garlic Noodles. Chicken and noodles in a sweet-savory honey soy sauce; serve hot as a dinner bowl or cold as a packed lunch",
+        "Sweet and Sour Chicken. Crispy chicken in a vibrant sweet-and-sour sauce with pineapple and bell peppers; serve over steamed rice",
+        "Hong Kong Egg Tarts. Flaky shortcrust pastry shells filled with a silky, lightly sweet egg custard; the classic dim sum dessert baked at home",
+    ],
+    "Vietnamese": [
+        "Crispy Pork Bánh Mì. Caramelized ground pork with pickled daikon, jalapeño, cucumber, and sriracha mayo on a toasted baguette",
+        "Pho Saigon. Long-simmered beef bone broth with rice noodles, herbs, and thin-sliced beef; the same broth works as a base for a spicy noodle soup",
+        "Lemongrass Beef Vermicelli Salad. Grilled lemongrass beef over cold rice vermicelli with herbs, pickled vegetables, and nuoc cham",
+        "Vietnamese Pork Noodle Bowl. Caramelized pork with vermicelli, fresh herbs, bean sprouts, and a bright fish sauce dressing",
+        "Vietnamese Matcha White Chocolate Cookies. Chewy matcha cookies with white chocolate chips; the earthy green tea bitterness balanced by sweet melty chocolate",
+        "Vietnamese Coffee Brownies. Rich fudgy brownies infused with sweetened condensed milk and strong Vietnamese coffee; dense, caramel-sweet, intensely caffeinated",
+    ],
+    "Korean": [
+        "Korean Beef Bulgogi Bowls. Marinated soy-sesame beef over steamed rice with pickled cucumber and sesame; same beef used in lettuce wraps or Korean tacos",
+        "Kimchi Fried Rice. Day-old rice stir-fried with kimchi, pork belly, and a fried egg on top; a perfect meal from pantry staples",
+        "Gochujang Beef & Kimchi Salad. Spicy marinated beef over a tangy kimchi-dressed salad with sesame and rice",
+        "Kimchi Scrambled Eggs. Fluffy egg whites and kimchi over brown rice with fresh fruit; high-protein Korean breakfast in 10 minutes",
+        "Korean Green Salad. Fresh greens, cucumber, and pear with bulgogi chicken and Korean dressing; a light protein-packed lunch",
+        "Kongnamul Guk (Soybean Sprout Soup). Shrimp in a light, garlicky soybean sprout broth; served with sautéed zucchini, brown rice, and pickled radish",
+        "Korean Mushroom Pancakes. Savory whole-wheat pancakes packed with mushrooms and scallions, served with a soy dipping sauce",
+        "Bulgogi with Korean Steamed Eggplant. Tender lean beef and silky steamed eggplant in a soy-sesame glaze, served in lettuce cups over brown rice",
+        "Korean Braised Chicken. Whole chicken thighs braised with potatoes, mushrooms, carrot, and onion in a gochujang-soy sauce; finished with whole wheat noodles",
+        "Korean Curry Rice. Shrimp or fish with chickpeas, peppers, mushrooms, and green apple in a golden Korean curry, over brown rice",
+        "Bulgogi Chicken with Multigrain Rice. Sesame-soy marinated chicken over multigrain rice with steamed spinach; a clean, balanced meal-prep lunch",
+        "Hotteok (Korean Sweet Pancakes). Chewy yeasted pancakes filled with brown sugar, cinnamon, and chopped peanuts; a beloved Korean street snack served hot",
+    ],
+    "Thai": [
+        "Thai Chicken Meal Prep Bowls. Sesame-sriracha baked chicken over jasmine rice with shredded cabbage, carrots, and a creamy peanut sauce; great cold or reheated",
+        "Khao Soi (Thai Coconut Noodle Soup). Northern Thai coconut curry broth with egg noodles and chicken; served with pickled mustard greens, crispy noodles, and Thai basil",
+        "Pad Thai. Stir-fried rice noodles with chicken, egg, and bean sprouts in a tangy fish sauce and brown sugar sauce; garnished with crushed peanuts and lime",
+        "Drunken Noodles (Pad Kee Mao). Wide rice noodles with chicken, Thai chilies, and a heap of fresh basil in a savory oyster sauce; a classic Bangkok street dish",
+        "Pad See Ew. Smoky caramelized wide rice noodles with Chinese broccoli and egg in a dark soy sauce; rich, deeply flavored, ready in 25 minutes",
+        "Thai Noodle Salad with Peanut Sauce. Cold rice noodles with shredded cabbage, carrots, and a bright citrus peanut dressing; a no-cook meal prep lunch",
+        "Massaman Curry. Mellow, warmly spiced Thai curry with chicken and potatoes in a coconut milk sauce with tamarind and peanut butter; serve over jasmine rice",
+        "Panang Curry. Creamy, nutty Panang curry with chicken and bell peppers in a thick coconut sauce; richer than red curry with kaffir lime leaf aroma",
+        "Thai Green Curry. Vibrant coconubackdrop-filter: blur(20px)t curry with eggplant, bell pepper, and tofu or chicken; fragrant with green curry paste and fresh Thai basil",
+        "Thai Red Curry Chicken. Bold red curry with lemongrass, chicken, and vegetables in a creamy coconut broth; fast weeknight dinner that tastes better as leftovers",
+        "Thai Coconut Mango Sticky Rice. Sweet glutinous rice cooked in coconut milk, topped with ripe mango slices and a drizzle of salted coconut cream; the iconic Thai dessert",
+    ],
+    "Mediterranean": [
+        "Mediterranean Tuna Salad with Egg. Protein-packed tuna and hard-boiled egg salad with capers, red onion, and lemon-olive oil dressing; serve as a salad plate, stuffed in pita, or in tomatoes",
+        "Chicken and Sweet Potato Bowls. Spiced roasted chicken and caramelized sweet potato over quinoa with hummus and cucumber; also works as lettuce wraps or a harvest salad",
+        "Mediterranean Quinoa Salad. Fluffy quinoa with chickpeas, cucumber, cherry tomatoes, Kalamata olives, and feta in a lemon-oregano vinaigrette; stuffs into bell peppers or jars for meal prep",
+        "Chickpea Salad Sandwich. Smashed chickpeas with celery, dill, and a creamy yogurt-tahini dressing in crusty bread; also great in pita or as an open-face toast",
+        "Greek Black-Eyed Pea Stew (Mavromatika). Traditional simmered black-eyed peas with tomatoes, cumin, and olive oil; serve as a hearty soup, over farro, or mashed as a dip",
+        "Mediterranean Chicken Salad. Poached or rotisserie chicken with cucumber, Kalamata olives, cherry tomatoes, and feta in a lemon dressing; serve over greens, in pita, or over couscous",
+        "Pan Bagnat. Provençal pressed sandwich with tuna, hard-boiled egg, olives, tomato, and anchovies on crusty bread; also works as an open-face tartine or salad",
+        "Stuffed Sweet Potatoes with Chickpeas and Avocado Crema. Roasted sweet potatoes topped with spiced chickpeas and a creamy avocado-yogurt sauce; serve as a grain bowl or alongside greens",
+        "Salmon Rice Bowls. Seared salmon over rice with cucumber, avocado, and a lemon-herb dressing; also works as salmon tacos or a deconstructed sushi bowl",
+        "Greek Sheet Pan Chicken. Herb-marinated chicken thighs roasted with lemon, garlic, olives, and potatoes; serve as a dinner plate or slice chicken for a grain bowl lunch",
+        "Chicken Shawarma. Marinated and roasted chicken with warm spices, stuffed into pita with garlic sauce, tomatoes, and pickled vegetables; also works as a shawarma bowl or salad",
+        "Baked Salmon with Vegetables. Sheet pan salmon fillets roasted alongside Mediterranean vegetables in olive oil and herbs; serve with grain or greens",
+        "Mediterranean Beef Bowl. Spiced ground beef over rice or greens with hummus, cucumber, tomato, and tzatziki; fast and protein-packed",
+    ],
+    "Dessert": [
+        "Raspberry Ricotta Cake. A moist Italian-style cake with ricotta and fresh raspberries; serves as dessert, a sweet snack, or breakfast treat",
+        "Tiramisu Cake. Espresso-soaked layers with mascarpone cream; the Italian classic in cake form, perfect for entertaining or make-ahead dessert",
+        "Roasted Strawberries. Oven-roasted strawberries in balsamic and sugar; serve over ice cream, yogurt, or toast",
+        "Lemon Poppy Seed Loaf. Bright, tender loaf with citrus glaze; great as dessert, brunch, or afternoon snack",
     ],
     "Mexican": [
-        "Chicken Burrito Bowl ] cumin-spiced baked chicken over cilantro rice with avocado, cherry tomatoes, black olives, cheddar, and salsa; same base wraps into a burrito or lettuce wrap",
-        "Ground Turkey [ seasoned with taco spices and cooked with onion, bell peppers, carrots, mushrooms, and jalapeño; serves as taco filling, stuffed bell peppers, or a hearty taco soup",
-        "Guacamole Stuffed Mini Peppers ] simple lime guacamole stuffed into mini pepper halves; the same guac base makes nachos or a snack plate with carrots and peppers",
-        "Beef Fajitas [ taco-seasoned stir-fry beef with sautéed bell peppers and red onion; serves as a fajita bowl, tacos, or a fajita salad",
-        "Beef Barbacoa ] chipotle and cumin braised chuck roast shredded and served over quinoa; works as a barbacoa bowl or a barbacoa salad",
+        "Chicken Burrito Bowl. Cumin-spiced baked chicken over cilantro rice with avocado, cherry tomatoes, black olives, cheddar, and salsa; same base wraps into a burrito or lettuce wrap",
+        "Ground Turkey. Seasoned with taco spices and cooked with onion, bell peppers, carrots, mushrooms, and jalapeño; serves as taco filling, stuffed bell peppers, or a hearty taco soup",
+        "Guacamole Stuffed Mini Peppers. Simple lime guacamole stuffed into mini pepper halves; the same guac base makes nachos or a snack plate with carrots and peppers",
+        "Beef Fajitas. Taco-seasoned stir-fry beef with sautéed bell peppers and red onion; serves as a fajita bowl, tacos, or a fajita salad",
+        "Beef Barbacoa. Chipotle and cumin braised chuck roast shredded and served over quinoa; works as a barbacoa bowl or a barbacoa salad",
+        "Taquitos, Burritos & Quesadillas. One filling (spiced chicken, beans, cheese) shaped three ways, rolled and crisped taquitos, stuffed burritos, or flat quesadillas",
+        "Pulled Pork Tacos & Sandwiches. Slow-cooked chipotle pulled pork piled into warm tortillas with pickled onion and slaw, or stuffed into a crusty roll",
+        "Mexican Chicken Soup. Hearty chicken and black bean soup with corn, tomatoes, and chipotle; garnished with avocado, sour cream, and tortilla strips",
     ],
 }
 
@@ -293,7 +861,21 @@ _RECIPE_CUISINE: dict[str, str] = {
     "greek-egg-bites":         "Mediterranean",
     "shakshuka":               "Mediterranean",
     "turkish-eggs":            "Mediterranean",
-    "ground-turkey-pita":        "Mediterranean",
+    "ground-turkey-pita":                  "Mediterranean",
+    "mediterranean-tuna-salad":            "Mediterranean",
+    "chicken-sweet-potato-bowls":          "Mediterranean",
+    "mediterranean-quinoa-salad":          "Mediterranean",
+    "chickpea-salad-sandwich":             "Mediterranean",
+    "greek-black-eyed-pea-stew":           "Mediterranean",
+    "mediterranean-chicken-salad":         "Mediterranean",
+    "pan-bagnat":                          "Mediterranean",
+    "stuffed-sweet-potatoes-chickpeas":    "Mediterranean",
+    "salmon-rice-bowls":                   "Mediterranean",
+    "greek-sheet-pan-chicken":             "Mediterranean",
+    "chicken-shawarma":                    "Mediterranean",
+    "italian-chicken-meatballs":           "Italian",
+    "baked-salmon-vegetables":             "Mediterranean",
+    "mediterranean-beef-bowl":             "Mediterranean",
     "chicken-tandoori-bowls":   "Indian",
     "vegan-indian-curry":        "Indian",
     "paneer-tikka-bowl":         "Indian",
@@ -302,6 +884,13 @@ _RECIPE_CUISINE: dict[str, str] = {
     "coconut-lentil-curry":      "Indian",
     "indian-veggie-rice-bowl":   "Indian",
     "indian-savory-toast":       "Indian",
+    "chana-masala":              "Indian",
+    "aloo-gobi":                 "Indian",
+    "palak-paneer":              "Indian",
+    "dal-tadka":                 "Indian",
+    "bhindi-do-pyaza":           "Indian",
+    "butter-chicken":            "Indian",
+    "tofu-tikka-masala":         "Indian",
     "spanish-breakfast-hash":    "Spanish",
     "spanish-scrambled-eggs":    "Spanish",
     "spanish-tortilla":          "Spanish",
@@ -310,6 +899,42 @@ _RECIPE_CUISINE: dict[str, str] = {
     "gambas-al-ajillo":          "Spanish",
     "spanish-garlic-soup":       "Spanish",
     "spanish-beef-rice":         "Spanish",
+    "ceviche":                   "Spanish",
+    "peruvian-chicken":          "Spanish",
+    "brazilian-black-bean-stew": "Spanish",
+    "venezuelan-chili":          "Spanish",
+    "dominican-chicken-rice":    "Spanish",
+    "peruvian-steak":            "Spanish",
+    "spanish-torrijas":          "Spanish",
+    "round-steak-italiano":      "Italian",
+    "eggplant-parmesan":         "Italian",
+    "tuscan-ravioli":            "Italian",
+    "bruschetta-chicken-wraps":  "Italian",
+    "sheet-pan-chicken-parm":    "Italian",
+    "squash-pasta-toss":         "Italian",
+    "panzanella-burrata":        "Italian",
+    "italian-lentil-salad":      "Italian",
+    "corn-zucchini-salad":       "Italian",
+    "italian-meatball-soup":     "Italian",
+    "roasted-garlic-soup":       "Italian",
+    "pumpkin-spice-soup":        "Italian",
+    "italian-lentil-soup":       "Italian",
+    "herb-pork-tenderloin":      "Italian",
+    "italian-pork-chops":        "Italian",
+    "wine-braised-sausage":      "Italian",
+    "raspberry-ricotta-cake":    "Dessert",
+    "apple-cinnamon-flatbread":  "Dessert",
+    "peach-crostata":            "Dessert",
+    "pumpkin-spice-muffins":     "American",
+    "tiramisu-cake":             "Dessert",
+    "banana-nut-muffins":        "American",
+    "roasted-strawberries":      "Dessert",
+    "lemon-poppy-seed-loaf":     "Dessert",
+    "fruit-pizza-cookies":       "American",
+    "oatmeal-choc-chip-cookies": "American",
+    "vegan-banana-brownies":     "American",
+    "date-peanut-butter-cups":   "American",
+    "raspberry-choc-muffins":    "American",
     "chipotle-rice-bowl":        "Mexican",
     "mexican-chorizo-casserole": "Mexican",
     "mexican-street-corn":       "Mexican",
@@ -322,6 +947,133 @@ _RECIPE_CUISINE: dict[str, str] = {
     "tom-rim-shrimp":                 "Vietnamese",
     "canh-chua-ca":                   "Vietnamese",
     "grilled-pork-rice-paper-rolls":  "Vietnamese",
+    "vietnamese-matcha-cookies":      "Vietnamese",
+    "vietnamese-coffee-brownies":     "Vietnamese",
+    "thai-chicken-bowls":   "Thai",
+    "khao-soi":             "Thai",
+    "pad-thai":             "Thai",
+    "drunken-noodles":      "Thai",
+    "pad-see-ew":           "Thai",
+    "thai-noodle-salad":    "Thai",
+    "massaman-curry":       "Thai",
+    "panang-curry":         "Thai",
+    "green-curry":          "Thai",
+    "thai-red-curry":            "Thai",
+    "thai-fish-curry":           "Thai",
+    "thai-pumpkin-curry":        "Thai",
+    "green-curry-noodle-soup":   "Thai",
+    "thai-pineapple-curry":      "Thai",
+    "tom-kha-gai":               "Thai",
+    "thai-sweet-potato-soup":    "Thai",
+    "thai-broccoli-soup":        "Thai",
+    "green-bean-stirfry":        "Thai",
+    "thai-basil-chicken":        "Thai",
+    "thai-basil-eggplant":       "Thai",
+    "thai-pineapple-fried-rice": "Thai",
+    "larb":                      "Thai",
+    "green-papaya-salad":        "Thai",
+    "thai-grilled-eggplant-salad": "Thai",
+    "thai-chicken-salad":        "Thai",
+    "chicken-satay":             "Thai",
+    "fresh-spring-rolls":        "Thai",
+    "thai-mango-sticky-rice":    "Thai",
+    # Japanese (new)
+    "edamame-onigiri":           "Japanese",
+    "poached-chicken-sandwich":  "Japanese",
+    "tonkotsu-ramen":            "Japanese",
+    "yakisoba":                  "Japanese",
+    "tsukune-meatballs":         "Japanese",
+    "okonomiyaki":               "Japanese",
+    "japanese-souffle-pancakes": "Japanese",
+    "korokke":                   "Japanese",
+    "tamagoyaki":                "Japanese",
+    "japanese-milk-bread":       "Japanese",
+    "chili-crisp-mazemen":       "Japanese",
+    "mochi-ice-cream":           "Japanese",
+    "tamago-kake-gohan":         "Japanese",
+    # French (new)
+    "ratatouille":               "French",
+    # Chinese (new)
+    "black-pepper-beef":         "Chinese",
+    "cashew-chicken":            "Chinese",
+    "black-pepper-chicken":      "Chinese",
+    "black-pepper-tofu":         "Chinese",
+    "teriyaki-poke-bowl":        "Chinese",
+    "honey-soy-noodles":         "Chinese",
+    "honey-lemon-chicken":       "Chinese",
+    "ginger-honey-salmon":       "Chinese",
+    "orange-chicken":            "Chinese",
+    "kung-pao-chicken":          "Chinese",
+    "sweet-sour-chicken":        "Chinese",
+    "honey-soy-tofu":            "Chinese",
+    "sweet-sour-pork":           "Chinese",
+    "hong-kong-egg-tarts":       "Chinese",
+    # Vietnamese (new)
+    "lemongrass-beef-vermicelli": "Vietnamese",
+    # Korean (new)
+    "gochujang-beef-kimchi":        "Korean",
+    "kimchi-scrambled-eggs":        "Korean",
+    "korean-green-salad":           "Korean",
+    "kongnamul-guk":                "Korean",
+    "korean-mushroom-pancakes":     "Korean",
+    "chicken-ginseng-soup":         "Korean",
+    "bulgogi-steamed-eggplant":     "Korean",
+    "korean-salmon-rice-bowl":      "Korean",
+    "korean-braised-chicken":       "Korean",
+    "kimchi-tacos":                 "Korean",
+    "spicy-cod-celery-salad":       "Korean",
+    "korean-curry-rice":            "Korean",
+    "bulgogi-chicken-multigrain":   "Korean",
+    "korean-hotteok":               "Korean",
+    # French (new)
+    "french-cucumber-salad":     "French",
+    "french-potato-bean-salad":  "French",
+    "quiche-lorraine":           "French",
+    "french-mac-and-cheese":     "French",
+    "eggplant-tomato-gratin":    "French",
+    "french-apple-cake":         "French",
+    "cherry-clafoutis":          "French",
+    "french-chocolate-mousse":   "French",
+    "french-chocolate-moelleux": "French",
+    "apple-tarte-tatin":         "French",
+    # Mexican (new)
+    "mexican-taquitos":          "Mexican",
+    "mexican-empanadas":         "Mexican",
+    "air-fryer-chicken-fajitas": "Mexican",
+    "mexican-salad":             "Mexican",
+    "mexican-molletes":          "Mexican",
+    "taco-salad":                "Mexican",
+    "pulled-pork-sandwich-mx":   "Mexican",
+    "mexican-chicken-soup":      "Mexican",
+    "mexican-bean-salad":        "Mexican",
+    "pulled-pork-tacos":         "Mexican",
+    "mexican-steak-sandwich":    "Mexican",
+}
+
+# Maps dessert recipe IDs to their actual cuisine (for filtering on the suggest page)
+_DESSERT_CUISINE: dict[str, str] = {
+    "raspberry-ricotta-cake":    "Italian",
+    "apple-cinnamon-flatbread":  "Italian",
+    "peach-crostata":            "Italian",
+    "tiramisu-cake":             "Italian",
+    "roasted-strawberries":      "Italian",
+    "lemon-poppy-seed-loaf":     "American",
+    "mochi-ice-cream":           "Japanese",
+    "french-apple-cake":         "French",
+    "cherry-clafoutis":          "French",
+    "french-chocolate-mousse":   "French",
+    "french-chocolate-moelleux": "French",
+    "fruit-pizza-cookies":       "American",
+    "oatmeal-choc-chip-cookies": "American",
+    "vegan-banana-brownies":     "American",
+    "date-peanut-butter-cups":   "American",
+    "apple-tarte-tatin":         "French",
+    "korean-hotteok":            "Korean",
+    "thai-mango-sticky-rice":    "Thai",
+    "spanish-torrijas":          "Spanish",
+    "vietnamese-matcha-cookies": "Vietnamese",
+    "vietnamese-coffee-brownies": "Vietnamese",
+    "hong-kong-egg-tarts":       "Chinese",
 }
 
 # ── Recipe database (Good Mood Food newsletter + curated Italian) ─────────────
@@ -332,7 +1084,9 @@ RECIPE_DB = [
         "_id": "miso-maple-chicken",
         "_keywords": ["chicken", "miso"],
         "image": "/static/images/miso-maple-chicken.jpg",
-        "intro": "One sticky, savory marinade does all the work [ cook the chicken and vegetables together, then eat from it three different ways across the week.",
+        "servings": 4,
+        "calories_per_serving": 368,
+        "intro": "One sticky, savory marinade does all the work. Cook the chicken and vegetables together, then eat from it three different ways across the week.",
         "base": {
             "title": "Miso Maple Chili Crisp Chicken",
             "ingredients": [
@@ -397,7 +1151,7 @@ RECIPE_DB = [
                     "Whisk together lemon juice, rice vinegar, Dijon, olive oil, salt, and pepper.",
                     "Toss salad with dressing. Top with cilantro and furikake if you have it.",
                 ],
-                "tip": "Kale holds up well in the fridge ] this is a great pack-ahead lunch.",
+                "tip": "Kale holds up well in the fridge. This is a great pack-ahead lunch.",
             },
             {
                 "name": "Garlic and Ginger Chicken Soup",
@@ -424,8 +1178,10 @@ RECIPE_DB = [
     {
         "_id": "harissa-salmon",
         "_keywords": ["harissa", "salmon"],
-        "image": "/static/images/Baked-Harissa-Salmon.jpg",
-        "intro": "Light, fresh, and bold [ salmon coated in a simple harissa sauce and served over lemony quinoa with wilted kale and golden raisins. A 35-minute meal prep that works as three different plates across the week.",
+        "image": "/static/images/harrisa-salmon.jpg",
+        "servings": 6,
+        "calories_per_serving": 223,
+        "intro": "Light, fresh, and bold. Salmon coated in a simple harissa sauce and served over lemony quinoa with wilted kale and golden raisins. A 35-minute meal prep that works as three different plates across the week.",
         "base": {
             "title": "Baked Harissa Salmon with Lemon Quinoa",
             "ingredients": [
@@ -453,7 +1209,7 @@ RECIPE_DB = [
             {
                 "name": "Lemon Quinoa Bowl",
                 "subtitle": "harissa salmon over lemon kale quinoa with golden raisins",
-                "image": "/static/images/Baked-Harissa-Salmon.jpg",
+                "image": "/static/images/harrisa-salmon.jpg",
                 "extras": [],
                 "steps": [
                     "Spoon lemon kale quinoa into a bowl.",
@@ -502,7 +1258,9 @@ RECIPE_DB = [
         "_id": "turmeric-salmon",
         "_keywords": ["turmeric", "salmon"],
         "image": "/static/images/Crispy-Turmeric-Salmon-With-Yogurt-Sauce.jpg",
-        "intro": "Pan-seared with a golden turmeric crust and served with a cool herbed yogurt ] this salmon pairs beautifully with bold roasted vegetables.",
+        "servings": 4,
+        "calories_per_serving": 303,
+        "intro": "Pan-seared with a golden turmeric crust and served with a cool herbed yogurt. This salmon pairs beautifully with bold roasted vegetables.",
         "base": {
             "title": "Crispy Turmeric Salmon with Parsley Yogurt Sauce",
             "ingredients": [
@@ -536,7 +1294,7 @@ RECIPE_DB = [
                     "Roast at 400 F for 25-30 minutes, stirring halfway, until golden and crispy.",
                     "Pile potatoes into a bowl, lay salmon on top, and spoon parsley yogurt sauce generously over everything.",
                 ],
-                "tip": "Reheat potatoes in the oven or a hot pan [ microwave makes them soft.",
+                "tip": "Reheat potatoes in the oven or a hot pan. Microwave makes them soft.",
             },
             {
                 "name": "Spiced Cauliflower Plate",
@@ -576,16 +1334,25 @@ RECIPE_DB = [
     },
     {
         "_id": "pistachio-pesto-salmon",
-        "_keywords": ["pistachio", "salmon"],
+        "_keywords": ["pistachio", "salmon", "pesto", "basil", "baked"],
         "image": "/static/images/Baked-Salmon-With-Pistachio-Pesto.jpg",
-        "intro": "A bright, nutty pistachio pesto takes minutes to blend and turns a simple baked salmon into something that feels special ] mix with different sides all week.",
+        "servings": 4,
+        "calories_per_serving": 420,
+        "prep_tasks": ["Pesto", "Salmon"],
+        "intro": "A bright, nutty pistachio pesto takes minutes to blend and turns a simple baked salmon into something that feels special. Mix with different sides all week.",
         "base": {
             "title": "Baked Salmon with Pistachio Pesto",
             "ingredients": [
-                "4 salmon fillets (4-6 oz each)",
+                "4 fresh salmon fillets (4–6 oz each)",
                 "1 tbsp extra virgin olive oil",
                 "Salt and pepper",
-                "For pistachio pesto: 2 cups fresh basil, 2 cloves garlic, 1/4 cup shelled pistachios, 1/3 cup nutritional yeast (or Parmesan), 1/3 cup extra virgin olive oil, salt and pepper",
+                "[ Pistachio Pesto ]",
+                "2 cups fresh basil",
+                "2 cloves garlic",
+                "1/4 cup shelled pistachios",
+                "1/3 cup nutritional yeast",
+                "1/3 cup extra virgin olive oil",
+                "Salt and pepper",
             ],
             "steps": [
                 "Preheat oven to 400 F. Line a baking sheet with parchment.",
@@ -628,7 +1395,7 @@ RECIPE_DB = [
                     "Roast at 400 F for 20 minutes until fork-tender and cheese is golden.",
                     "Plate zucchini and lay salmon alongside. Spoon extra pistachio pesto over everything and scatter fresh basil on top.",
                 ],
-                "tip": "Pesto keeps in the fridge for a week [ spoon it on toast, pasta, or grain bowls all week.",
+                "tip": "Pesto keeps in the fridge for a week. Spoon it on toast, pasta, or grain bowls all week.",
             },
             {
                 "name": "Farro & Green Bean Bowl",
@@ -655,7 +1422,9 @@ RECIPE_DB = [
         "_id": "lemon-salmon",
         "_keywords": ["salmon"],
         "image": "/static/images/salmon-three-ways.jpg",
-        "intro": "Simple lemon-baked salmon that splits into three completely different meals ] a vibrant Mediterranean bowl, spicy hand rolls, and fresh fish tacos.",
+        "servings": 4,
+        "calories_per_serving": 301,
+        "intro": "Simple lemon-baked salmon that splits into three completely different meals. A vibrant Mediterranean bowl, spicy hand rolls, and fresh fish tacos.",
         "base": {
             "title": "Lemon Garlic Salmon",
             "ingredients": [
@@ -717,7 +1486,7 @@ RECIPE_DB = [
                     "Top with a spoonful of spicy salmon, sesame seeds, avocado slices, cucumber, and microgreens.",
                     "Roll from the bottom-left corner diagonally up. Wet a fingertip to seal the edge.",
                 ],
-                "tip": "Assemble these just before eating [ nori gets soggy fast.",
+                "tip": "Assemble these just before eating. Nori gets soggy fast.",
             },
             {
                 "name": "Salmon Tacos with Mango Avocado Salsa",
@@ -745,7 +1514,9 @@ RECIPE_DB = [
         "_id": "herby-parmesan-meatballs",
         "_keywords": ["meatball"],
         "image": "/static/images/pearl-halloumi-bowl.jpg",
-        "intro": "A big batch of herby, Parmesan-loaded meatballs ] bake them once and use them three completely different ways through the week.",
+        "servings": 6,
+        "calories_per_serving": 225,
+        "intro": "A big batch of herby, Parmesan-loaded meatballs. Bake them once and use them three completely different ways through the week.",
         "base": {
             "title": "Herby Parmesan Meatballs",
             "ingredients": [
@@ -763,7 +1534,7 @@ RECIPE_DB = [
             ],
             "steps": [
                 "Preheat oven to 400 F. Line a baking sheet with parchment.",
-                "Combine all ingredients in a large bowl, mixing gently [ do not overwork the meat.",
+                "Combine all ingredients in a large bowl, mixing gently. Do not overwork the meat.",
                 "Use a cookie scoop to portion, then roll into balls and arrange on the baking sheet.",
                 "Bake 15-20 minutes until the internal temperature reaches 165 F. Makes about 36 meatballs.",
             ],
@@ -827,28 +1598,21 @@ RECIPE_DB = [
         "_id": "berry-parfait",
         "_keywords": ["parfait", "yogurt", "granola", "berries", "breakfast"],
         "image": "/static/images/parfait.jpg",
-        "intro": "Homemade cinnamon granola layered with yogurt and fresh berries in a jar ] prep four on Sunday, keep the granola on the side, and add it right before eating so it stays crunchy all week.",
+        "servings": 4,
+        "calories_per_serving": 190,
+        "intro": "Yogurt layered with fresh berries in a jar. Prep four on Sunday and grab one each morning — add store-bought granola right before eating so it stays crunchy.",
         "base": {
             "title": "Greek Yogurt Parfait",
             "ingredients": [
-                "[ Granola ]",
-                "1 cup old fashioned oats",
-                "1 tsp cinnamon",
-                "1/4 tsp salt",
-                "3 tbsp butter",
-                "3 tbsp brown sugar",
-                "1/2 cup coconut flakes (optional)",
-                "[ Assembly ]",
-                "3–4 single-serve yogurt containers (plain, vanilla, or Greek)",
+                "4 single-serve plain or Greek yogurt (5–6 oz each)",
                 "3 cups fresh berries of choice",
+                "Store-bought granola, to serve",
                 "Honey, for drizzling (optional)",
             ],
             "steps": [
-                "Preheat oven to 325°F.",
-                "Melt butter and stir in brown sugar. In a bowl, combine oats, cinnamon, salt, and coconut flakes. Pour butter mixture over oats and stir well.",
-                "Spread on a baking sheet and bake 20–25 minutes, stirring halfway, until golden brown. Cool completely on the pan.",
-                "Layer yogurt and berries into jars or containers. Seal and refrigerate up to 4 days.",
-                "Store granola in a separate airtight container at room temperature [ add it right before eating to keep it crunchy.",
+                "Layer yogurt and berries into 4 jars or containers.",
+                "Seal and refrigerate up to 4 days.",
+                "Add granola and a drizzle of honey right before eating.",
             ],
         },
         "uses": [
@@ -866,7 +1630,7 @@ RECIPE_DB = [
                     "Layer yogurt, then a mix of all three berries, then another layer of yogurt in a jar.",
                     "Top with granola and a drizzle of honey just before eating.",
                 ],
-                "tip": "Add granola at the last minute ] it softens within an hour if layered in advance.",
+                "tip": "Add granola at the last minute. It softens within an hour if layered in advance.",
             },
             {
                 "name": "Strawberry",
@@ -896,7 +1660,7 @@ RECIPE_DB = [
                     "Layer yogurt and berries into a jar, alternating layers.",
                     "Top with granola (and toasted coconut flakes if you made them) just before eating.",
                 ],
-                "tip": "Coconut yogurt pairs especially well with dark berries [ it adds a creamy, tropical contrast.",
+                "tip": "Coconut yogurt pairs especially well with dark berries. It adds a creamy, tropical contrast.",
             },
         ],
     },
@@ -904,7 +1668,9 @@ RECIPE_DB = [
         "_id": "overnight-oats",
         "_keywords": ["oats"],
         "image": "/static/images/overnight-oats.jpg",
-        "intro": "Five minutes of prep the night before means breakfast is already waiting ] make a batch on Sunday and vary the toppings all week.",
+        "servings": 1,
+        "calories_per_serving": 310,
+        "intro": "Five minutes of prep the night before means breakfast is already waiting. Make a batch on Sunday and vary the toppings all week.",
         "base": {
             "title": "Overnight Oats",
             "ingredients": [
@@ -975,30 +1741,40 @@ RECIPE_DB = [
     },
     {
         "_id": "kale-salad-base",
-        "_keywords": ["kale"],
+        "_keywords": ["kale", "salad", "chickpea", "carrot", "ginger", "avocado", "grain bowl", "vegan"],
         "image": "/static/images/kale-salad.jpg",
-        "intro": "Massaged kale stays fresh and hearty all week [ one big batch of greens and carrot ginger dressing turns into a wrap, a grain bowl, and a warm pasta.",
+        "servings": 4,
+        "calories_per_serving": 390,
+        "prep_tasks": ["Dressing", "Salad"],
+        "intro": "Massaged kale stays fresh and hearty all week. One big batch of greens and carrot ginger dressing turns into a wrap, a grain bowl, and a warm pasta.",
         "base": {
             "title": "Massaged Kale with Carrot Ginger Dressing",
             "ingredients": [
-                "1 large bunch curly kale, stems removed, torn into pieces",
+                "1 bunch curly kale, stems removed, leaves torn",
                 "1 tsp fresh lemon juice",
-                "1/2 tsp olive oil",
-                "1 can chickpeas, drained and roasted at 400 F for 20-25 min",
+                "1/2 tsp extra-virgin olive oil",
+                "1 can roasted chickpeas (see notes)",
                 "1 small carrot, grated",
-                "1 small red beet, grated (optional)",
-                "For dressing: 3/4 cup chopped carrots",
-                "1/3 cup water",
-                "1/4 cup olive oil",
+                "1 small red beet, grated",
+                "1/2 watermelon radish, very thinly sliced",
+                "1 avocado, cubed",
+                "2 tbsp dried cranberries",
+                "1/4 cup pepitas, toasted",
+                "1 tsp sesame seeds",
+                "Sea salt and freshly ground black pepper",
+                "[ Carrot Ginger Dressing ]",
+                "3/4 cup chopped carrots",
+                "1/3–1/2 cup water",
+                "1/4 cup extra-virgin olive oil",
                 "2 tbsp rice vinegar",
                 "2 tsp minced fresh ginger",
                 "1/4 tsp sea salt",
             ],
             "steps": [
-                "Make the dressing: roast carrot chunks at 400 F for 20-25 minutes until tender. Blend with water, olive oil, rice vinegar, ginger, and salt until smooth. Refrigerate.",
-                "Place kale in a large bowl. Drizzle with lemon juice and olive oil and massage firmly for 2-3 minutes until the leaves soften and turn dark green.",
-                "Toss in the grated carrot and beet if using. Store undressed in the fridge ] it holds up to 4 days.",
-                "Roast chickpeas on a separate sheet at 400 F for 20-25 minutes until crispy. Season with salt and pepper.",
+                "Dressing: roast carrot chunks at 400°F for 20–25 minutes until tender. Blend with water, olive oil, rice vinegar, ginger, and salt until very smooth. Refrigerate.",
+                "Kale: place torn kale in a large bowl. Drizzle with lemon juice and olive oil and massage firmly for 2–3 minutes until leaves soften and turn dark green.",
+                "Toss grated carrot and beet into the kale. Store undressed — it holds up to 4 days in the fridge.",
+                "Chickpeas: drain and dry a can of chickpeas. Toss with olive oil, salt, and pepper. Roast at 400°F for 20–25 minutes until crispy.",
             ],
         },
         "uses": [
@@ -1036,7 +1812,7 @@ RECIPE_DB = [
                     "Add roasted chickpeas. Drizzle carrot ginger dressing over everything.",
                     "Fold and roll tightly. Slice in half and serve.",
                 ],
-                "tip": "Pack the dressing on the side if making these ahead [ it keeps the wrap from getting soggy.",
+                "tip": "Pack the dressing on the side if making these ahead. It keeps the wrap from getting soggy.",
             },
             {
                 "name": "Kale and Chickpea Pasta",
@@ -1064,7 +1840,9 @@ RECIPE_DB = [
         "_id": "walder-shrimp",
         "_keywords": ["shrimp"],
         "image": "/static/images/Garlic-Shrimp.jpg",
-        "intro": "A 15-minute shrimp base that pairs with three completely different vegetable sides ] fast enough for any weeknight, varied enough for the whole week.",
+        "servings": 4,
+        "calories_per_serving": 190,
+        "intro": "A 15-minute shrimp base that pairs with three completely different vegetable sides. Fast enough for any weeknight, varied enough for the whole week.",
         "base": {
             "title": "Garlic Shrimp with Smoked Paprika & Honey",
             "ingredients": [
@@ -1077,7 +1855,7 @@ RECIPE_DB = [
             ],
             "steps": [
                 "Pat shrimp dry with paper towels and toss with 1 tbsp olive oil, salt, and pepper.",
-                "Heat a pan over medium-high until very hot [ a drop of water should sizzle immediately.",
+                "Heat a pan over medium-high until very hot. A drop of water should sizzle immediately.",
                 "Cook shrimp in a single layer 1-2 minutes per side until opaque and slightly browned. Work in batches if needed. Remove and set aside.",
                 "In the same pan, add remaining olive oil and garlic. Saute 1 minute until fragrant and golden.",
                 "Stir in smoked paprika and honey. Return shrimp and toss to coat. Remove from heat.",
@@ -1144,7 +1922,9 @@ RECIPE_DB = [
         "_id": "walder-tofu",
         "_keywords": ["tofu"],
         "image": "/static/images/Baked-Tofu-Maple-Miso.jpg",
-        "intro": "Crispy miso-maple tofu is the weeknight protein that makes vegetables the main event ] three bold pairings, all built around the same golden base.",
+        "servings": 4,
+        "calories_per_serving": 157,
+        "intro": "Crispy miso-maple tofu is the weeknight protein that makes vegetables the main event. Three bold pairings, all built around the same golden base.",
         "base": {
             "title": "Baked Miso Maple Tofu",
             "ingredients": [
@@ -1197,7 +1977,7 @@ RECIPE_DB = [
                     "Blend yogurt, mint, lemon juice, and garlic powder until smooth. Season with salt.",
                     "Serve rice topped with miso tofu and curry cauliflower. Scatter cashews and raisins over the top and drizzle minty yogurt generously.",
                 ],
-                "tip": "Make extra minty yogurt [ it keeps 3-4 days and is great on everything.",
+                "tip": "Make extra minty yogurt. It keeps 3-4 days and is great on everything.",
             },
             {
                 "name": "Miso Zucchini Pasta",
@@ -1225,7 +2005,9 @@ RECIPE_DB = [
         "_id": "hot-honey-zaatar-turkey",
         "_keywords": ["turkey", "za"],
         "image": "/static/images/zataar-sausage.png",
-        "intro": "A Middle Eastern-spiced turkey sausage with hot honey and zaatar ] cook it once and it turns into a grain bowl, a creamy pasta, and a breakfast frittata.",
+        "servings": 4,
+        "calories_per_serving": 200,
+        "intro": "A Middle Eastern-spiced turkey sausage with hot honey and zaatar. Cook it once and it turns into a grain bowl, a creamy pasta, and a breakfast frittata.",
         "base": {
             "title": "Hot Honey Zaatar Turkey Sausage",
             "ingredients": [
@@ -1294,7 +2076,7 @@ RECIPE_DB = [
                     "Turn heat to low. Stir in zucchini, Parmesan, basil, and lemon juice until the sauce is creamy.",
                     "Serve with extra basil and Parmesan.",
                 ],
-                "tip": "Check pasta at 10 minutes [ cooking time varies by shape.",
+                "tip": "Check pasta at 10 minutes. Cooking time varies by shape.",
             },
             {
                 "name": "Potato and Goat Cheese Frittata",
@@ -1324,7 +2106,9 @@ RECIPE_DB = [
         "_id": "bean-veggie-salad",
         "_keywords": ["beans", "vegetarian", "vegan", "salad", "lunch"],
         "image": "/static/images/BEAN-SALAD.jpg",
-        "intro": "One lemony, herb-packed bowl of marinated cannellini beans and vegetables that you make once and eat five different ways ] on toast, in a pita, or tossed with greens.",
+        "servings": 6,
+        "calories_per_serving": 135,
+        "intro": "One lemony, herb-packed bowl of marinated cannellini beans and vegetables that you make once and eat five different ways. On toast, in a pita, or tossed with greens.",
         "base": {
             "title": "Easy Lemon-Marinated Bean and Vegetable Salad",
             "ingredients": [
@@ -1385,7 +2169,7 @@ RECIPE_DB = [
                 "subtitle": "tossed with arugula or baby spinach",
                 "extras": ["2 cups arugula or baby spinach"],
                 "steps": [
-                    "Add arugula or spinach to the bean salad and toss [ no extra dressing needed.",
+                    "Add arugula or spinach to the bean salad and toss. No extra dressing needed.",
                 ],
                 "tip": None,
             },
@@ -1405,7 +2189,9 @@ RECIPE_DB = [
         "_id": "protein-overnight-oats",
         "_keywords": ["oats", "breakfast", "protein"],
         "image": "/static/images/High-Protein-Overnight-Oats.jpg",
-        "intro": "40 grams of protein and 10 grams of fiber in a jar you prep the night before ] make four on Sunday and breakfast is handled all week.",
+        "servings": 1,
+        "calories_per_serving": 380,
+        "intro": "40 grams of protein and 10 grams of fiber in a jar you prep the night before. Make four on Sunday and breakfast is handled all week.",
         "base": {
             "title": "High Protein Overnight Oats",
             "ingredients": [
@@ -1460,7 +2246,9 @@ RECIPE_DB = [
         "_id": "sausage-egg-bites",
         "_keywords": ["eggs", "breakfast", "protein", "sausage"],
         "image": "/static/images/Sausage-Egg-Bites.jpg",
-        "intro": "12 protein-packed egg bites you bake on Sunday and microwave in 30 seconds all week [ sausage, cottage cheese, and vegetables baked into creamy, portable bites.",
+        "servings": 6,
+        "calories_per_serving": 182,
+        "intro": "12 protein-packed egg bites you bake on Sunday and microwave in 30 seconds all week. Sausage, cottage cheese, and vegetables baked into creamy, portable bites.",
         "base": {
             "title": "Sausage Egg Bites",
             "ingredients": [
@@ -1494,7 +2282,7 @@ RECIPE_DB = [
                     "Store egg bites in an airtight container in the fridge up to 4 days.",
                     "Microwave 30-60 seconds until warmed through.",
                 ],
-                "tip": "Freeze up to 30 days ] thaw overnight or microwave from frozen for 60-90 seconds.",
+                "tip": "Freeze up to 30 days. Thaw overnight or microwave from frozen for 60-90 seconds.",
             },
             {
                 "name": "Veggie Swap",
@@ -1512,7 +2300,9 @@ RECIPE_DB = [
         "_id": "breakfast-burritos",
         "_keywords": ["eggs", "breakfast", "protein", "burrito", "turkey"],
         "image": "/static/images/High-Protein-Breakfast-Burritos.jpg",
-        "intro": "Over 30 grams of protein per burrito [ scrambled eggs, turkey sausage, peppers, onions, and pepper jack wrapped in a low-carb tortilla. Make a batch on Sunday and toast one each morning.",
+        "servings": 6,
+        "calories_per_serving": 402,
+        "intro": "Over 30 grams of protein per burrito. Scrambled eggs, turkey sausage, peppers, onions, and pepper jack wrapped in a low-carb tortilla. Make a batch on Sunday and toast one each morning.",
         "base": {
             "title": "High Protein Breakfast Burritos",
             "ingredients": [
@@ -1543,7 +2333,7 @@ RECIPE_DB = [
                     "Heat butter in a skillet over medium heat.",
                     "Place burrito seam-side down and cook 2-3 minutes per side until golden and crispy.",
                 ],
-                "tip": "Always cool fillings before assembling ] warm fillings make the tortilla soggy.",
+                "tip": "Always cool fillings before assembling. Warm fillings make the tortilla soggy.",
             },
             {
                 "name": "Freezer Batch",
@@ -1571,7 +2361,9 @@ RECIPE_DB = [
         "_id": "bacon-gruyere-egg-bites",
         "_keywords": ["eggs", "breakfast", "protein", "bacon"],
         "image": "/static/images/Bacon-Gruyere-Egg-Bites.jpg",
-        "intro": "A homemade take on Starbucks sous vide egg bites [ creamy, protein-packed, and made with just a muffin tin. Bacon, Gruyère, and cottage cheese baked into 12 portable bites.",
+        "servings": 6,
+        "calories_per_serving": 212,
+        "intro": "A homemade take on Starbucks sous vide egg bites. Creamy, protein-packed, and made with just a muffin tin. Bacon, Gruyère, and cottage cheese baked into 12 portable bites.",
         "base": {
             "title": "Bacon Gruyère Egg Bites",
             "ingredients": [
@@ -1588,7 +2380,7 @@ RECIPE_DB = [
                 "Preheat oven to 375 F. Spray a 12-cup muffin tin with nonstick spray. Set the tin in a rimmed baking sheet and fill the baking sheet halfway with water to create a water bath.",
                 "Blend eggs, cottage cheese, Gruyère, and seasonings until smooth. Pour evenly into muffin cups.",
                 "Top each cup with chopped bacon.",
-                "Bake 35-40 minutes until centers are firm. Cool 5 minutes before removing ] they'll deflate slightly, which is normal.",
+                "Bake 35-40 minutes until centers are firm. Cool 5 minutes before removing. They'll deflate slightly, which is normal.",
             ],
         },
         "uses": [
@@ -1628,7 +2420,9 @@ RECIPE_DB = [
         "_id": "protein-chia-pudding",
         "_keywords": ["chia", "breakfast", "protein", "pudding"],
         "image": "/static/images/Protein-Chia-Seed-Pudding.jpg",
-        "intro": "36 grams of protein from just 4 ingredients [ Greek yogurt, milk, protein powder, and chia seeds. Prep in 5 minutes on Sunday and eat all week with endless flavor variations.",
+        "servings": 4,
+        "calories_per_serving": 277,
+        "intro": "36 grams of protein from just 4 ingredients. Greek yogurt, milk, protein powder, and chia seeds. Prep in 5 minutes on Sunday and eat all week with endless flavor variations.",
         "base": {
             "title": "Protein Chia Seed Pudding",
             "ingredients": [
@@ -1681,7 +2475,9 @@ RECIPE_DB = [
         "_id": "cosmic-brownie-oats",
         "_keywords": ["oats", "breakfast", "protein", "chocolate"],
         "image": "/static/images/Cosmic-Brownie-Overnight-Oats.jpg",
-        "intro": "A nostalgia-fueled dessert-for-breakfast jar ] fudgy brownie overnight oats topped with a layer of chocolate protein frosting and candy sprinkles. 44 grams of protein.",
+        "servings": 1,
+        "calories_per_serving": 430,
+        "intro": "A nostalgia-fueled dessert-for-breakfast jar. Fudgy brownie overnight oats topped with a layer of chocolate protein frosting and candy sprinkles. 44 grams of protein.",
         "base": {
             "title": "Cosmic Brownie Overnight Oats",
             "ingredients": [
@@ -1711,7 +2507,7 @@ RECIPE_DB = [
                     "Multiply the recipe by 4. Prepare all jars on Sunday.",
                     "Refrigerate up to 4-5 days. Add sprinkles to each jar just before eating.",
                 ],
-                "tip": "Do not freeze [ the texture changes significantly.",
+                "tip": "Do not freeze. The texture changes significantly.",
             },
         ],
     },
@@ -1719,7 +2515,9 @@ RECIPE_DB = [
         "_id": "cottage-cheese-bowl",
         "_keywords": ["cottage cheese", "breakfast", "protein"],
         "image": "/static/images/Cottage-Cheese-Bowl.jpg",
-        "intro": "30 grams of protein, zero cooking. Spoon cottage cheese into a bowl, go sweet with berries, granola, and peanut butter ] or savory with avocado, tomatoes, and everything bagel seasoning.",
+        "servings": 1,
+        "calories_per_serving": 221,
+        "intro": "30 grams of protein, zero cooking. Spoon cottage cheese into a bowl, go sweet with berries, granola, and peanut butter. Or savory with avocado, tomatoes, and everything bagel seasoning.",
         "base": {
             "title": "Cottage Cheese Bowls",
             "ingredients": [
@@ -1762,7 +2560,7 @@ RECIPE_DB = [
                     "Spoon cottage cheese into a bowl.",
                     "Top with berries, granola, a dollop of peanut butter, a drizzle of honey, and a pinch of cinnamon.",
                 ],
-                "tip": "Swap peanut butter for almond butter or tahini, and use any seasonal fruit [ banana, mango, or peach all work great.",
+                "tip": "Swap peanut butter for almond butter or tahini, and use any seasonal fruit. Banana, mango, or peach all work great.",
             },
             {
                 "name": "Savory Avocado Bowl",
@@ -1790,12 +2588,12 @@ RECIPE_DB = [
         "_id": "crustless-veggie-quiche",
         "_keywords": ["eggs", "breakfast", "quiche", "vegetables"],
         "image": "/static/images/crustless-quiche.jpg",
-        "intro": "One pie dish baked on Sunday, sliced into a full week of breakfasts. Sautéed shallots, broccoli, and Gruyère ] elegant enough for brunch, easy enough for meal prep. Reheats in 90 seconds.",
+        "intro": "One pie dish baked on Sunday, sliced into a full week of breakfasts. Sautéed shallots, broccoli, and Gruyère. Elegant enough for brunch, easy enough for meal prep. Reheats in 90 seconds.",
         "base": {
             "title": "Crustless Veggie Quiche",
             "ingredients": [
                 "6 large eggs",
-                "1/2 cup milk (any kind [ whole, 2%, or almond)",
+                "1/2 cup milk (any kind. Whole, 2%, or almond)",
                 "1/2 tsp sea salt, plus more to taste",
                 "Freshly ground black pepper",
                 "1 tbsp extra virgin olive oil, plus more for the dish",
@@ -1820,7 +2618,7 @@ RECIPE_DB = [
             {
                 "name": "Broccoli and Gruyère",
                 "image": "",
-                "subtitle": "the classic ] shallots, broccoli, and melty Gruyère",
+                "subtitle": "the classic. Shallots, broccoli, and melty Gruyère",
                 "extras": [],
                 "steps": [
                     "Follow the base recipe as written.",
@@ -1842,7 +2640,7 @@ RECIPE_DB = [
                     "Transfer to pie dish, top with feta, then pour egg mixture over. Sprinkle with thyme.",
                     "Bake 30–40 minutes until set.",
                 ],
-                "tip": "Squeeze excess moisture from the spinach before adding to the dish [ this keeps the quiche from getting watery.",
+                "tip": "Squeeze excess moisture from the spinach before adding to the dish. This keeps the quiche from getting watery.",
             },
             {
                 "name": "Mushroom and Goat Cheese",
@@ -1858,7 +2656,7 @@ RECIPE_DB = [
                     "Transfer to pie dish, crumble goat cheese over top, then pour egg mixture over. Sprinkle with rosemary.",
                     "Bake 30–40 minutes until set.",
                 ],
-                "tip": "Don't rush the mushrooms ] letting them cook until golden (not steamed) gives the best flavor.",
+                "tip": "Don't rush the mushrooms. Letting them cook until golden (not steamed) gives the best flavor.",
             },
         ],
     },
@@ -1866,7 +2664,9 @@ RECIPE_DB = [
         "_id": "sheet-pan-eggs",
         "_keywords": ["eggs", "breakfast", "protein"],
         "image": "/static/images/Sheet-Pan-Eggs.jpg",
-        "intro": "Blend, pour, bake [ one sheet pan of fluffy eggs sliced into squares becomes wraps, bowls, and sandwiches for the whole week. Faster than scrambling individual portions every morning.",
+        "servings": 6,
+        "calories_per_serving": 151,
+        "intro": "Blend, pour, bake. One sheet pan of fluffy eggs sliced into squares becomes wraps, bowls, and sandwiches for the whole week. Faster than scrambling individual portions every morning.",
         "base": {
             "title": "Sheet Pan Eggs",
             "ingredients": [
@@ -1882,11 +2682,11 @@ RECIPE_DB = [
             ],
             "steps": [
                 "Preheat oven to 350°F. Line a rimmed 12×17-inch sheet pan with parchment paper and grease well.",
-                "Combine eggs, milk, salt, and pepper in a blender and blend until smooth ] this makes the eggs extra fluffy.",
+                "Combine eggs, milk, salt, and pepper in a blender and blend until smooth. This makes the eggs extra fluffy.",
                 "Pour the egg mixture evenly onto the prepared sheet pan.",
                 "Sprinkle with bell pepper, cheese, and any additional vegetables or protein.",
                 "Bake 17–20 minutes until fully set with no liquid in the center.",
-                "Cool 10 minutes before slicing into squares [ cooling helps them hold their shape.",
+                "Cool 10 minutes before slicing into squares. Cooling helps them hold their shape.",
                 "Store in the fridge up to 4 days, or freeze individual portions up to 2 months. Reheat 30–60 seconds in the microwave.",
             ],
         },
@@ -1923,7 +2723,7 @@ RECIPE_DB = [
                     "Place 1–2 egg squares on top and add avocado and salsa.",
                     "Finish with a dollop of sour cream and hot sauce.",
                 ],
-                "tip": "Swap potatoes for leftover rice or quinoa ] both work great as a base.",
+                "tip": "Swap potatoes for leftover rice or quinoa. Both work great as a base.",
             },
             {
                 "name": "Breakfast Sandwich",
@@ -1941,7 +2741,7 @@ RECIPE_DB = [
                     "Microwave the open-faced sandwich 20–30 seconds to melt the cheese.",
                     "Add hot sauce and the top of the muffin. Press and eat.",
                 ],
-                "tip": "Freeze assembled sandwiches wrapped in foil [ reheat straight from frozen at 350°F for 25 minutes.",
+                "tip": "Freeze assembled sandwiches wrapped in foil. Reheat straight from frozen at 350°F for 25 minutes.",
             },
         ],
     },
@@ -1949,7 +2749,7 @@ RECIPE_DB = [
         "_id": "breakfast-snack-plate",
         "_keywords": ["eggs", "breakfast", "snack", "protein"],
         "image": "/static/images/breakfast-snack-plate.jpg",
-        "intro": "The anti-recipe breakfast ] pull whatever you have from the fridge and arrange it on a plate. Aim for fat, protein, and something carby, and you're done. A great way to use up leftovers.",
+        "intro": "The anti-recipe breakfast. Pull whatever you have from the fridge and arrange it on a plate. Aim for fat, protein, and something carby, and you're done. A great way to use up leftovers.",
         "base": {
             "title": "DIY Breakfast Snack Plates",
             "ingredients": [
@@ -1961,7 +2761,7 @@ RECIPE_DB = [
             "steps": [
                 "Pick one item from each category above based on what you have.",
                 "Arrange on a plate or layer into a container.",
-                "That's it [ no cooking required. Prep 4-5 containers on Sunday and refrigerate up to 4 days.",
+                "That's it. No cooking required. Prep 4-5 containers on Sunday and refrigerate up to 4 days.",
             ],
         },
         "uses": [
@@ -2012,87 +2812,85 @@ RECIPE_DB = [
                     "Arrange egg, cheese, berries, and protein bar pieces on a plate.",
                     "Eat as-is or refrigerate in a container for the morning rush.",
                 ],
-                "tip": "Swap in any leftover protein ] a few meatballs, a slice of quiche, or leftover salmon all work perfectly.",
+                "tip": "Swap in any leftover protein. A few meatballs, a slice of quiche, or leftover salmon all work perfectly.",
             },
         ],
     },
     {
         "_id": "gourmet-toast",
-        "_keywords": ["toast", "breakfast", "nut butter", "honey", "fruit", "sweet"],
+        "_keywords": ["walnut", "honey", "breakfast"],
         "image": "/static/images/sweet-toast.jpg",
-        "intro": "Sweet, satisfying breakfast toasts built around a pantry of honey, nut butter, and nuts [ each variation swaps in a different fruit and spread so the whole batch stays interesting without needing many extra ingredients.",
+        "intro": "One quick oven roast gives you a week of sweet, crunchy walnuts with honey and cinnamon. Scatter them over yogurt, oatmeal, or cottage cheese for a breakfast that comes together in under a minute.",
         "base": {
             "title": "Sweet Gourmet Toast",
             "ingredients": [
-                "4 slices sourdough or whole wheat bread",
-                "1/4 cup nut butter (almond, cashew, or peanut ] your pick)",
-                "3 tbsp honey",
-                "1/4 cup mixed nuts, chopped (almonds, walnuts, or a mix)",
+                "1½ cups raw walnuts",
+                "2 tbsp honey",
+                "½ tsp ground cinnamon",
+                "Pinch of sea salt",
             ],
             "steps": [
-                "Toast bread slices until golden and crisp.",
-                "While still warm, proceed with your chosen topping variation below.",
-                "Drizzle honey over the top before serving [ warmth from the toast helps it melt in.",
+                "Preheat oven to 350°F. Line a baking sheet with parchment.",
+                "In a bowl, combine walnuts, honey, and cinnamon. Toss until every walnut is coated.",
+                "Spread in a single layer on the baking sheet.",
+                "Roast 8–10 minutes until fragrant and golden. Watch closely — they burn fast.",
+                "Let cool completely on the pan. They crisp up as they cool.",
+                "Store in an airtight container at room temperature for up to 5 days.",
             ],
         },
         "uses": [
             {
-                "name": "Nut Butter & Banana",
-                "subtitle": "almond butter, banana slices, sliced almonds, honey",
+                "name": "Yogurt & Walnut Bowl",
+                "subtitle": "Greek yogurt, honey cinnamon walnuts, drizzle of honey",
                 "extras": [
-                    "2 tbsp almond butter (or cashew/peanut)",
-                    "1 small banana, sliced",
-                    "2 tbsp sliced almonds",
+                    "¾ cup plain Greek yogurt",
                     "Drizzle of honey",
                 ],
                 "steps": [
-                    "Spread almond butter over warm toast.",
-                    "Lay banana slices in a single layer on top.",
-                    "Scatter sliced almonds and drizzle with honey.",
+                    "Spoon yogurt into a bowl.",
+                    "Scatter a generous handful of the roasted walnuts on top.",
+                    "Finish with an extra drizzle of honey.",
                 ],
-                "tip": "For extra richness, spread a thin layer of chocolate-hazelnut spread under the almond butter.",
+                "tip": "Add sliced banana or fresh berries if you have them — they're great with the cinnamon walnuts.",
             },
             {
-                "name": "Apple, Walnut & Honey",
-                "subtitle": "nut butter, honey, apple slices, chopped walnuts",
+                "name": "Cottage Cheese & Walnut Bowl",
+                "subtitle": "cottage cheese, honey cinnamon walnuts, fresh fruit",
                 "extras": [
-                    "2 tbsp almond or walnut butter",
-                    "1 tbsp honey (drizzled and slightly melted)",
-                    "1/2 apple, thinly sliced",
-                    "2 tbsp raw walnuts, roughly chopped",
-                ],
-                "steps": [
-                    "Drizzle honey directly on warm toast and let it melt for 30 seconds.",
-                    "Spread nut butter over the honey layer.",
-                    "Fan apple slices across the top and scatter chopped walnuts.",
-                    "Drizzle a little more honey to finish.",
-                ],
-                "tip": "Honeycrisp or Pink Lady apples hold their crunch best and aren't too tart.",
-            },
-            {
-                "name": "Cottage Cheese & Berry",
-                "subtitle": "cottage cheese, fresh berries, mint, crushed nuts, honey",
-                "extras": [
-                    "3 tbsp cottage cheese",
-                    "1/3 cup fresh berries (strawberries, blueberries, or a mix)",
-                    "A few fresh mint leaves",
-                    "2 tbsp nuts, crushed (almonds, walnuts, or pistachios)",
+                    "¾ cup cottage cheese",
+                    "½ cup fresh berries or sliced apple",
                     "Drizzle of honey",
                 ],
                 "steps": [
-                    "Spread cottage cheese generously over warm toast.",
-                    "Top with fresh berries and a few torn mint leaves.",
-                    "Scatter crushed nuts and finish with a honey drizzle.",
+                    "Spoon cottage cheese into a bowl.",
+                    "Top with fresh fruit and a handful of roasted walnuts.",
+                    "Drizzle with honey and serve.",
                 ],
-                "tip": "Swap cottage cheese for ricotta if you have it ] both work beautifully and share the same mild, creamy base.",
+                "tip": "Swap cottage cheese for ricotta for an even creamier texture.",
+            },
+            {
+                "name": "Oatmeal with Honey Walnuts",
+                "subtitle": "warm oats topped with honey cinnamon walnuts",
+                "extras": [
+                    "½ cup rolled oats, cooked",
+                    "Splash of milk or oat milk",
+                    "Drizzle of honey",
+                ],
+                "steps": [
+                    "Cook oats with milk until creamy.",
+                    "Top with a handful of the roasted walnuts.",
+                    "Drizzle with honey and serve warm.",
+                ],
+                "tip": "A pinch of extra cinnamon stirred into the oats ties the whole bowl together.",
             },
         ],
     },
     {
         "_id": "savory-gourmet-toast",
         "_keywords": ["toast", "breakfast", "avocado", "ricotta", "mozzarella", "savory"],
+        "calories_per_serving": 320,
         "image": "/static/images/gourmet-toast.jpg",
-        "intro": "Three no-cook toast builds that go from fridge to plate in five minutes [ each one shares a base of good bread, a creamy spread, and fresh toppings, so you can rotate through them all week.",
+        "intro": "Three no-cook toast builds that go from fridge to plate in five minutes. Each one shares a base of good bread, a creamy spread, and fresh toppings, so you can rotate through them all week.",
         "base": {
             "title": "Savory Gourmet Toast",
             "ingredients": [
@@ -2102,7 +2900,7 @@ RECIPE_DB = [
                 "Red pepper flakes (optional)",
             ],
             "steps": [
-                "Toast bread until golden and crisp ] a hot pan with a little butter gives great flavor.",
+                "Toast bread until golden and crisp. A hot pan with a little butter gives great flavor.",
                 "While still warm, build your chosen topping variation.",
                 "Finish every version with a pinch of flaky salt and a drizzle of olive oil.",
             ],
@@ -2136,11 +2934,11 @@ RECIPE_DB = [
                     "Flaky salt and olive oil",
                 ],
                 "steps": [
-                    "Spread ricotta thickly over warm toast [ use the back of a spoon to swirl it.",
+                    "Spread ricotta thickly over warm toast. Use the back of a spoon to swirl it.",
                     "Lay tomato slices over the ricotta and scatter torn basil.",
                     "Drizzle with balsamic glaze and olive oil, then finish with flaky salt.",
                 ],
-                "tip": "Ricotta firms up quickly ] build these right before eating for the best texture.",
+                "tip": "Ricotta firms up quickly. Build these right before eating for the best texture.",
             },
             {
                 "name": "Mozzarella, Pesto & Balsamic",
@@ -2165,7 +2963,7 @@ RECIPE_DB = [
         "_id": "chicken-parm-meatballs",
         "_keywords": ["chicken", "meatball", "parm"],
         "image": "/static/images/chicken-parm-meatballs-recipe.jpg",
-        "intro": "All the bubbly cheese and rich marinara of chicken Parmesan, none of the breading or frying [ one skillet, 30 minutes, and you have meatballs that become three completely different meals.",
+        "intro": "All the bubbly cheese and rich marinara of chicken Parmesan, none of the breading or frying. One skillet, 30 minutes, and you have meatballs that become three completely different meals.",
         "base": {
             "title": "Chicken Parm Meatballs",
             "ingredients": [
@@ -2246,11 +3044,13 @@ RECIPE_DB = [
         "_id": "broccoli-pasta",
         "_keywords": ["broccoli", "pasta"],
         "image": "/static/images/broccoli-pasta.jpg",
-        "intro": "Cook broccoli in the pasta water, mash it into a silky garlic sauce, and finish with toasted breadcrumbs and lemon ] one pot, 30 minutes, and the same base makes a creamy soup or a crispy breadcrumb pasta.",
+        "servings": 4,
+        "calories_per_serving": 336,
+        "intro": "Cook broccoli in the pasta water, mash it into a silky garlic sauce, and finish with toasted breadcrumbs and lemon. One pot, 30 minutes, and the same base makes a creamy soup or a crispy breadcrumb pasta.",
         "base": {
             "title": "Pasta con i Broccoli",
             "ingredients": [
-                "400g (14 oz) short pasta [ rigatoni, fusilli, or penne",
+                "400g (14 oz) short pasta. Rigatoni, fusilli, or penne",
                 "1 lb (450g) broccoli, cut into small florets",
                 "3 tbsp extra virgin olive oil",
                 "3 garlic cloves, minced",
@@ -2265,9 +3065,9 @@ RECIPE_DB = [
             "steps": [
                 "Bring a large pot of heavily salted water to a boil.",
                 "Toast breadcrumbs: in a skillet over low heat, warm ½ tbsp olive oil and fry breadcrumbs with a pinch of salt for 4–5 minutes until golden and crispy. Transfer to a plate.",
-                "Add broccoli florets to the boiling water and cook 5 minutes until tender. Remove with a slotted spoon into a bowl ] keep the water boiling.",
+                "Add broccoli florets to the boiling water and cook 5 minutes until tender. Remove with a slotted spoon into a bowl. Keep the water boiling.",
                 "Cook pasta in the same broccoli water until al dente. Reserve ½ cup pasta water before draining.",
-                "In the same skillet over low heat, warm 3 tbsp olive oil. Add garlic and chili flakes and cook 1 minute until fragrant [ don't let it brown.",
+                "In the same skillet over low heat, warm 3 tbsp olive oil. Add garlic and chili flakes and cook 1 minute until fragrant. Don't let it brown.",
                 "Add cooked broccoli and the reserved pasta water to the skillet. Simmer over medium heat 3–4 minutes, breaking up the broccoli with a spoon into a rough, saucy texture.",
                 "Season well with salt and pepper. Add drained pasta and toss until fully coated. Add a splash more pasta water if needed.",
                 "Finish with lemon juice, a drizzle of olive oil, and the toasted breadcrumbs. Serve with Parmesan.",
@@ -2288,7 +3088,7 @@ RECIPE_DB = [
                     "Make the base recipe through step 8.",
                     "Divide into bowls and top with extra breadcrumbs, a shower of Parmesan, and a squeeze of lemon.",
                 ],
-                "tip": "Reheat leftovers by sautéing in a pan with a splash of water ] the pasta gets lightly crispy and even better.",
+                "tip": "Reheat leftovers by sautéing in a pan with a splash of water. The pasta gets lightly crispy and even better.",
             },
             {
                 "name": "Vellutata di Broccoli",
@@ -2320,7 +3120,7 @@ RECIPE_DB = [
                     "Follow the base recipe but skip the Parmesan.",
                     "Toss pasta with extra olive oil, red pepper flakes, and a very generous handful of toasted breadcrumbs.",
                 ],
-                "tip": "Breadcrumbs keep in the freezer for weeks [ toast a big batch and use them on soups, salads, and grilled fish too.",
+                "tip": "Breadcrumbs keep in the freezer for weeks. Toast a big batch and use them on soups, salads, and grilled fish too.",
             },
         ],
     },
@@ -2328,7 +3128,9 @@ RECIPE_DB = [
         "_id": "tortellini-soup",
         "_keywords": ["tortellini"],
         "image": "/static/images/Spicy-Sausage-and-Tortellini.jpg",
-        "intro": "One pot, 35 minutes ] spicy Italian sausage, cheese tortellini, kale, and fire-roasted tomatoes come together in a deeply satisfying soup that packs beautifully for the week.",
+        "servings": 6,
+        "calories_per_serving": 250,
+        "intro": "One pot, 35 minutes. Spicy Italian sausage, cheese tortellini, kale, and fire-roasted tomatoes come together in a deeply satisfying soup that packs beautifully for the week.",
         "base": {
             "title": "Spicy Italian Sausage and Tortellini Soup",
             "ingredients": [
@@ -2366,7 +3168,7 @@ RECIPE_DB = [
                     "Ladle soup into bowls.",
                     "Top with shaved Parmesan and freshly chopped basil.",
                 ],
-                "tip": "Tortellini will absorb more liquid as it sits [ add a splash of stock when reheating.",
+                "tip": "Tortellini will absorb more liquid as it sits. Add a splash of stock when reheating.",
             },
             {
                 "name": "Soup with Crusty Bread",
@@ -2395,7 +3197,7 @@ RECIPE_DB = [
                     "Once cooled, top each with Parmesan and basil.",
                     "Refrigerate up to 4 days. Reheat with a splash of chicken stock if needed.",
                 ],
-                "tip": "Freezes well for up to 3 months ] skip the cream if freezing and stir it in when reheating.",
+                "tip": "Freezes well for up to 3 months. Skip the cream if freezing and stir it in when reheating.",
             },
         ],
     },
@@ -2403,7 +3205,9 @@ RECIPE_DB = [
         "_id": "italian-couscous",
         "_keywords": ["couscous"],
         "image": "/static/images/Italian-Couscous.jpg",
-        "intro": "A hearty, no-cook Italian salad that gets better as it sits [ roasted garlic couscous loaded with salami, mozzarella, chickpeas, and a punchy red wine vinaigrette.",
+        "servings": 6,
+        "calories_per_serving": 400,
+        "intro": "A hearty, no-cook Italian salad that gets better as it sits. Roasted garlic couscous loaded with salami, mozzarella, chickpeas, and a punchy red wine vinaigrette.",
         "base": {
             "title": "Italian Couscous Salad",
             "ingredients": [
@@ -2445,7 +3249,7 @@ RECIPE_DB = [
                     "Add cooled couscous to a large bowl with all veggies, salami, mozzarella, basil, and chickpeas.",
                     "Add dressing, a squeeze of lemon, and season to taste. Toss and serve immediately.",
                 ],
-                "tip": "Only dress what you plan to eat right away ] this salad doesn't sit well once dressed.",
+                "tip": "Only dress what you plan to eat right away. This salad doesn't sit well once dressed.",
             },
             {
                 "name": "Meal Prep Jars",
@@ -2479,26 +3283,28 @@ RECIPE_DB = [
     },
     {
         "_id": "tuscan-chicken-pasta",
-        "_keywords": ["tuscan", "chicken"],
+        "_keywords": ["tuscan", "chicken", "pasta", "calabrian", "sun-dried tomato", "spinach", "cream", "spicy"],
         "image": "/static/images/Spicy-Tuscan-Chicken-Pasta.jpg",
-        "intro": "A restaurant-worthy pasta that comes together in 30 minutes [ juicy chicken, sun-dried tomatoes, wilted spinach, and a creamy Parmesan sauce clinging to every piece of pasta.",
+        "servings": 6,
+        "calories_per_serving": 622,
+        "intro": "A restaurant-worthy pasta that comes together in 30 minutes. Juicy chicken, sun-dried tomatoes, wilted spinach, and a creamy Calabrian chili Parmesan sauce clinging to every piece of pasta.",
         "base": {
             "title": "Spicy Tuscan Chicken Pasta",
             "ingredients": [
-                "1.5 lbs boneless skinless chicken breasts, pounded to even thickness",
-                "2 tsp Italian seasoning",
-                "1 tsp smoked paprika",
-                "1/2 tsp red pepper flakes, plus more to taste",
-                "Salt and black pepper",
-                "3 tbsp olive oil",
-                "5 cloves garlic, minced",
-                "1/2 cup sun-dried tomatoes in oil, drained and roughly chopped",
-                "1 cup chicken broth",
+                "1 jar (8 oz) oil-packed sun-dried tomatoes",
+                "1 lb boneless skinless chicken breasts, cubed",
+                "4 tsp Italian seasoning",
+                "1 tsp paprika or smoked paprika",
+                "Red pepper flakes, to taste",
+                "Kosher salt and black pepper",
+                "2 tbsp salted butter",
+                "1 medium shallot, chopped",
+                "2 cloves garlic, chopped",
+                "2–3 tbsp crushed Calabrian chili paste",
+                "1 lb short-cut pasta (penne, rigatoni, or similar)",
                 "1 cup heavy cream",
-                "1/2 cup grated Parmesan",
-                "3 cups baby spinach",
-                "12 oz penne or rigatoni",
-                "Fresh basil and extra Parmesan, to serve",
+                "1 cup grated Parmesan cheese",
+                "2 cups fresh baby spinach",
             ],
             "steps": [
                 "Cook pasta in heavily salted boiling water until al dente. Reserve 1/2 cup pasta water before draining.",
@@ -2523,7 +3329,7 @@ RECIPE_DB = [
                     "Divide pasta into bowls.",
                     "Top with torn fresh basil, extra Parmesan, and a pinch of red pepper flakes.",
                 ],
-                "tip": "The sauce thickens as it sits ] add a splash of broth or cream when reheating.",
+                "tip": "The sauce thickens as it sits. Add a splash of broth or cream when reheating.",
             },
             {
                 "name": "Leftover Baked Pasta",
@@ -2561,7 +3367,7 @@ RECIPE_DB = [
         "_id": "pasta-alla-gricia",
         "_keywords": ["gricia", "guanciale", "pecorino", "roman", "italian pasta"],
         "image": "/static/images/Pasta-Alla-Gricia-Recipe.jpg",
-        "intro": "The Roman pasta that came before carbonara [ guanciale rendered until golden, black pepper bloomed in the fat, and Pecorino Romano stirred into a glossy, emulsified sauce. Four ingredients, maximum flavor.",
+        "intro": "The Roman pasta that came before carbonara. Guanciale rendered until golden, black pepper bloomed in the fat, and Pecorino Romano stirred into a glossy, emulsified sauce. Four ingredients, maximum flavor.",
         "base": {
             "title": "Pasta alla Gricia",
             "ingredients": [
@@ -2595,7 +3401,7 @@ RECIPE_DB = [
                     "Follow the base recipe through step 8.",
                     "Divide into warm bowls and shower with extra Pecorino and a generous crack of pepper.",
                 ],
-                "tip": "Use the finest grater you have ] pre-grated Pecorino won't melt into the sauce properly.",
+                "tip": "Use the finest grater you have. Pre-grated Pecorino won't melt into the sauce properly.",
             },
             {
                 "name": "Gricia-Inspired Leftovers",
@@ -2610,7 +3416,7 @@ RECIPE_DB = [
                     "Toss until heated through and sauce loosens. Add more water as needed.",
                     "Top with fresh Pecorino and pepper before serving.",
                 ],
-                "tip": "Never microwave [ reheating in a pan revives the sauce and keeps the guanciale crispy.",
+                "tip": "Never microwave. Reheating in a pan revives the sauce and keeps the guanciale crispy.",
             },
         ],
     },
@@ -2618,7 +3424,7 @@ RECIPE_DB = [
         "_id": "chicken-burrito-bowl",
         "_keywords": ["burrito", "mexican", "chicken", "rice", "avocado"],
         "image": "/static/images/Chicken-Burrito-Bowl.jpg",
-        "intro": "Cumin-spiced baked chicken and cilantro rice prepped once ] then build burrito bowls, stuff into burritos, or wrap in lettuce all week. Fresh, filling, and endlessly customizable.",
+        "intro": "Cumin-spiced baked chicken and cilantro rice prepped once. Then build burrito bowls, stuff into burritos, or wrap in lettuce all week. Fresh, filling, and endlessly customizable.",
         "base": {
             "title": "Chicken Burrito Bowl",
             "ingredients": [
@@ -2640,7 +3446,7 @@ RECIPE_DB = [
                 "Bake 25 minutes until the internal temperature reaches 165°F. Let cool, then cut or shred into bite-sized pieces.",
                 "Meanwhile, combine rice and water in a medium pot. Bring to a boil, cover, and simmer 25 minutes until water is absorbed. Stir in salt, cumin, and remaining 1/4 tsp garlic powder.",
                 "Halve cherry tomatoes, dice avocados, and chop cilantro.",
-                "Store all components separately in the fridge [ assemble each bowl fresh throughout the week.",
+                "Store all components separately in the fridge. Assemble each bowl fresh throughout the week.",
             ],
         },
         "uses": [
@@ -2675,7 +3481,7 @@ RECIPE_DB = [
                     "Fold in the sides, roll up tightly, and press seam-side down.",
                     "Optional: toast in a dry pan 1–2 minutes per side until golden and sealed.",
                 ],
-                "tip": "Don't overfill ] less is more for a burrito that actually stays together.",
+                "tip": "Don't overfill. Less is more for a burrito that actually stays together.",
             },
             {
                 "name": "Lettuce Wrap",
@@ -2699,7 +3505,7 @@ RECIPE_DB = [
         "_id": "ground-turkey-base",
         "_keywords": ["turkey", "taco", "mexican", "ground turkey", "stuffed peppers"],
         "image": "/static/images/Turkey-Taco-Soup.jpg",
-        "intro": "One pound of ground turkey seasoned with taco spices and cooked down with onion, bell peppers, carrots, mushrooms, and jalapeño [ ladle it into soup, spoon it into bell peppers, or pile it into tacos.",
+        "intro": "One pound of ground turkey seasoned with taco spices and cooked down with onion, bell peppers, carrots, mushrooms, and jalapeño. Ladle it into soup, spoon it into bell peppers, or pile it into tacos.",
         "base": {
             "title": "Taco-Spiced Ground Turkey",
             "ingredients": [
@@ -2736,11 +3542,11 @@ RECIPE_DB = [
                     "Tortilla chips (optional)",
                 ],
                 "steps": [
-                    "Ladle the turkey base (with all the broth) into bowls ] this is the soup as-is.",
+                    "Ladle the turkey base (with all the broth) into bowls. This is the soup as-is.",
                     "Top with sliced avocado, a handful of cheddar, and a dollop of sour cream.",
                     "Serve with tortilla chips on the side for dipping.",
                 ],
-                "tip": "The soup thickens as it sits in the fridge [ just add a splash of broth when reheating.",
+                "tip": "The soup thickens as it sits in the fridge. Just add a splash of broth when reheating.",
             },
             {
                 "name": "Stuffed Bell Peppers",
@@ -2757,7 +3563,7 @@ RECIPE_DB = [
                     "Mix the turkey base with cooked rice if using. Spoon into each pepper half.",
                     "Top with shredded cheese and bake 25–30 minutes until the peppers are tender and cheese is bubbly.",
                 ],
-                "tip": "Use the leftover broth from the base as a sauce ] pour a little into the baking dish before cooking.",
+                "tip": "Use the leftover broth from the base as a sauce. Pour a little into the baking dish before cooking.",
             },
             {
                 "name": "Tacos",
@@ -2784,7 +3590,7 @@ RECIPE_DB = [
         "_id": "guac-stuffed-peppers",
         "_keywords": ["guacamole", "avocado", "peppers", "snack", "mexican", "nachos"],
         "image": "/static/images/Guacamole-Mini-Peppers.jpg",
-        "intro": "Fresh lime guacamole stuffed into mini pepper halves [ make the guac once and it becomes a snack plate, a nacho topping, or a light lunch with carrots and peppers all week.",
+        "intro": "Fresh lime guacamole stuffed into mini pepper halves. Make the guac once and it becomes a snack plate, a nacho topping, or a light lunch with carrots and peppers all week.",
         "base": {
             "title": "Guacamole Stuffed Mini Peppers",
             "ingredients": [
@@ -2800,7 +3606,7 @@ RECIPE_DB = [
                 "Halve avocados, remove pits, and scoop flesh into a bowl. Mash with a fork to your preferred texture.",
                 "Stir in red onion, lime juice, and salt. Taste and adjust.",
                 "Spoon guacamole into pepper halves and serve immediately, or prep components separately and assemble before eating.",
-                "Store leftover guacamole with the avocado pits pressed on the surface and wrap tightly ] keeps 1–2 days.",
+                "Store leftover guacamole with the avocado pits pressed on the surface and wrap tightly. Keeps 1–2 days.",
             ],
         },
         "uses": [
@@ -2816,7 +3622,7 @@ RECIPE_DB = [
                     "Spoon guacamole generously into each pepper half.",
                     "Finish with a squeeze of lime and a pinch of flaky salt.",
                 ],
-                "tip": "Prep the peppers and guac separately [ stuff just before eating so the peppers stay crisp.",
+                "tip": "Prep the peppers and guac separately. Stuff just before eating so the peppers stay crisp.",
             },
             {
                 "name": "Snack Plate",
@@ -2832,7 +3638,7 @@ RECIPE_DB = [
                     "Arrange baby carrots, mini peppers, and any other raw veggies around it.",
                     "Add a handful of tortilla chips on the side if you want something crunchy.",
                 ],
-                "tip": "This also works as a light lunch ] add a hard-boiled egg or a handful of nuts to round it out.",
+                "tip": "This also works as a light lunch. Add a hard-boiled egg or a handful of nuts to round it out.",
             },
             {
                 "name": "Nachos",
@@ -2851,7 +3657,7 @@ RECIPE_DB = [
                     "Remove from oven and dollop guacamole, salsa, and sour cream over the top.",
                     "Add jalapeños and serve immediately.",
                 ],
-                "tip": "Add guac after baking [ heat turns it brown and bitter.",
+                "tip": "Add guac after baking. Heat turns it brown and bitter.",
             },
         ],
     },
@@ -2859,7 +3665,7 @@ RECIPE_DB = [
         "_id": "chicken-katsudon",
         "_keywords": ["katsu", "katsudon", "japanese", "chicken", "breaded", "rice bowl"],
         "image": "/static/images/chicken-katsudon.jpg",
-        "intro": "Panko-crusted chicken cutlet fried golden, then simmered in a sweet dashi-soy egg sauce and served over steamed rice ] the same crispy katsu also fills a sando sandwich or tops a crisp salad.",
+        "intro": "Panko-crusted chicken cutlet fried golden, then simmered in a sweet dashi-soy egg sauce and served over steamed rice. The same crispy katsu also fills a sando sandwich or tops a crisp salad.",
         "base": {
             "title": "Chicken Katsu Don",
             "ingredients": [
@@ -2883,7 +3689,7 @@ RECIPE_DB = [
             ],
             "steps": [
                 "Place chicken between two sheets of plastic wrap and pound to an even 1cm thickness. Season with salt and white pepper.",
-                "Set up a crumbing station: flour, beaten egg, then panko. Coat each piece [ flour first, then egg, then press firmly into panko.",
+                "Set up a crumbing station: flour, beaten egg, then panko. Coat each piece. Flour first, then egg, then press firmly into panko.",
                 "Heat oil in a frying pan over medium-high heat. Fry chicken 3–4 minutes per side until deep golden and cooked through. Drain on paper towel, rest 2 minutes, then slice.",
                 "In a small pan, combine dashi, soy sauce, mirin, and sugar. Bring to a simmer, add sliced onion, and cook 3 minutes until softened.",
                 "Pour beaten eggs over the simmering sauce. Cover and cook on low 60–90 seconds until just set but still slightly runny in the centre.",
@@ -2904,7 +3710,7 @@ RECIPE_DB = [
                     "Follow the base recipe through step 6.",
                     "Garnish with spring onions, nori strips, and sesame seeds.",
                 ],
-                "tip": "The egg sauce should be just barely set ] it continues cooking from residual heat, so pull it early.",
+                "tip": "The egg sauce should be just barely set. It continues cooking from residual heat, so pull it early.",
             },
             {
                 "name": "Katsu Sando",
@@ -2921,7 +3727,7 @@ RECIPE_DB = [
                     "Layer shredded cabbage, then the sliced katsu cutlet.",
                     "Press the sandwich firmly, trim crusts, and slice in half.",
                 ],
-                "tip": "Wrap tightly in cling wrap and rest 5 minutes before slicing [ it holds together better.",
+                "tip": "Wrap tightly in cling wrap and rest 5 minutes before slicing. It holds together better.",
             },
             {
                 "name": "Katsu Salad",
@@ -2946,7 +3752,9 @@ RECIPE_DB = [
         "_id": "tuna-sushi",
         "_keywords": ["tuna", "sushi", "japanese", "maki", "rice bowl", "nori"],
         "image": "/static/images/tuna-sushi-rolls.jpg",
-        "intro": "Seasoned sushi rice and tuna rolled into maki or piled into a bowl ] both come together from the same prep and are ready to eat straight from the fridge all week.",
+        "servings": 4,
+        "calories_per_serving": 384,
+        "intro": "Seasoned sushi rice and tuna rolled into maki or piled into a bowl. Both come together from the same prep and are ready to eat straight from the fridge all week.",
         "base": {
             "title": "Tuna Sushi Rice",
             "ingredients": [
@@ -2970,10 +3778,10 @@ RECIPE_DB = [
                 "Pickled ginger and nori strips",
             ],
             "steps": [
-                "Rinse rice under cold water until water runs clear. Cook with 2½ cups water [ bring to boil, cover, simmer 12 minutes. Remove from heat, rest 10 minutes.",
-                "Mix rice vinegar, sugar, and salt until dissolved. Fold through hot rice with a spatula using cutting motions ] fan the rice as you fold to cool it quickly. Do not refrigerate.",
+                "Rinse rice under cold water until water runs clear. Cook with 2½ cups water. Bring to boil, cover, simmer 12 minutes. Remove from heat, rest 10 minutes.",
+                "Mix rice vinegar, sugar, and salt until dissolved. Fold through hot rice with a spatula using cutting motions. Fan the rice as you fold to cool it quickly. Do not refrigerate.",
                 "Mix drained tuna with Japanese mayo.",
-                "Store sushi rice covered with a damp cloth at room temperature [ do not refrigerate or it will harden.",
+                "Store sushi rice covered with a damp cloth at room temperature. Do not refrigerate or it will harden.",
             ],
         },
         "uses": [
@@ -2993,7 +3801,7 @@ RECIPE_DB = [
                     "Roll firmly away from you, pressing gently as you go. Wet the border to seal.",
                     "Slice into 6–8 pieces with a wet sharp knife. Serve with soy, pickled ginger, and wasabi.",
                 ],
-                "tip": "Wet your knife between each cut ] it prevents the rice from sticking and gives cleaner slices.",
+                "tip": "Wet your knife between each cut. It prevents the rice from sticking and gives cleaner slices.",
             },
             {
                 "name": "Tuna Rice Bowl",
@@ -3063,7 +3871,7 @@ RECIPE_DB = [
                     "Follow the base recipe through step 6.",
                     "Drizzle any remaining glaze over the salmon before serving.",
                 ],
-                "tip": "Make a double batch of the teriyaki glaze [ it keeps in the fridge for 2 weeks and works on chicken, tofu, and vegetables too.",
+                "tip": "Make a double batch of the teriyaki glaze. It keeps in the fridge for 2 weeks and works on chicken, tofu, and vegetables too.",
             },
             {
                 "name": "Teriyaki Salmon Rice Bowl",
@@ -3080,7 +3888,7 @@ RECIPE_DB = [
                     "Top with teriyaki salmon, edamame, and avocado.",
                     "Drizzle with teriyaki glaze and finish with sesame seeds and nori.",
                 ],
-                "tip": "Flake the salmon into the rice rather than serving it whole ] it distributes the glaze more evenly.",
+                "tip": "Flake the salmon into the rice rather than serving it whole. It distributes the glaze more evenly.",
             },
         ],
     },
@@ -3088,6 +3896,8 @@ RECIPE_DB = [
         "_id": "beef-fajitas",
         "_keywords": ["beef", "fajita", "mexican", "steak", "peppers"],
         "image": "/static/images/Beef-Fajitas.jpg",
+        "servings": 6,
+        "calories_per_serving": 350,
         "intro": "Taco-seasoned stir-fry beef with sautéed bell peppers and red onion - cook it once and build fajita bowls, tacos, or a fajita salad across the week.",
         "base": {
             "title": "Beef Fajitas",
@@ -3167,7 +3977,7 @@ RECIPE_DB = [
                     "Top with warm beef and peppers and a spoonful of guacamole.",
                     "Add tortilla strips for crunch.",
                 ],
-                "tip": "The warm beef wilts the lettuce slightly [ dress and serve immediately.",
+                "tip": "The warm beef wilts the lettuce slightly. Dress and serve immediately.",
             },
         ],
     },
@@ -3175,7 +3985,9 @@ RECIPE_DB = [
         "_id": "beef-barbacoa",
         "_keywords": ["barbacoa", "beef", "mexican", "chipotle", "shredded beef"],
         "image": "/static/images/Beef-Barbacoa.jpg",
-        "intro": "A chipotle-cumin braised chuck roast cooked until fall-apart tender and shredded into its own sauce ] meal prep six portions of bowls or salads in one Instant Pot session.",
+        "servings": 6,
+        "calories_per_serving": 200,
+        "intro": "A chipotle-cumin braised chuck roast cooked until fall-apart tender and shredded into its own sauce. Meal prep six portions of bowls or salads in one Instant Pot session.",
         "base": {
             "title": "Beef Barbacoa",
             "ingredients": [
@@ -3224,7 +4036,7 @@ RECIPE_DB = [
                     "Add diced red onion, fresh cilantro, and a squeeze of lime.",
                     "Finish with avocado or guacamole if desired.",
                 ],
-                "tip": "Reheat beef in a skillet over medium heat or microwave in 60-second intervals [ always add a spoonful of the braising sauce to keep it moist.",
+                "tip": "Reheat beef in a skillet over medium heat or microwave in 60-second intervals. Always add a spoonful of the braising sauce to keep it moist.",
             },
             {
                 "name": "Barbacoa Salad",
@@ -3251,7 +4063,7 @@ RECIPE_DB = [
         "_id": "breakfast-taco-bowl",
         "_keywords": ["breakfast", "taco", "eggs", "turkey", "potato", "mexican"],
         "image": "/static/images/Taco-Breakfast-Bowl.jpg",
-        "intro": "Seasoned ground turkey, scrambled eggs, roasted baby potatoes, fresh pico de gallo, and melted cheese ] all in one bowl. Meal prep four on Sunday and breakfast is handled all week.",
+        "intro": "Seasoned ground turkey, scrambled eggs, roasted baby potatoes, fresh pico de gallo, and melted cheese. All in one bowl. Meal prep four on Sunday and breakfast is handled all week.",
         "base": {
             "title": "Breakfast Taco Bowl",
             "ingredients": [
@@ -3310,7 +4122,7 @@ RECIPE_DB = [
                     "Spoon seasoned turkey and a little pico onto one half. Sprinkle with cheese.",
                     "Fold the omelet over the filling and slide onto a plate. Add avocado or sour cream on the side.",
                 ],
-                "tip": "Use the pre-cooked turkey straight from the fridge ] the residual heat of the omelet warms it through.",
+                "tip": "Use the pre-cooked turkey straight from the fridge. The residual heat of the omelet warms it through.",
             },
         ],
     },
@@ -3318,7 +4130,7 @@ RECIPE_DB = [
         "_id": "wonton-soup",
         "_keywords": ["wonton", "pork", "shrimp", "chinese", "soup", "dumpling"],
         "image": "/static/images/wonton-soup.jpg",
-        "intro": "Hand-folded pork and shrimp wontons are the week's MVP [ batch-make them on Sunday and pull from them three different ways: in a clear ginger broth, over rice with chili oil, or floating in a spicy miso ramen.",
+        "intro": "Hand-folded pork and shrimp wontons are the week's MVP. Batch-make them on Sunday and pull from them three different ways: in a clear ginger broth, over rice with chili oil, or floating in a spicy miso ramen.",
         "base": {
             "title": "Pork & Shrimp Wontons",
             "ingredients": [
@@ -3362,7 +4174,7 @@ RECIPE_DB = [
                     "Add 12–15 wontons directly to the simmering broth. Cook 2–3 minutes until wrappers turn semi-transparent and wontons float.",
                     "Ladle into bowls. Finish with sliced green onions and a drizzle of chili oil.",
                 ],
-                "tip": "Cook wontons directly in the broth ] the starch from the wrappers gives the broth extra body.",
+                "tip": "Cook wontons directly in the broth. The starch from the wrappers gives the broth extra body.",
             },
             {
                 "name": "Wonton Rice Bowl",
@@ -3380,7 +4192,7 @@ RECIPE_DB = [
                     "Whisk together soy sauce, chili oil, sesame oil, and rice vinegar for the sauce.",
                     "Spoon rice into bowls, place wontons on top, and drizzle with sauce. Garnish with sesame seeds and green onions.",
                 ],
-                "tip": "The chili oil sauce also works cold [ this bowl is great packed for lunch the next day.",
+                "tip": "The chili oil sauce also works cold. This bowl is great packed for lunch the next day.",
             },
             {
                 "name": "Ramen Wonton Soup",
@@ -3409,7 +4221,7 @@ RECIPE_DB = [
         "_id": "dan-dan-noodles",
         "_keywords": ["dan dan", "noodles", "pork", "sichuan", "sesame", "chinese"],
         "image": "/static/images/dan-dan-noodles.jpg",
-        "intro": "One pork topping and one silky sesame-chili sauce ] cooked once on Sunday, eaten three completely different ways: tossed hot, chilled as a salad, or spooned over smashed cucumber for a no-noodle version.",
+        "intro": "One pork topping and one silky sesame-chili sauce. Cooked once on Sunday, eaten three completely different ways: tossed hot, chilled as a salad, or spooned over smashed cucumber for a no-noodle version.",
         "base": {
             "title": "Dan Dan Noodles",
             "ingredients": [
@@ -3456,7 +4268,7 @@ RECIPE_DB = [
                     "Add noodles, top with pork topping and blanched greens. Garnish with crushed peanuts and green onions.",
                     "Toss vigorously before eating so the sauce coats every strand.",
                 ],
-                "tip": "Sauce thickens in the fridge [ thin with 1–2 tbsp warm water before using if needed.",
+                "tip": "Sauce thickens in the fridge. Thin with 1–2 tbsp warm water before using if needed.",
             },
             {
                 "name": "Cold Dan Dan Noodle Salad",
@@ -3472,13 +4284,13 @@ RECIPE_DB = [
                     "Cook noodles, then rinse under cold running water until completely chilled.",
                     "Thin the sauce with 2–3 tbsp cold water. Toss noodles with sauce until well coated.",
                     "Top with cold pork, julienned cucumber, shredded cabbage, peanuts, and sesame seeds.",
-                    "Serve immediately or refrigerate up to 2 days ] keep sauce separate if making ahead.",
+                    "Serve immediately or refrigerate up to 2 days. Keep sauce separate if making ahead.",
                 ],
                 "tip": "Great packed for lunch: portion noodles into containers and keep sauce in a small jar on the side.",
             },
             {
                 "name": "Cucumber & Pork in Dan Dan Sauce",
-                "subtitle": "smashed cucumber with pork topping and dan dan sauce [ no noodles",
+                "subtitle": "smashed cucumber with pork topping and dan dan sauce. No noodles",
                 "extras": [
                     "2 English cucumbers",
                     "1/4 tsp salt",
@@ -3491,7 +4303,7 @@ RECIPE_DB = [
                     "Arrange cucumber in bowls. Spoon 3–4 tbsp dan dan sauce over the top.",
                     "Add a scoop of the warm pork topping. Finish with crushed peanuts, sesame seeds, and chili oil.",
                 ],
-                "tip": "The cucumber absorbs the sauce just like noodles ] a great low-carb swap that uses all the same flavors.",
+                "tip": "The cucumber absorbs the sauce just like noodles. A great low-carb swap that uses all the same flavors.",
             },
         ],
     },
@@ -3499,6 +4311,8 @@ RECIPE_DB = [
         "_id": "honey-soy-chicken",
         "_keywords": ["honey", "soy", "chicken", "wings", "chinese", "sesame"],
         "image": "/static/images/honey-soy-chicken.jpg",
+        "servings": 4,
+        "calories_per_serving": 350,
         "intro": "A soy-ginger marinade does the work overnight, and three rounds of honey glazing in the oven give you impossibly sticky, golden chicken - three side pairings, one marinade.",
         "base": {
             "title": "Chinese Honey Soy Chicken",
@@ -3544,7 +4358,7 @@ RECIPE_DB = [
                     "Mix soy sauce, sesame oil, and honey for a quick dipping sauce.",
                     "Plate rice in bowls, top with 4–5 wings. Scatter scallions and drizzle with dipping sauce.",
                 ],
-                "tip": "Make extra dipping sauce [ it doubles as a drizzle over rice or a dip for the green beans.",
+                "tip": "Make extra dipping sauce. It doubles as a drizzle over rice or a dip for the green beans.",
             },
             {
                 "name": "With Garlic Green Beans",
@@ -3563,7 +4377,7 @@ RECIPE_DB = [
                     "Add garlic, oyster sauce, soy sauce, and sugar. Toss vigorously 1 minute.",
                     "Serve the green beans alongside the glazed chicken.",
                 ],
-                "tip": "High heat is the key ] if the beans steam instead of blister, your pan isn't hot enough.",
+                "tip": "High heat is the key. If the beans steam instead of blister, your pan isn't hot enough.",
             },
             {
                 "name": "With Garlic Bok Choy",
@@ -3581,7 +4395,7 @@ RECIPE_DB = [
                     "Flip bok choy and cook 1–2 more minutes until just tender.",
                     "Plate rice, bok choy, and glazed chicken together.",
                 ],
-                "tip": "Sear the bok choy cut-side down without moving it [ you want a caramelized golden face before flipping.",
+                "tip": "Sear the bok choy cut-side down without moving it. You want a caramelized golden face before flipping.",
             },
         ],
     },
@@ -3590,7 +4404,7 @@ RECIPE_DB = [
         "_id": "cheesy-chicken-orzo",
         "_keywords": ["chicken", "orzo", "tomato", "mozzarella", "basil", "one-pot", "french"],
         "image": "/static/images/cheesy-chicken-orzo.jpg",
-        "intro": "One Dutch oven does everything ] chicken thighs braise right in a garlicky tomato sauce while orzo absorbs all the flavor, then a blanket of melted mozzarella and fresh basil finishes it.",
+        "intro": "One Dutch oven does everything. Chicken thighs braise right in a garlicky tomato sauce while orzo absorbs all the flavor, then a blanket of melted mozzarella and fresh basil finishes it.",
         "base": {
             "title": "One-Pot Cheesy Chicken & Orzo",
             "ingredients": [
@@ -3622,7 +4436,7 @@ RECIPE_DB = [
         "uses": [
             {
                 "name": "Cheesy Chicken Orzo Bowl",
-                "subtitle": "straight from the pot [ chicken, saucy orzo, melted mozzarella, basil",
+                "subtitle": "straight from the pot. Chicken, saucy orzo, melted mozzarella, basil",
                 "extras": [
                     "Extra fresh basil",
                     "Drizzle of good olive oil",
@@ -3633,7 +4447,7 @@ RECIPE_DB = [
                     "Tear a little extra mozzarella on top if you like, drizzle with olive oil.",
                     "Pass bread alongside.",
                 ],
-                "tip": "The orzo thickens as it sits ] add a splash of broth to loosen when reheating.",
+                "tip": "The orzo thickens as it sits. Add a splash of broth to loosen when reheating.",
             },
             {
                 "name": "Baked Stuffed Peppers",
@@ -3664,7 +4478,7 @@ RECIPE_DB = [
                     "Bring to a simmer, stirring to loosen the orzo into a soup consistency.",
                     "Ladle into bowls and top with Parmesan and parsley.",
                 ],
-                "tip": "This reheats beautifully as soup [ the orzo softens even more overnight.",
+                "tip": "This reheats beautifully as soup. The orzo softens even more overnight.",
             },
         ],
     },
@@ -3672,7 +4486,7 @@ RECIPE_DB = [
         "_id": "salade-nicoise",
         "_keywords": ["tuna", "eggs", "salad", "nicoise", "french", "olives", "cucumber", "lunch"],
         "image": "/static/images/salade-nicoise.jpg",
-        "intro": "A classic Provençal composed salad built on a Dijon vinaigrette ] jammy soft-boiled eggs, good-quality tuna, crisp vegetables, and briny olives that you can compose on a platter or toss in a bowl.",
+        "intro": "A classic Provençal composed salad built on a Dijon vinaigrette. Jammy soft-boiled eggs, good-quality tuna, crisp vegetables, and briny olives that you can compose on a platter or toss in a bowl.",
         "base": {
             "title": "Salade Niçoise",
             "ingredients": [
@@ -3703,7 +4517,7 @@ RECIPE_DB = [
         "uses": [
             {
                 "name": "Classic Composed Platter",
-                "subtitle": "arranged on a platter for sharing [ each component in its own section",
+                "subtitle": "arranged on a platter for sharing. Each component in its own section",
                 "extras": [
                     "Extra Dijon vinaigrette on the side",
                     "Crusty baguette slices",
@@ -3714,7 +4528,7 @@ RECIPE_DB = [
                     "Arrange each component in distinct sections across the greens.",
                     "Drizzle vinaigrette over everything and serve immediately with baguette.",
                 ],
-                "tip": "Keep all components separate until serving ] the salad holds perfectly prepped in the fridge for 2 days.",
+                "tip": "Keep all components separate until serving. The salad holds perfectly prepped in the fridge for 2 days.",
             },
             {
                 "name": "Pan Bagnat Sandwich",
@@ -3728,9 +4542,9 @@ RECIPE_DB = [
                     "Brush cut sides of rolls generously with Dijon vinaigrette.",
                     "Layer tuna, sliced egg, tomatoes, cucumber, olives, and capers.",
                     "Wrap tightly in plastic wrap and press under a heavy pan in the fridge for 30 minutes.",
-                    "Slice and serve [ the flavors meld beautifully.",
+                    "Slice and serve. The flavors meld beautifully.",
                 ],
-                "tip": "Pressing the sandwich is the key ] it lets the bread absorb all the vinaigrette.",
+                "tip": "Pressing the sandwich is the key. It lets the bread absorb all the vinaigrette.",
             },
             {
                 "name": "Niçoise Grain Bowl",
@@ -3745,7 +4559,7 @@ RECIPE_DB = [
                     "Arrange tuna, eggs, vegetables, and olives over the grains.",
                     "Drizzle generously with vinaigrette and a squeeze of lemon.",
                 ],
-                "tip": "Warm grains wilt the greens slightly [ add them last if you prefer them crisp.",
+                "tip": "Warm grains wilt the greens slightly. Add them last if you prefer them crisp.",
             },
         ],
     },
@@ -3753,7 +4567,7 @@ RECIPE_DB = [
         "_id": "french-lentil-soup",
         "_keywords": ["lentil", "soup", "french", "chicken", "thyme", "rosemary", "tomato", "dinner"],
         "image": "/static/images/french-lentil-soup.jpg",
-        "intro": "Green lentils simmer low and slow with chicken, crushed tomatoes, and a bouquet of Provençal herbs ] deeply savory and even better the next day, three ways to serve it through the week.",
+        "intro": "Green lentils simmer low and slow with chicken, crushed tomatoes, and a bouquet of Provençal herbs. Deeply savory and even better the next day, three ways to serve it through the week.",
         "base": {
             "title": "French Lentil Soup",
             "ingredients": [
@@ -3799,7 +4613,7 @@ RECIPE_DB = [
                     "Drizzle with olive oil and scatter fresh thyme over the top.",
                     "Serve with thick slices of crusty bread.",
                 ],
-                "tip": "The soup thickens overnight [ stir in a splash of broth when reheating.",
+                "tip": "The soup thickens overnight. Stir in a splash of broth when reheating.",
             },
             {
                 "name": "Lentil Stew over Rice",
@@ -3831,7 +4645,7 @@ RECIPE_DB = [
                     "Whisk olive oil, vinegar, and Dijon mustard. Toss with lentils and shallot.",
                     "Serve warm lentil mixture over greens.",
                 ],
-                "tip": "Save the remaining broth ] it's excellent as a base for another soup or to cook grains in.",
+                "tip": "Save the remaining broth. It's excellent as a base for another soup or to cook grains in.",
             },
         ],
     },
@@ -3853,7 +4667,7 @@ RECIPE_DB = [
             ],
             "steps": [
                 "Blend flour, eggs, milk, melted butter, salt, and nutmeg in a blender until completely smooth.",
-                "Rest the batter at least 30 minutes in the fridge (or overnight [ it improves the texture).",
+                "Rest the batter at least 30 minutes in the fridge (or overnight. It improves the texture).",
                 "Heat a 10-inch nonstick skillet over medium. Brush lightly with butter.",
                 "Pour about 1/4 cup batter and swirl immediately to coat the pan in a thin, even layer.",
                 "Cook 90 seconds until the edges lift and the bottom is golden. Flip and cook 30 seconds more.",
@@ -3863,7 +4677,7 @@ RECIPE_DB = [
         "uses": [
             {
                 "name": "Ham & Gruyère Crêpe",
-                "subtitle": "the classic crêpe complète ] ham, melted Gruyère, folded into quarters",
+                "subtitle": "the classic crêpe complète. Ham, melted Gruyère, folded into quarters",
                 "extras": [
                     "4 oz thinly sliced ham or prosciutto",
                     "1 cup Gruyère, grated",
@@ -3901,7 +4715,7 @@ RECIPE_DB = [
             },
             {
                 "name": "Smoked Salmon & Cream Cheese Crêpe",
-                "subtitle": "cream cheese and capers, topped with smoked salmon [ no heat needed",
+                "subtitle": "cream cheese and capers, topped with smoked salmon. No heat needed",
                 "extras": [
                     "4 oz smoked salmon",
                     "4 oz cream cheese, softened",
@@ -3915,7 +4729,7 @@ RECIPE_DB = [
                     "Layer smoked salmon, a few capers, dill, and red onion.",
                     "Roll or fold and serve immediately with a lemon wedge.",
                 ],
-                "tip": "These are best eaten cold or at room temperature ] no need to reheat.",
+                "tip": "These are best eaten cold or at room temperature. No need to reheat.",
             },
         ],
     },
@@ -3962,11 +4776,11 @@ RECIPE_DB = [
                     "Arrange on a plate and scatter extra fruit around.",
                     "Dust with powdered sugar and drizzle with extra chocolate sauce or honey.",
                 ],
-                "tip": "Warm the crêpes in a dry skillet 30 seconds before filling [ the Nutella spreads much easier.",
+                "tip": "Warm the crêpes in a dry skillet 30 seconds before filling. The Nutella spreads much easier.",
             },
             {
                 "name": "Lemon & Sugar",
-                "subtitle": "the simplest French crêpe ] warm crêpe, lemon juice, and crunchy sugar",
+                "subtitle": "the simplest French crêpe. Warm crêpe, lemon juice, and crunchy sugar",
                 "extras": [
                     "1 lemon, halved",
                     "4 tbsp granulated or caster sugar",
@@ -3978,7 +4792,7 @@ RECIPE_DB = [
                     "Sprinkle a tablespoon of sugar, then fold into quarters.",
                     "Serve immediately while the sugar is still slightly crunchy.",
                 ],
-                "tip": "Use caster sugar if you have it [ it dissolves faster and gives a cleaner finish.",
+                "tip": "Use caster sugar if you have it. It dissolves faster and gives a cleaner finish.",
             },
             {
                 "name": "Berry Compote & Whipped Cream",
@@ -4004,7 +4818,7 @@ RECIPE_DB = [
         "_id": "korean-beef-bowls",
         "_keywords": ["korean", "beef", "bulgogi", "rice", "slaw", "sesame", "gochujang", "meal prep"],
         "image": "/static/images/korean-beef-bowls.jpg",
-        "intro": "Sticky-sweet bulgogi-style beef grilled until charred, packed over jasmine rice with a crunchy sesame-ginger slaw ] four containers ready to go for the week.",
+        "intro": "Sticky-sweet bulgogi-style beef grilled until charred, packed over jasmine rice with a crunchy sesame-ginger slaw. Four containers ready to go for the week.",
         "base": {
             "title": "Korean Beef Meal Prep Bowls",
             "ingredients": [
@@ -4055,7 +4869,7 @@ RECIPE_DB = [
                 "steps": [
                     "Spoon rice and beef into each lettuce cup.",
                     "Add sliced cucumber and a drizzle of hoisin or gochujang.",
-                    "Eat immediately [ these don't keep well once assembled.",
+                    "Eat immediately. These don't keep well once assembled.",
                 ],
                 "tip": "Chill the lettuce leaves in ice water for 10 minutes for extra crunch.",
             },
@@ -4068,7 +4882,7 @@ RECIPE_DB = [
                     "Fry an egg in sesame oil, leaving the yolk runny.",
                     "Lay egg on top and drizzle with soy sauce. Break the yolk and toss everything together.",
                 ],
-                "tip": "The runny yolk acts as a sauce ] don't skip it.",
+                "tip": "The runny yolk acts as a sauce. Don't skip it.",
             },
         ],
     },
@@ -4076,7 +4890,7 @@ RECIPE_DB = [
         "_id": "kimchi-fried-rice",
         "_keywords": ["kimchi", "fried rice", "korean", "egg", "sesame", "lunch", "probiotics"],
         "image": "/static/images/kimchi-fried-rice.jpg",
-        "intro": "Bold, fermented, and satisfying [ day-old rice stir-fried with kimchi and garlic, crowned with a runny egg. The kimchi does all the seasoning work; everything else takes five minutes.",
+        "intro": "Bold, fermented, and satisfying. Day-old rice stir-fried with kimchi and garlic, crowned with a runny egg. The kimchi does all the seasoning work; everything else takes five minutes.",
         "base": {
             "title": "Kimchi Fried Rice",
             "ingredients": [
@@ -4112,7 +4926,7 @@ RECIPE_DB = [
                     "Fry an egg alongside, leaving the yolk runny.",
                     "Plate rice, top with egg, and scatter sesame seeds and scallions.",
                 ],
-                "tip": "High heat is essential ] a hot pan gives you the crispy bottom that makes this dish.",
+                "tip": "High heat is essential. A hot pan gives you the crispy bottom that makes this dish.",
             },
             {
                 "name": "Kimchi Rice with Crispy Tofu",
@@ -4123,7 +4937,7 @@ RECIPE_DB = [
                     "Pan-fry in a little oil over medium-high until golden and crispy on all sides.",
                     "Reheat kimchi rice and top with crispy tofu and a soft-boiled egg.",
                 ],
-                "tip": "Press tofu for at least 20 minutes [ the drier it is, the crispier it gets.",
+                "tip": "Press tofu for at least 20 minutes. The drier it is, the crispier it gets.",
             },
             {
                 "name": "Kimchi Rice with Chicken",
@@ -4134,7 +4948,7 @@ RECIPE_DB = [
                     "Grill or pan-sear over medium-high 5 minutes per side. Rest and slice.",
                     "Reheat kimchi fried rice and top with sliced chicken.",
                 ],
-                "tip": "Use thighs ] they stay juicy and don't dry out when reheated with the rice.",
+                "tip": "Use thighs. They stay juicy and don't dry out when reheated with the rice.",
             },
         ],
     },
@@ -4192,7 +5006,7 @@ RECIPE_DB = [
                     "Top noodles with shrimp, vegetables, and sliced cucumber.",
                     "Drizzle with soy sauce and rice vinegar. Toss to combine.",
                 ],
-                "tip": "Cold noodles keep better for meal prep ] toss with sesame oil to prevent sticking.",
+                "tip": "Cold noodles keep better for meal prep. Toss with sesame oil to prevent sticking.",
             },
             {
                 "name": "Shrimp Lettuce Cups",
@@ -4209,73 +5023,79 @@ RECIPE_DB = [
     },
     {
         "_id": "korean-chicken-bowls",
-        "_keywords": ["korean", "chicken", "gochujang", "sesame", "rice", "meal prep", "bowls"],
+        "_keywords": ["korean", "chicken", "sesame", "slaw", "rice", "meal prep", "bowls", "honey", "ginger"],
         "image": "/static/images/korean-chicken-bowls.jpg",
-        "intro": "Gochujang-glazed chicken thighs roasted until sticky and caramelized, sliced over rice with quick-pickled cucumbers and a sesame drizzle - four meal prep boxes done in 35 minutes.",
+        "servings": 4,
+        "calories_per_serving": 520,
+        "prep_tasks": ["Rice", "Sesame slaw", "Chicken"],
+        "intro": "Soy-honey-sesame marinated chicken thighs over jasmine rice with a crisp sesame coleslaw. Prep the rice, slaw, and chicken once and you have four lunch boxes ready for the week.",
         "base": {
             "title": "Korean Chicken Meal Prep Bowls",
             "ingredients": [
-                "1.5 lbs boneless, skinless chicken thighs",
-                "[ Sauce ]",
-                "3 tbsp gochujang",
-                "2 tbsp soy sauce",
+                "[ Chicken marinade ]",
+                "8 boneless skinless chicken thighs",
+                "¼ cup low-sodium soy sauce",
+                "2 tbsp honey",
                 "1 tbsp sesame oil",
-                "1 tbsp honey",
-                "1 tbsp rice vinegar",
-                "3 cloves garlic, minced",
-                "1 tsp fresh ginger, grated",
-                "[ Quick Pickled Cucumber ]",
-                "1 English cucumber, thinly sliced",
+                "4 cloves garlic, minced",
+                "1 tbsp fresh ginger, grated",
+                "1 tbsp sesame seeds",
+                "[ Sesame slaw ]",
+                "1 bag coleslaw mix",
+                "2 tbsp low-sodium soy sauce",
                 "2 tbsp rice vinegar",
-                "1 tsp sugar",
-                "1/2 tsp salt",
-                "1/2 tsp sesame oil",
-                "[ To serve ]",
-                "3 cups jasmine rice, cooked",
-                "Sesame seeds, scallions, Sriracha",
+                "1 tbsp honey",
+                "1 tbsp sesame oil",
+                "1 tsp ground ginger",
+                "[ Rice ]",
+                "1 cup jasmine rice",
+                "1¼ cups water",
+                "1 tsp butter",
+                "Pinch of salt",
             ],
             "steps": [
-                "Whisk sauce ingredients. Reserve 2 tbsp for drizzling. Toss chicken with remaining sauce.",
-                "Make pickled cucumber: toss sliced cucumber with rice vinegar, sugar, salt, and sesame oil. Refrigerate while chicken cooks.",
-                "Heat a skillet or grill pan over medium-high. Cook chicken 5–6 minutes per side until cooked through and nicely caramelized.",
-                "Rest 5 minutes, then slice against the grain.",
-                "Divide rice into 4 containers. Top with sliced chicken, pickled cucumbers, and a drizzle of reserved sauce.",
-                "Finish with sesame seeds and scallions.",
+                "Cook rice: combine rice, water, butter, and salt in a pot. Bring to a boil, reduce to low, cover and cook 15 min. Fluff and cool.",
+                "Make sesame slaw dressing: whisk soy sauce, rice vinegar, honey, sesame oil, and ginger. Toss with coleslaw mix. Refrigerate.",
+                "Marinate chicken: whisk soy sauce, honey, sesame oil, garlic, ginger, and sesame seeds. Add chicken and marinate at least 15 min.",
+                "Cook chicken in the oven at 400°F for 20–25 min, on the stovetop 5–6 min per side, or on the grill until cooked through.",
+                "Rest 5 min then slice or chop.",
+                "Divide rice into 4 containers. Top with chicken and sesame slaw. Store dressing separately if preferred.",
             ],
         },
         "uses": [
             {
-                "name": "Korean Chicken Rice Bowl",
-                "subtitle": "sliced gochujang chicken over rice with pickled cucumber and sesame",
-                "extras": ["Reserved gochujang sauce", "Sesame seeds", "Sliced scallions", "Fried egg (optional)"],
+                "name": "Classic Korean Bowl",
+                "subtitle": "rice, sliced chicken, and sesame slaw with extra sesame seeds",
+                "extras": ["Extra sesame seeds", "Sliced scallions", "Sriracha (optional)"],
                 "steps": [
-                    "Reheat chicken and rice in the microwave 90 seconds.",
-                    "Add pickled cucumbers cold on top.",
-                    "Drizzle with reserved sauce, scatter sesame seeds and scallions.",
+                    "Meal prep: cook the rice, make the sesame slaw, and marinate and cook the chicken.",
+                    "Divide into 4 containers: rice base, sliced chicken on top, sesame slaw on the side.",
+                    "To serve: reheat chicken and rice covered with a damp paper towel for 1–2 min. Add cold slaw on top.",
                 ],
-                "tip": "Add a fried egg on top [ the yolk makes an extra sauce.",
+                "tip": "Store the slaw separately from the rice and chicken so it stays crisp. Add it cold on top after reheating.",
             },
             {
-                "name": "Chicken Bibimbap-Style",
-                "subtitle": "rice topped with chicken, cucumber, spinach, and a fried egg with gochujang",
-                "extras": ["2 cups baby spinach, wilted", "1 egg per bowl", "Extra gochujang", "Sesame oil drizzle"],
+                "name": "Slaw Salad Bowl",
+                "subtitle": "skip the rice, double the slaw for a lighter low-carb bowl",
+                "extras": ["Extra coleslaw mix", "Extra sesame slaw dressing", "Sesame seeds", "Sliced avocado"],
                 "steps": [
-                    "Wilt spinach in a hot pan with a splash of sesame oil and a pinch of salt.",
-                    "Place rice in bowls. Arrange chicken, cucumber, and spinach in sections.",
-                    "Top with a fried egg and a generous spoonful of gochujang. Mix everything at the table.",
+                    "Meal prep: make a double batch of sesame slaw and marinate and cook the chicken. Skip the rice.",
+                    "Divide into 4 containers: generous pile of sesame slaw, sliced chicken on top.",
+                    "To serve: eat cold or reheat just the chicken. Add avocado slices before eating.",
                 ],
-                "tip": "Real bibimbap is all about mixing ] the gochujang should coat every grain of rice.",
+                "tip": "This version travels better cold. The slaw holds up without getting soggy for up to 3 days.",
             },
             {
-                "name": "Chicken & Veggie Stir-Fry",
-                "subtitle": "slice the chicken and toss with wok-fried broccoli and snap peas",
-                "extras": ["1 head broccoli, cut into florets", "1 cup snap peas", "1 tbsp soy sauce", "1 tsp sesame oil", "Steamed rice"],
+                "name": "Korean Chicken Fried Rice",
+                "subtitle": "use the prepped rice to make a quick fried rice with the chicken",
+                "extras": ["2 eggs", "1 tbsp soy sauce", "1 tsp sesame oil", "2 scallions, sliced", "Sesame seeds"],
                 "steps": [
-                    "Stir-fry broccoli and snap peas in a hot wok with sesame oil and soy sauce, 3–4 minutes.",
-                    "Add sliced pre-cooked chicken and toss to heat through.",
-                    "Serve over fresh rice with extra gochujang sauce.",
+                    "Meal prep: cook the rice a day ahead (cold rice fries best), marinate and cook the chicken.",
+                    "To cook: heat oil in a wok or large pan over high. Add cold rice and press flat, cook 2 min undisturbed.",
+                    "Push rice to the side. Scramble 2 eggs in the empty space. Add chicken, soy sauce, and sesame oil. Toss everything together.",
+                    "Top with scallions and sesame seeds.",
                 ],
-                "tip": "The chicken is already cooked, so it just needs to warm up [ 1 minute max in the wok.",
+                "tip": "Day-old rice is essential for fried rice. Freshly cooked rice is too wet and steams instead of frying.",
             },
         ],
     },
@@ -4283,7 +5103,7 @@ RECIPE_DB = [
         "_id": "korean-spicy-tofu",
         "_keywords": ["tofu", "korean", "gochujang", "spicy", "mapo", "dinner", "vegetarian"],
         "image": "/static/images/korean-spicy-tofu.jpg",
-        "intro": "Silken tofu cubes braised in a bold gochujang sauce with ground pork, bell peppers, and scallions ] a Korean-style Dubu Jorim that's deeply savory, spicy, and ready in 20 minutes.",
+        "intro": "Silken tofu cubes braised in a bold gochujang sauce with ground pork, bell peppers, and scallions. A Korean-style Dubu Jorim that's deeply savory, spicy, and ready in 20 minutes.",
         "base": {
             "title": "Korean Spicy Braised Tofu",
             "ingredients": [
@@ -4317,14 +5137,14 @@ RECIPE_DB = [
         "uses": [
             {
                 "name": "Over Steamed Rice",
-                "subtitle": "the classic way [ spooned over jasmine rice to soak up the spicy sauce",
+                "subtitle": "the classic way. Spooned over jasmine rice to soak up the spicy sauce",
                 "extras": ["2 cups jasmine rice, steamed", "Extra scallions", "Sesame seeds", "Fried egg (optional)"],
                 "steps": [
                     "Serve the braised tofu directly over steamed rice.",
                     "Top with scallion greens and sesame seeds.",
-                    "Add a fried egg if you want extra protein ] break the yolk into the sauce.",
+                    "Add a fried egg if you want extra protein. Break the yolk into the sauce.",
                 ],
-                "tip": "The sauce is the star [ make sure your rice is hot so it absorbs every drop.",
+                "tip": "The sauce is the star. Make sure your rice is hot so it absorbs every drop.",
             },
             {
                 "name": "Tofu Rice Bowl with Kimchi",
@@ -4354,7 +5174,7 @@ RECIPE_DB = [
         "_id": "greek-meatball-bowls",
         "_keywords": ["meatball", "greek", "beef", "pita", "hummus", "tzatziki", "meal prep"],
         "image": "/static/images/greek-meatball-bowls.jpg",
-        "intro": "Herby beef meatballs over turmeric rice with pita, hummus, tzatziki, cherry tomatoes, and pickled onions ] Greek-style meal prep that reheats beautifully all week.",
+        "intro": "Herby beef meatballs over turmeric rice with pita, hummus, tzatziki, cherry tomatoes, and pickled onions. Greek-style meal prep that reheats beautifully all week.",
         "base": {
             "title": "Greek Meatball Bowls",
             "ingredients": [
@@ -4383,7 +5203,7 @@ RECIPE_DB = [
                 "Fresh dill and parsley",
             ],
             "steps": [
-                "Preheat oven to 400°F. Mix all meatball ingredients together until just combined [ don't over-mix.",
+                "Preheat oven to 400°F. Mix all meatball ingredients together until just combined. Don't over-mix.",
                 "Roll into 1.5-inch balls (about 24 total). Place on a lined baking sheet.",
                 "Bake 18–20 minutes until browned and cooked through.",
                 "Cook rice with turmeric, cumin, and salt according to package directions.",
@@ -4394,7 +5214,7 @@ RECIPE_DB = [
         "uses": [
             {
                 "name": "Greek Meatball Bowl",
-                "subtitle": "the classic prep ] turmeric rice, hummus, tzatziki, and pita all in one",
+                "subtitle": "the classic prep. Turmeric rice, hummus, tzatziki, and pita all in one",
                 "extras": ["Warm pita", "Extra tzatziki", "Fresh dill", "Lemon wedge"],
                 "steps": [
                     "Reheat rice and meatballs.",
@@ -4423,7 +5243,7 @@ RECIPE_DB = [
                     "Top with warm meatballs and crumbled feta.",
                     "Scatter pita chips over the top for crunch.",
                 ],
-                "tip": "Cold leftover meatballs straight from the fridge actually work great here [ no reheating needed.",
+                "tip": "Cold leftover meatballs straight from the fridge actually work great here. No reheating needed.",
             },
         ],
     },
@@ -4431,7 +5251,7 @@ RECIPE_DB = [
         "_id": "greek-chicken-bowl",
         "_keywords": ["chicken", "greek", "quinoa", "feta", "olives", "cucumber", "salad", "bowl"],
         "image": "/static/images/greek-chicken-bowl.jpg",
-        "intro": "Marinated grilled chicken over fluffy quinoa with a bright Greek salad of tomatoes, cucumber, olives, and feta ] a clean, protein-packed bowl you'll want on repeat.",
+        "intro": "Marinated grilled chicken over fluffy quinoa with a bright Greek salad of tomatoes, cucumber, olives, and feta. A clean, protein-packed bowl you'll want on repeat.",
         "base": {
             "title": "Greek Chicken Bowl",
             "ingredients": [
@@ -4476,7 +5296,7 @@ RECIPE_DB = [
                     "Layer quinoa, sliced chicken, and Greek salad.",
                     "Top with extra feta, fresh oregano, a squeeze of lemon, and a spoonful of tzatziki.",
                 ],
-                "tip": "The salad gets better after a day in the fridge [ the vinegar softens the onion and deepens the flavors.",
+                "tip": "The salad gets better after a day in the fridge. The vinegar softens the onion and deepens the flavors.",
             },
             {
                 "name": "Greek Chicken Wrap",
@@ -4498,7 +5318,7 @@ RECIPE_DB = [
                     "Add sliced chicken, Greek salad, and extra olives.",
                     "Serve tzatziki on the side with pita chips for dipping.",
                 ],
-                "tip": "This is the version to make when you want something lighter ] all the flavor, no grain.",
+                "tip": "This is the version to make when you want something lighter. All the flavor, no grain.",
             },
         ],
     },
@@ -4547,7 +5367,7 @@ RECIPE_DB = [
         "uses": [
             {
                 "name": "Lamb Rice Bowl",
-                "subtitle": "the full bowl [ turmeric rice, lamb, hummus, and all the toppings",
+                "subtitle": "the full bowl. Turmeric rice, lamb, hummus, and all the toppings",
                 "extras": ["Tzatziki", "Pickled red onion", "Extra feta", "Lemon wedge", "Fresh mint"],
                 "steps": [
                     "Reheat lamb and rice.",
@@ -4565,7 +5385,7 @@ RECIPE_DB = [
                     "Stuff with warm lamb, shredded lettuce, tomato, and feta.",
                     "Spoon tzatziki generously inside.",
                 ],
-                "tip": "Line the pita with a smear of hummus before adding the lamb ] it keeps the pita from getting soggy.",
+                "tip": "Line the pita with a smear of hummus before adding the lamb. It keeps the pita from getting soggy.",
             },
             {
                 "name": "Lamb over Orzo Salad",
@@ -4576,7 +5396,7 @@ RECIPE_DB = [
                     "Fold in diced cucumber, halved cherry tomatoes, olives, and feta.",
                     "Serve warm lamb over the orzo salad.",
                 ],
-                "tip": "The orzo salad is also great cold [ make it ahead and the flavors meld overnight.",
+                "tip": "The orzo salad is also great cold. Make it ahead and the flavors meld overnight.",
             },
         ],
     },
@@ -4584,7 +5404,7 @@ RECIPE_DB = [
         "_id": "greek-breakfast-bowl",
         "_keywords": ["greek", "breakfast", "bowl", "eggs", "feta", "cucumber", "olives", "crackers", "cottage cheese", "mediterranean"],
         "image": "/static/images/greek-breakfast-bowl.jpg",
-        "intro": "A fresh, protein-packed Mediterranean breakfast bowl with soft-boiled eggs, Greek salad veggies, feta, olives, and crackers ] meal-prepped in 20 minutes and ready all week.",
+        "intro": "A fresh, protein-packed Mediterranean breakfast bowl with soft-boiled eggs, Greek salad veggies, feta, olives, and crackers. Meal-prepped in 20 minutes and ready all week.",
         "base": {
             "title": "Greek Breakfast Bowl",
             "ingredients": [
@@ -4626,7 +5446,7 @@ RECIPE_DB = [
             },
             {
                 "name": "Greek Cottage Cheese Bowl",
-                "subtitle": "cottage cheese base instead of arugula [ higher protein, creamier texture",
+                "subtitle": "cottage cheese base instead of arugula. Higher protein, creamier texture",
                 "extras": ["3/4 cup cottage cheese", "1 tsp olive oil", "Everything bagel seasoning", "Cherry tomatoes", "Cucumber", "Kalamata olives"],
                 "steps": [
                     "Spoon cottage cheese into a bowl and drizzle with olive oil.",
@@ -4634,7 +5454,7 @@ RECIPE_DB = [
                     "Sprinkle with everything bagel seasoning and fresh pepper.",
                     "Add a halved soft-boiled egg on top.",
                 ],
-                "tip": "Full-fat cottage cheese gives a much creamier result than low-fat ] worth it here.",
+                "tip": "Full-fat cottage cheese gives a much creamier result than low-fat. Worth it here.",
             },
             {
                 "name": "Open-Face Breakfast Flatbread",
@@ -4654,7 +5474,7 @@ RECIPE_DB = [
         "_id": "greek-scrambled-eggs",
         "_keywords": ["eggs", "scrambled", "greek", "feta", "tomatoes", "spinach", "mediterranean", "breakfast"],
         "image": "/static/images/greek-scrambled-eggs.jpg",
-        "intro": "Soft, creamy scrambled eggs loaded with cherry tomatoes, wilted spinach, and tangy feta [ a Mediterranean breakfast that comes together in under 10 minutes.",
+        "intro": "Soft, creamy scrambled eggs loaded with cherry tomatoes, wilted spinach, and tangy feta. A Mediterranean breakfast that comes together in under 10 minutes.",
         "base": {
             "title": "Greek Scrambled Eggs",
             "ingredients": [
@@ -4673,7 +5493,7 @@ RECIPE_DB = [
                 "Whisk eggs with milk, a pinch of salt, and pepper.",
                 "Heat olive oil in a non-stick skillet over medium. Add cherry tomatoes and cook 2 minutes until they start to blister.",
                 "Add spinach and stir until just wilted, about 1 minute.",
-                "Lower heat to medium-low. Pour in eggs and gently fold with a spatula ] pull from the edges toward the center. Cook until just set but still glossy.",
+                "Lower heat to medium-low. Pour in eggs and gently fold with a spatula. Pull from the edges toward the center. Cook until just set but still glossy.",
                 "Remove from heat and fold in feta and scallions. Finish with fresh parsley and a pinch of oregano.",
             ],
         },
@@ -4686,7 +5506,7 @@ RECIPE_DB = [
                     "Toast bread while eggs cook.",
                     "Plate eggs alongside toast with an extra crumble of feta and a squeeze of lemon.",
                 ],
-                "tip": "Pull the eggs off heat 10 seconds before they look done [ residual heat finishes them perfectly.",
+                "tip": "Pull the eggs off heat 10 seconds before they look done. Residual heat finishes them perfectly.",
             },
             {
                 "name": "Scrambled Egg Pita",
@@ -4697,18 +5517,18 @@ RECIPE_DB = [
                     "Spread hummus inside each pita, then a layer of spinach.",
                     "Stuff with warm scrambled eggs, sliced cucumber, and a drizzle of tzatziki.",
                 ],
-                "tip": "Pack the eggs and pita separately if making ahead ] stuff right before eating so the pita stays crisp.",
+                "tip": "Pack the eggs and pita separately if making ahead. Stuff right before eating so the pita stays crisp.",
             },
             {
                 "name": "Over Arugula",
-                "subtitle": "serve warm eggs over peppery arugula [ a breakfast salad",
+                "subtitle": "serve warm eggs over peppery arugula. A breakfast salad",
                 "extras": ["2 cups arugula", "1 tsp olive oil", "Lemon juice", "Kalamata olives", "Pita chips"],
                 "steps": [
                     "Dress arugula with olive oil, lemon juice, and a pinch of salt.",
-                    "Spoon warm eggs over the arugula ] the heat wilts the edges slightly.",
+                    "Spoon warm eggs over the arugula. The heat wilts the edges slightly.",
                     "Top with olives and pita chips for crunch.",
                 ],
-                "tip": "The warm eggs act as the dressing here [ don't over-dress the arugula.",
+                "tip": "The warm eggs act as the dressing here. Don't over-dress the arugula.",
             },
         ],
     },
@@ -4716,7 +5536,7 @@ RECIPE_DB = [
         "_id": "greek-egg-bites",
         "_keywords": ["eggs", "egg bites", "muffins", "greek", "feta", "spinach", "red pepper", "meal prep", "breakfast"],
         "image": "/static/images/greek-egg-bites.jpg",
-        "intro": "Greek-style egg muffins baked in a muffin pan with feta, red peppers, and spinach ] grab two from the fridge every morning and breakfast is done.",
+        "intro": "Greek-style egg muffins baked in a muffin pan with feta, red peppers, and spinach. Grab two from the fridge every morning and breakfast is done.",
         "base": {
             "title": "Greek Egg Bites",
             "ingredients": [
@@ -4750,7 +5570,7 @@ RECIPE_DB = [
                     "Microwave 2 egg bites for 30–45 seconds.",
                     "Serve alongside toast with sliced avocado and a sprinkle of everything bagel seasoning.",
                 ],
-                "tip": "Make a double batch and freeze half [ they reheat from frozen in 60 seconds.",
+                "tip": "Make a double batch and freeze half. They reheat from frozen in 60 seconds.",
             },
             {
                 "name": "Egg Bite Plate with Greek Salad",
@@ -4761,7 +5581,7 @@ RECIPE_DB = [
                     "Plate 3 egg bites alongside the salad.",
                     "Serve with pita or crackers.",
                 ],
-                "tip": "This works as a light lunch too ] just add an extra egg bite.",
+                "tip": "This works as a light lunch too. Just add an extra egg bite.",
             },
             {
                 "name": "Egg Bite Breakfast Box",
@@ -4770,7 +5590,7 @@ RECIPE_DB = [
                 "steps": [
                     "Pack 2–3 egg bites in a container.",
                     "Add a small jar of Greek yogurt drizzled with honey, a handful of berries, and almonds.",
-                    "Refrigerate [ grab the whole box in the morning.",
+                    "Refrigerate. Grab the whole box in the morning.",
                 ],
                 "tip": "This is a full macro-balanced breakfast (protein, fat, carbs) in one box.",
             },
@@ -4780,7 +5600,9 @@ RECIPE_DB = [
         "_id": "shakshuka",
         "_keywords": ["eggs", "shakshuka", "tomato", "mediterranean", "breakfast", "peppers", "spiced", "pita"],
         "image": "/static/images/shakshuka.jpg",
-        "intro": "Eggs poached directly in a bold, spiced tomato and pepper sauce ] serve it straight from the skillet with pita bread to scoop up every drop.",
+        "servings": 6,
+        "calories_per_serving": 362,
+        "intro": "Eggs poached directly in a bold, spiced tomato and pepper sauce. Serve it straight from the skillet with pita bread to scoop up every drop.",
         "base": {
             "title": "Shakshuka",
             "ingredients": [
@@ -4810,14 +5632,14 @@ RECIPE_DB = [
         "uses": [
             {
                 "name": "Classic with Pita",
-                "subtitle": "straight from the skillet [ eggs in spiced tomato sauce with pita to scoop",
+                "subtitle": "straight from the skillet. Eggs in spiced tomato sauce with pita to scoop",
                 "extras": ["4 pitas, warmed", "Extra chili flakes", "Fresh parsley or cilantro", "Crumbled feta (optional)"],
                 "steps": [
                     "Warm pita in a dry skillet or in the oven.",
                     "Serve shakshuka directly from the pan at the table.",
                     "Crumble feta on top and scatter fresh herbs. Eat with pita to scoop.",
                 ],
-                "tip": "The sauce keeps well ] make a big batch and just poach fresh eggs in it each morning.",
+                "tip": "The sauce keeps well. Make a big batch and just poach fresh eggs in it each morning.",
             },
             {
                 "name": "Green Shakshuka",
@@ -4825,11 +5647,11 @@ RECIPE_DB = [
                 "extras": ["2 cups baby spinach", "1 zucchini, grated", "1/2 cup fresh herbs (parsley, cilantro, dill)", "1/2 cup feta", "Greek yogurt dollop"],
                 "steps": [
                     "Sauté onion and garlic. Add grated zucchini and cook 3 minutes.",
-                    "Add spinach and herbs [ stir until wilted. Season with salt, cumin, and chili flakes.",
+                    "Add spinach and herbs. Stir until wilted. Season with salt, cumin, and chili flakes.",
                     "Make wells and crack in eggs. Cover and cook until whites are set.",
                     "Top with crumbled feta and a dollop of Greek yogurt.",
                 ],
-                "tip": "This version is lighter and brighter ] good if you want something less tomato-heavy.",
+                "tip": "This version is lighter and brighter. Good if you want something less tomato-heavy.",
             },
             {
                 "name": "Shakshuka Toast",
@@ -4840,7 +5662,7 @@ RECIPE_DB = [
                     "Spoon a generous amount of the shakshuka sauce (without eggs) over each slice.",
                     "Top with a poached or fried egg, crumbled feta, chili flakes, and basil.",
                 ],
-                "tip": "This is a great way to use leftover sauce [ just make fresh eggs each day.",
+                "tip": "This is a great way to use leftover sauce. Just make fresh eggs each day.",
             },
         ],
     },
@@ -4848,7 +5670,7 @@ RECIPE_DB = [
         "_id": "turkish-eggs",
         "_keywords": ["eggs", "turkish", "yogurt", "cilbir", "butter", "chili", "mediterranean", "breakfast"],
         "image": "/static/images/turkish-eggs.jpg",
-        "intro": "Silky poached eggs over cool garlicky yogurt, finished with a pool of chili-paprika butter ] Turkish Çılbır that looks impressive but takes about 10 minutes.",
+        "intro": "Silky poached eggs over cool garlicky yogurt, finished with a pool of chili-paprika butter. Turkish Çılbır that looks impressive but takes about 10 minutes.",
         "base": {
             "title": "Turkish Eggs (Çılbır)",
             "ingredients": [
@@ -4871,7 +5693,7 @@ RECIPE_DB = [
                 "Mix yogurt with garlic, lemon juice, and salt. Let it come to room temperature (cold yogurt will cool the eggs too fast).",
                 "Bring a wide saucepan of water to a gentle simmer. Add a splash of white vinegar. Crack eggs into individual cups.",
                 "Create a gentle whirlpool and slide eggs in one at a time. Poach 3 minutes for runny yolks, 4 for jammy. Remove with a slotted spoon and drain.",
-                "In a small pan, melt butter over medium heat until foamy. Add Aleppo pepper and mint [ it will sizzle immediately. Remove from heat.",
+                "In a small pan, melt butter over medium heat until foamy. Add Aleppo pepper and mint. It will sizzle immediately. Remove from heat.",
                 "Spoon yogurt onto plates, spreading into a nest. Lay poached eggs on top. Pour chili butter over everything. Finish with parsley and walnuts.",
             ],
         },
@@ -4885,11 +5707,11 @@ RECIPE_DB = [
                     "Pour chili butter over the top and finish with fresh dill and extra Aleppo.",
                     "Serve with toast for dipping into the runny yolk and yogurt.",
                 ],
-                "tip": "Room-temperature yogurt is the most important detail ] it makes the whole dish taste silkier.",
+                "tip": "Room-temperature yogurt is the most important detail. It makes the whole dish taste silkier.",
             },
             {
                 "name": "With Soft-Boiled Eggs",
-                "subtitle": "swap the poach for soft-boiled [ easier for meal prep",
+                "subtitle": "swap the poach for soft-boiled. Easier for meal prep",
                 "extras": ["4 soft-boiled eggs (7 min)", "Pita chips or crackers", "Fresh parsley", "Sumac"],
                 "steps": [
                     "Soft-boil eggs: 7 minutes in boiling water, then ice bath. Peel and halve.",
@@ -4897,7 +5719,7 @@ RECIPE_DB = [
                     "Drizzle with chili butter, scatter parsley and a pinch of sumac.",
                     "Serve with pita chips.",
                 ],
-                "tip": "Soft-boiled eggs keep in the fridge for 5 days unpeeled ] faster than poaching each morning.",
+                "tip": "Soft-boiled eggs keep in the fridge for 5 days unpeeled. Faster than poaching each morning.",
             },
             {
                 "name": "Turkish Egg Bowl",
@@ -4908,7 +5730,7 @@ RECIPE_DB = [
                     "Build bowl: farro, cucumber, roasted tomatoes, then a generous scoop of garlic yogurt.",
                     "Add poached or soft-boiled eggs, drizzle with chili butter.",
                 ],
-                "tip": "This turns breakfast into a proper brunch bowl [ great for a lazy weekend morning.",
+                "tip": "This turns breakfast into a proper brunch bowl. Great for a lazy weekend morning.",
             },
         ],
     },
@@ -4916,7 +5738,7 @@ RECIPE_DB = [
         "_id": "ground-turkey-pita",
         "_keywords": ["turkey", "pita", "mediterranean", "greek", "tzatziki", "feta", "lunch", "wrap"],
         "image": "/static/images/ground-turkey-pita.jpg",
-        "intro": "Spiced ground turkey seasoned with cumin, oregano, and garlic, stuffed into whole wheat pita with feta, cucumber, and creamy tzatziki ] a quick Mediterranean lunch that meal preps in 20 minutes.",
+        "intro": "Spiced ground turkey seasoned with cumin, oregano, and garlic, stuffed into whole wheat pita with feta, cucumber, and creamy tzatziki. A quick Mediterranean lunch that meal preps in 20 minutes.",
         "base": {
             "title": "Ground Turkey Pita Pockets",
             "ingredients": [
@@ -4961,18 +5783,18 @@ RECIPE_DB = [
                     "Warm pita and fill with spinach, turkey, cucumber, tomatoes, and feta.",
                     "Drizzle generously with tzatziki. Add olives and a squeeze of lemon.",
                 ],
-                "tip": "Pack pitas and filling separately for meal prep [ stuff right before eating to keep the pita from getting soggy.",
+                "tip": "Pack pitas and filling separately for meal prep. Stuff right before eating to keep the pita from getting soggy.",
             },
             {
                 "name": "Turkey Pita Bowl",
-                "subtitle": "deconstructed ] serve everything over a grain base for a heartier meal",
+                "subtitle": "deconstructed. Serve everything over a grain base for a heartier meal",
                 "extras": ["1.5 cups cooked quinoa or rice", "Hummus", "Pickled red onion", "Pita chips"],
                 "steps": [
                     "Build a bowl with quinoa as the base.",
                     "Add turkey filling, cucumber, tomatoes, and a scoop of hummus.",
                     "Drizzle tzatziki over everything. Top with pickled onion and crumbled feta. Serve with pita chips.",
                 ],
-                "tip": "The hummus and tzatziki together make the bowl taste extra rich [ don't skip either.",
+                "tip": "The hummus and tzatziki together make the bowl taste extra rich. Don't skip either.",
             },
             {
                 "name": "Turkey Flatbread",
@@ -4983,7 +5805,943 @@ RECIPE_DB = [
                     "Spread a layer of hummus over each flatbread.",
                     "Top with turkey filling, arugula, sliced red onion, feta, and a drizzle of tzatziki.",
                 ],
-                "tip": "This version is great for serving a crowd ] slice into pieces and let everyone help themselves.",
+                "tip": "This version is great for serving a crowd. Slice into pieces and let everyone help themselves.",
+            },
+        ],
+    },
+    {
+        "_id": "mediterranean-tuna-salad",
+        "_keywords": ["tuna", "egg", "capers", "mediterranean", "protein", "lunch", "no-cook", "lemon", "olive oil"],
+        "image": "/static/images/mediterranean-tuna-salad.jpg",
+        "intro": "Protein-packed tuna salad with hard-boiled eggs, capers, red onion, and fresh parsley dressed with lemon and olive oil, a no-cook Mediterranean lunch ready in under 10 minutes.",
+        "base": {
+            "title": "Mediterranean Tuna Salad with Egg",
+            "ingredients": [
+                "2 cans (5 oz each) solid white albacore tuna, drained",
+                "2 hard-boiled eggs, chopped",
+                "2 tbsp capers, drained",
+                "1/4 red onion, finely diced",
+                "2 stalks celery, finely sliced",
+                "1/4 cup fresh flat-leaf parsley, chopped",
+                "2 tbsp lemon juice",
+                "3 tbsp extra-virgin olive oil",
+                "Salt and black pepper to taste",
+            ],
+            "steps": [
+                "Hard-boil eggs: place in cold water, bring to a boil, cover and cook 10 minutes. Transfer to ice water, peel, and chop.",
+                "Drain tuna and break into a large bowl with a fork.",
+                "Add chopped eggs, capers, red onion, celery, and parsley.",
+                "Drizzle with lemon juice and olive oil. Toss gently to combine. Season with salt and pepper.",
+                "Serve immediately or refrigerate up to 3 days.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Tuna Salad Plate",
+                "subtitle": "served over greens with olives, cucumber, and warm pita",
+                "extras": ["Mixed greens or romaine", "Kalamata olives", "Sliced cucumber", "Warm pita or crackers"],
+                "steps": [
+                    "Arrange greens on a plate and spoon tuna salad on top.",
+                    "Add olives and sliced cucumber around the plate.",
+                    "Serve with warm pita triangles or crackers on the side.",
+                ],
+                "tip": "A drizzle of extra olive oil and a squeeze of lemon right before serving brightens everything up.",
+            },
+            {
+                "name": "Stuffed Tomatoes",
+                "subtitle": "tuna salad spooned into hollowed tomatoes for a fresh, elegant presentation",
+                "extras": ["4 large ripe tomatoes", "Extra parsley", "Lemon wedge"],
+                "steps": [
+                    "Slice off the tops of tomatoes and scoop out the insides with a spoon. Season the cavity with a pinch of salt.",
+                    "Fill each tomato generously with tuna salad.",
+                    "Garnish with fresh parsley and a lemon wedge. Serve chilled.",
+                ],
+                "tip": "Great for meal prep. Pack the stuffed tomatoes in containers and refrigerate, the tomato stays crisp for 1–2 days.",
+            },
+            {
+                "name": "Tuna Pita",
+                "subtitle": "tuna salad stuffed into warm pita with romaine and cucumber",
+                "extras": ["Whole wheat pitas", "Romaine lettuce", "Sliced cucumber", "Sliced red onion"],
+                "steps": [
+                    "Warm pita in a dry skillet or oven until soft and slightly toasted.",
+                    "Open the pita and layer with romaine leaves and cucumber slices.",
+                    "Spoon in a generous amount of tuna salad. Add extra red onion if desired.",
+                ],
+                "tip": "Pack tuna salad separately and assemble the pita right before eating to avoid sogginess.",
+            },
+        ],
+    },
+    {
+        "_id": "chicken-sweet-potato-bowls",
+        "_keywords": ["chicken", "sweet potato", "mediterranean", "grain bowl", "lunch", "meal prep", "quinoa", "hummus"],
+        "image": "/static/images/chicken-sweet-potato-bowls.jpg",
+        "intro": "Spiced roasted chicken breast and caramelized sweet potato cubes over a grain base with hummus, cucumber, and a lemon-herb dressing, a hearty Mediterranean meal-prep bowl.",
+        "base": {
+            "title": "Mediterranean Chicken and Sweet Potato Bowls",
+            "ingredients": [
+                "[ Chicken ]",
+                "1.5 lbs boneless chicken breast",
+                "1 tsp cumin",
+                "1 tsp smoked paprika",
+                "1/2 tsp garlic powder",
+                "1 tbsp olive oil",
+                "Salt and pepper",
+                "[ Sweet Potatoes ]",
+                "2 large sweet potatoes, peeled and cubed",
+                "1 tbsp olive oil",
+                "Salt and pepper",
+                "[ Bowls ]",
+                "1.5 cups dry quinoa or farro, cooked",
+                "1/2 cup hummus",
+                "1 English cucumber, diced",
+                "1 cup cherry tomatoes, halved",
+                "Fresh parsley",
+                "Lemon juice",
+            ],
+            "steps": [
+                "Preheat oven to 425°F. Line two baking sheets with parchment.",
+                "Toss chicken with cumin, paprika, garlic powder, olive oil, salt, and pepper. Place on one sheet.",
+                "Toss sweet potato cubes with olive oil, salt, and pepper. Spread on the second sheet.",
+                "Roast both 20–25 minutes, flipping sweet potatoes halfway, until chicken is cooked through and sweet potatoes are caramelized at the edges.",
+                "Slice or cube chicken. Build bowls with cooked grain, chicken, sweet potato, hummus, cucumber, and tomatoes. Squeeze lemon over everything and scatter parsley.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Bowl",
+                "subtitle": "grain + roasted chicken + sweet potato + hummus + lemon dressing",
+                "extras": ["Extra lemon", "Kalamata olives", "Crumbled feta", "Tahini drizzle"],
+                "steps": [
+                    "Build the bowl: start with grain, add chicken and sweet potato.",
+                    "Scoop hummus on the side. Add cucumber and tomatoes.",
+                    "Squeeze lemon over the top and scatter feta and parsley. Drizzle tahini if using.",
+                ],
+                "tip": "Roast an extra batch of sweet potatoes, they reheat beautifully and go with almost everything.",
+            },
+            {
+                "name": "Lettuce Wraps",
+                "subtitle": "chicken and sweet potato wrapped in crisp romaine leaves",
+                "extras": ["Large romaine or butter lettuce leaves", "Tahini", "Pickled red onion"],
+                "steps": [
+                    "Lay out lettuce leaves as cups.",
+                    "Fill each with a scoop of chicken, sweet potato, and cucumber.",
+                    "Drizzle with tahini and top with pickled onion. Fold and eat.",
+                ],
+                "tip": "Serve the filling warm so the lettuce provides a cool, crisp contrast.",
+            },
+            {
+                "name": "Harvest Salad",
+                "subtitle": "all the bowl components tossed over arugula with tahini dressing",
+                "extras": ["3 cups arugula", "2 tbsp tahini", "1 tbsp lemon juice", "1 tbsp water", "Pomegranate seeds"],
+                "steps": [
+                    "Whisk tahini, lemon juice, water, and a pinch of salt into a dressing.",
+                    "Toss arugula with half the dressing. Arrange on a platter.",
+                    "Top with chicken, sweet potato, cucumber, and tomatoes. Drizzle remaining dressing. Scatter pomegranate seeds.",
+                ],
+                "tip": "Dress arugula right before serving, it wilts quickly.",
+            },
+        ],
+    },
+    {
+        "_id": "mediterranean-quinoa-salad",
+        "_keywords": ["quinoa", "chickpeas", "cucumber", "feta", "olives", "mediterranean", "salad", "lunch", "vegetarian", "lemon"],
+        "image": "/static/images/mediterranean-quinoa-salad.jpg",
+        "intro": "Fluffy quinoa tossed with chickpeas, cucumber, cherry tomatoes, Kalamata olives, fresh herbs, and feta in a bright lemon-oregano vinaigrette, a filling no-heat Mediterranean lunch.",
+        "base": {
+            "title": "Mediterranean Quinoa Salad",
+            "ingredients": [
+                "1.5 cups dry quinoa",
+                "1 can (15 oz) chickpeas, drained and rinsed",
+                "1 English cucumber, diced",
+                "1 cup cherry tomatoes, halved",
+                "1/2 cup Kalamata olives, halved",
+                "1/2 cup crumbled feta",
+                "1/4 red onion, finely diced",
+                "1/4 cup fresh flat-leaf parsley, chopped",
+                "[ Vinaigrette ]",
+                "3 tbsp lemon juice",
+                "3 tbsp extra-virgin olive oil",
+                "1 tsp dried oregano",
+                "Salt and black pepper",
+            ],
+            "steps": [
+                "Cook quinoa according to package directions. Spread on a sheet pan and cool to room temperature.",
+                "Whisk lemon juice, olive oil, oregano, salt, and pepper in a small bowl.",
+                "Combine cooled quinoa, chickpeas, cucumber, cherry tomatoes, olives, red onion, and parsley in a large bowl.",
+                "Pour vinaigrette over and toss well. Fold in feta last.",
+                "Taste and adjust seasoning. Serve immediately or refrigerate, the salad improves after 30 minutes.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Salad Bowl",
+                "subtitle": "the full salad as a main with extra parsley and lemon",
+                "extras": ["Extra parsley", "Lemon wedge", "Pita on the side"],
+                "steps": [
+                    "Serve a generous portion of quinoa salad in a wide bowl.",
+                    "Scatter extra parsley and a squeeze of lemon over the top.",
+                    "Pair with warm pita triangles or crackers.",
+                ],
+                "tip": "Make a double batch, this salad keeps for 4 days and gets better as the quinoa absorbs the dressing.",
+            },
+            {
+                "name": "Stuffed Bell Peppers",
+                "subtitle": "quinoa salad spooned into halved bell peppers for a bright presentation",
+                "extras": ["3 large bell peppers (any color)", "Extra feta"],
+                "steps": [
+                    "Halve bell peppers and remove seeds.",
+                    "Spoon quinoa salad generously into each half.",
+                    "Top with extra crumbled feta. Serve at room temperature or chilled.",
+                ],
+                "tip": "Red and yellow peppers are sweeter, they balance the saltiness of the feta and olives beautifully.",
+            },
+            {
+                "name": "Mason Jar Salad",
+                "subtitle": "layered in jars for a portable, no-mess meal prep lunch",
+                "extras": ["Extra dressing on the side", "Cherry tomatoes", "Extra chickpeas"],
+                "steps": [
+                    "Pour dressing into the bottom of the jar.",
+                    "Layer in order: chickpeas, tomatoes, cucumber, olives, then quinoa and feta on top.",
+                    "Seal and refrigerate. Shake before eating, the dressing coats everything perfectly.",
+                ],
+                "tip": "Putting sturdy ingredients closest to the dressing and delicate ones on top keeps everything crisp until lunchtime.",
+            },
+        ],
+    },
+    {
+        "_id": "chickpea-salad-sandwich",
+        "_keywords": ["chickpea", "sandwich", "celery", "dill", "lemon", "mediterranean", "lunch", "vegetarian", "tahini", "yogurt"],
+        "image": "/static/images/chickpea-salad-sandwich.jpg",
+        "intro": "Smashed chickpeas with celery, dill, lemon, and a creamy yogurt-tahini dressing, stuffed into crusty bread or pita, a hearty vegetarian Mediterranean sandwich that meal-preps in 10 minutes.",
+        "base": {
+            "title": "Mediterranean Chickpea Salad Sandwich",
+            "ingredients": [
+                "2 cans (15 oz each) chickpeas, drained and rinsed",
+                "3 stalks celery, finely diced",
+                "1/4 red onion, finely diced",
+                "[ Dressing ]",
+                "3 tbsp Greek yogurt",
+                "2 tbsp tahini",
+                "2 tbsp lemon juice",
+                "1 tbsp fresh dill (or 1 tsp dried)",
+                "Salt and black pepper",
+                "[ To Serve ]",
+                "Whole grain bread or whole wheat pita",
+                "Romaine lettuce or baby spinach",
+                "Sliced tomato",
+            ],
+            "steps": [
+                "Drain and rinse chickpeas. Place in a bowl and use a fork or potato masher to roughly mash, leave about half the chickpeas whole for texture.",
+                "Add diced celery and red onion.",
+                "Whisk together yogurt, tahini, lemon juice, dill, salt, and pepper. Pour over chickpeas and stir to combine.",
+                "Taste and adjust seasoning, add more lemon or salt as needed.",
+                "Toast bread. Layer with romaine, spoon on chickpea salad, and top with sliced tomato.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Sandwich",
+                "subtitle": "chickpea salad on toasted whole grain bread with lettuce and tomato",
+                "extras": ["Extra dill", "Sliced avocado", "Pickled red onion"],
+                "steps": [
+                    "Toast two slices of whole grain bread.",
+                    "Layer one slice with romaine and tomato. Pile on a generous scoop of chickpea salad.",
+                    "Add avocado slices and pickled onion. Close the sandwich and press gently.",
+                ],
+                "tip": "Store the chickpea salad and bread separately for meal prep, assemble right before eating.",
+            },
+            {
+                "name": "Pita Pocket",
+                "subtitle": "chickpea salad stuffed into warm pita with cucumber slices",
+                "extras": ["Whole wheat pita", "Sliced cucumber", "Fresh parsley", "Extra lemon"],
+                "steps": [
+                    "Warm pita in a dry skillet or wrap in damp paper towel and microwave 20 seconds.",
+                    "Open the pita and tuck in a handful of spinach and cucumber slices.",
+                    "Spoon in chickpea salad and finish with a squeeze of lemon and fresh parsley.",
+                ],
+                "tip": "The pita pocket is ideal for meal prep lunches on the go, the chickpea salad holds its shape without getting soggy.",
+            },
+            {
+                "name": "Open-Face Toast",
+                "subtitle": "chickpea salad piled onto toasted sourdough with microgreens or sprouts",
+                "extras": ["Sourdough or rye bread", "Microgreens or sprouts", "Everything bagel seasoning", "Olive oil drizzle"],
+                "steps": [
+                    "Toast sourdough until deeply golden.",
+                    "Spread a thin layer of tahini or hummus on the toast.",
+                    "Pile on a generous scoop of chickpea salad. Scatter microgreens and a pinch of everything bagel seasoning. Drizzle olive oil.",
+                ],
+                "tip": "The open-face version makes a great brunch dish, serve two per person alongside a simple cucumber salad.",
+            },
+        ],
+    },
+    {
+        "_id": "greek-black-eyed-pea-stew",
+        "_keywords": ["black-eyed peas", "stew", "tomato", "greek", "dinner", "mediterranean", "vegetarian", "soup", "cumin"],
+        "image": "/static/images/greek-black-eyed-pea-stew.jpg",
+        "intro": "Traditional Greek black-eyed pea soup simmered with tomatoes, onion, cumin, and olive oil until rich and deeply savory, a hearty plant-forward Mediterranean dinner that tastes even better the next day.",
+        "base": {
+            "title": "Greek Black-Eyed Pea Stew (Mavromatika)",
+            "ingredients": [
+                "1 lb dried black-eyed peas, soaked overnight (or 3 cans, drained)",
+                "1 large yellow onion, diced",
+                "4 cloves garlic, minced",
+                "1 can (14 oz) crushed tomatoes",
+                "1 tsp cumin",
+                "1/2 tsp smoked paprika",
+                "1/4 cup extra-virgin olive oil",
+                "3 cups vegetable or chicken broth",
+                "1/4 cup fresh flat-leaf parsley, chopped",
+                "2 tbsp lemon juice",
+                "Salt and black pepper",
+                "Crusty bread or pita for serving",
+            ],
+            "steps": [
+                "If using dried: drain soaked peas and boil in fresh water 20–25 minutes until just tender. Drain and set aside.",
+                "Heat olive oil in a large pot over medium heat. Add onion and cook 5–7 minutes until golden.",
+                "Add garlic, cumin, and paprika. Stir and cook 1 minute until fragrant.",
+                "Add black-eyed peas, crushed tomatoes, and broth. Bring to a boil, then reduce to a simmer.",
+                "Simmer 25–30 minutes until the stew is thick, the peas are very tender, and the flavors have melded.",
+                "Stir in lemon juice and parsley. Season generously with salt and pepper. Serve with crusty bread.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Soup Bowl",
+                "subtitle": "served as a hearty soup with a drizzle of olive oil and lemon",
+                "extras": ["Extra olive oil", "Lemon wedge", "Crusty bread or pita", "Extra parsley"],
+                "steps": [
+                    "Ladle a generous portion into a deep bowl.",
+                    "Drizzle with good olive oil and a squeeze of lemon.",
+                    "Scatter fresh parsley on top. Serve with crusty bread for dipping.",
+                ],
+                "tip": "The stew thickens as it sits, add a splash of water or broth when reheating.",
+            },
+            {
+                "name": "Grain Bowl",
+                "subtitle": "stew ladled over cooked farro or barley for a heartier meal",
+                "extras": ["1.5 cups cooked farro or barley", "Crumbled feta", "Baby spinach", "Lemon wedge"],
+                "steps": [
+                    "Warm the stew and cook the grain separately.",
+                    "Place a scoop of farro or barley in a wide bowl. Ladle the stew over the top.",
+                    "Add a handful of wilted spinach, crumbled feta, and a lemon wedge.",
+                ],
+                "tip": "Stir spinach directly into the hot stew for the last minute of cooking, it wilts perfectly.",
+            },
+            {
+                "name": "Pita Dip",
+                "subtitle": "stew mashed and served as a thick dip with warm pita",
+                "extras": ["Warm pita triangles", "Olive oil", "Smoked paprika", "Fresh dill"],
+                "steps": [
+                    "Scoop a cup of the cooked stew and mash roughly with a fork until spreadable but still chunky.",
+                    "Spread on a plate and drizzle with olive oil. Dust with smoked paprika.",
+                    "Scatter fresh dill over the top. Serve with warm pita triangles.",
+                ],
+                "tip": "Use a splash of the stew liquid when mashing, it keeps the texture creamy rather than pasty.",
+            },
+        ],
+    },
+    {
+        "_id": "mediterranean-chicken-salad",
+        "_keywords": ["chicken", "salad", "cucumber", "feta", "olives", "mediterranean", "lunch", "lemon", "healthy"],
+        "image": "/static/images/mediterranean-chicken-salad.jpg",
+        "intro": "Tender poached or rotisserie chicken tossed with cucumber, Kalamata olives, cherry tomatoes, feta, fresh herbs, and a zippy lemon-olive oil dressing, a fast, protein-packed Mediterranean lunch.",
+        "base": {
+            "title": "Mediterranean Chicken Salad",
+            "ingredients": [
+                "1.5 lbs chicken breast, poached and shredded (or rotisserie chicken)",
+                "1 English cucumber, diced",
+                "1 cup cherry tomatoes, halved",
+                "1/3 cup Kalamata olives, halved",
+                "1/2 cup crumbled feta",
+                "1/4 red onion, very finely diced",
+                "1/4 cup fresh flat-leaf parsley, chopped",
+                "[ Dressing ]",
+                "3 tbsp lemon juice",
+                "3 tbsp extra-virgin olive oil",
+                "1 tsp dried oregano",
+                "Salt and black pepper",
+            ],
+            "steps": [
+                "Poach chicken: simmer in seasoned water 15–18 minutes until cooked through. Let cool, then shred or cube. (Skip if using rotisserie.)",
+                "Whisk lemon juice, olive oil, oregano, salt, and pepper into a dressing.",
+                "Combine chicken, cucumber, tomatoes, olives, red onion, and parsley in a large bowl.",
+                "Pour dressing over and toss well. Fold in feta.",
+                "Serve immediately or refrigerate up to 3 days, the flavors deepen overnight.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Salad",
+                "subtitle": "served over romaine or arugula with extra lemon",
+                "extras": ["Romaine or arugula", "Extra lemon wedge", "Whole grain pita"],
+                "steps": [
+                    "Arrange a bed of romaine or arugula on a plate or in a bowl.",
+                    "Spoon the chicken salad over the greens.",
+                    "Serve with a lemon wedge and pita on the side.",
+                ],
+                "tip": "Arugula adds a peppery bite that contrasts nicely with the creamy feta.",
+            },
+            {
+                "name": "Stuffed Pita",
+                "subtitle": "chicken salad tucked into warm pita with extra cucumber",
+                "extras": ["Whole wheat pitas", "Extra cucumber slices", "Tzatziki or hummus"],
+                "steps": [
+                    "Warm pita in a dry skillet or oven.",
+                    "Open the pocket and spread a thin layer of hummus or tzatziki inside.",
+                    "Fill generously with chicken salad and extra cucumber slices.",
+                ],
+                "tip": "Pack the chicken salad and pita separately for meal prep, fill right before eating.",
+            },
+            {
+                "name": "Couscous Bowl",
+                "subtitle": "chicken salad served over fluffy couscous for a heartier meal",
+                "extras": ["1.5 cups cooked couscous", "Extra parsley", "Lemon zest", "Toasted pine nuts"],
+                "steps": [
+                    "Fluff couscous with a fork and season with salt and a drizzle of olive oil.",
+                    "Spoon chicken salad over the couscous.",
+                    "Scatter toasted pine nuts and extra parsley. Finish with lemon zest.",
+                ],
+                "tip": "Couscous absorbs the lemon dressing as you eat, making every bite more flavorful.",
+            },
+        ],
+    },
+    {
+        "_id": "pan-bagnat",
+        "_keywords": ["tuna", "sandwich", "Provençal", "mediterranean", "lunch", "egg", "olives", "anchovies", "pressed"],
+        "image": "/static/images/pan-bagnat.jpg",
+        "intro": "A Provençal pressed sandwich loaded with tuna, hard-boiled egg, Kalamata olives, tomato, and anchovies on crusty olive-oil-rubbed bread, better after a few hours as the flavors meld.",
+        "base": {
+            "title": "Pan Bagnat",
+            "ingredients": [
+                "1 round crusty loaf or 2 demi-baguettes",
+                "2 cans (5 oz) oil-packed tuna, drained",
+                "2 hard-boiled eggs, sliced",
+                "1/2 cup Kalamata olives, pitted and halved",
+                "2 medium tomatoes, sliced",
+                "1/2 English cucumber, thinly sliced",
+                "1/4 red onion, very thinly sliced",
+                "4–6 anchovy fillets (optional)",
+                "1/4 cup fresh basil leaves",
+                "3 tbsp extra-virgin olive oil",
+                "2 tbsp red wine vinegar",
+                "1 small garlic clove, minced",
+                "Salt and black pepper",
+            ],
+            "steps": [
+                "Slice the bread in half horizontally. Drizzle both cut sides generously with olive oil.",
+                "Whisk remaining olive oil with vinegar, garlic, salt, and pepper.",
+                "Layer the bottom half: tomatoes, cucumber, onion, tuna, egg slices, olives, anchovies (if using), and basil.",
+                "Drizzle dressing over the filling. Top with the other half of the bread.",
+                "Wrap tightly in plastic wrap and press down firmly. Rest 30 minutes at room temperature (or refrigerate up to 4 hours) before slicing.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Pan Bagnat",
+                "subtitle": "the full pressed sandwich, sliced and served with a simple salad",
+                "extras": ["Mixed greens", "Extra olive oil", "Lemon wedge"],
+                "steps": [
+                    "Press the assembled sandwich under a heavy pan or wrapped book for 30–60 minutes.",
+                    "Unwrap and slice into quarters. Serve with simple dressed greens on the side.",
+                ],
+                "tip": "The longer it presses, the better, the bread absorbs the oil and vinegar and holds its shape when sliced.",
+            },
+            {
+                "name": "Open-Face Tartine",
+                "subtitle": "pan bagnat filling piled onto individual slices of crusty bread",
+                "extras": ["Toasted sourdough slices", "Extra basil", "Flaky sea salt"],
+                "steps": [
+                    "Toast thick slices of sourdough until golden.",
+                    "Drizzle with olive oil and rub lightly with a cut garlic clove.",
+                    "Layer tuna, egg, tomato, olives, and basil on each slice. Drizzle with a little red wine vinegar and flaky salt.",
+                ],
+                "tip": "Great for a quick lunch, no pressing needed for the open-face version.",
+            },
+            {
+                "name": "Niçoise-Style Salad",
+                "subtitle": "all the pan bagnat components served as a composed salad over greens",
+                "extras": ["3 cups mixed greens or romaine", "Dijon mustard", "Extra olive oil and vinegar", "Green beans, blanched"],
+                "steps": [
+                    "Whisk 1 tsp Dijon, 2 tbsp vinegar, 3 tbsp olive oil, salt, and pepper into a dressing.",
+                    "Arrange greens on a platter. Scatter tuna, egg wedges, olives, tomatoes, cucumber, and green beans.",
+                    "Drizzle dressing over everything. Scatter anchovies and basil on top.",
+                ],
+                "tip": "This is essentially a Salade Niçoise, serve it the same way with crusty bread on the side.",
+            },
+        ],
+    },
+    {
+        "_id": "stuffed-sweet-potatoes-chickpeas",
+        "_keywords": ["sweet potato", "chickpea", "avocado", "mediterranean", "vegetarian", "lunch", "dinner", "stuffed"],
+        "image": "/static/images/stuffed-sweet-potatoes-chickpeas.jpg",
+        "intro": "Roasted sweet potatoes split open and loaded with warmly spiced chickpeas, fresh herbs, and a creamy avocado-yogurt sauce, a hearty Mediterranean veggie meal that works for lunch or dinner.",
+        "base": {
+            "title": "Stuffed Sweet Potatoes with Chickpeas and Avocado Crema",
+            "ingredients": [
+                "4 medium sweet potatoes",
+                "[ Chickpeas ]",
+                "1 can (15 oz) chickpeas, drained and rinsed",
+                "1 tbsp olive oil",
+                "1 tsp cumin",
+                "1/2 tsp smoked paprika",
+                "1/4 tsp cinnamon",
+                "Salt and pepper",
+                "[ Avocado Crema ]",
+                "1 ripe avocado",
+                "1/4 cup Greek yogurt",
+                "2 tbsp lemon juice",
+                "1 small garlic clove",
+                "Salt to taste",
+                "[ To Serve ]",
+                "Fresh parsley or cilantro",
+                "Pomegranate seeds or diced tomato",
+            ],
+            "steps": [
+                "Preheat oven to 400°F. Pierce sweet potatoes several times and roast directly on the rack 45–50 minutes until tender.",
+                "Toss chickpeas with olive oil, cumin, paprika, cinnamon, salt, and pepper. Spread on a sheet pan and roast 20–25 minutes until crispy.",
+                "Blend avocado, yogurt, lemon juice, garlic, and salt until smooth. Thin with 1–2 tbsp water if needed.",
+                "Split sweet potatoes open and fluff the inside. Spoon on spiced chickpeas.",
+                "Drizzle avocado crema generously. Top with fresh herbs and pomegranate seeds or tomato.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Stuffed Sweet Potato",
+                "subtitle": "the full dish with avocado crema, herbs, and pomegranate",
+                "extras": ["Pomegranate seeds", "Crumbled feta", "Extra lemon"],
+                "steps": [
+                    "Serve one loaded sweet potato per person.",
+                    "Add crumbled feta and pomegranate for extra color and flavor.",
+                    "Finish with a squeeze of lemon and a drizzle of olive oil.",
+                ],
+                "tip": "Roast a double batch of sweet potatoes, they reheat beautifully and can serve as a base all week.",
+            },
+            {
+                "name": "Grain Bowl",
+                "subtitle": "chickpeas and avocado crema served over farro or quinoa with roasted sweet potato chunks",
+                "extras": ["1.5 cups cooked farro or quinoa", "Baby spinach", "Lemon dressing"],
+                "steps": [
+                    "Cube the roasted sweet potato flesh and toss with the farro and baby spinach.",
+                    "Top with chickpeas and drizzle with avocado crema.",
+                    "Finish with lemon juice and olive oil.",
+                ],
+                "tip": "Works great as a make-ahead lunch, store components separately and assemble cold.",
+            },
+            {
+                "name": "Chickpea Avocado Toast",
+                "subtitle": "crispy chickpeas and avocado crema on toasted sourdough",
+                "extras": ["Thick sourdough slices", "Cherry tomatoes", "Red pepper flakes", "Extra parsley"],
+                "steps": [
+                    "Toast sourdough slices until golden.",
+                    "Spread avocado crema generously on each slice.",
+                    "Top with crispy chickpeas, halved cherry tomatoes, and a pinch of red pepper flakes.",
+                ],
+                "tip": "Use the leftover crema as a dip for veggies or pita, it keeps in the fridge for 2 days.",
+            },
+        ],
+    },
+    {
+        "_id": "salmon-rice-bowls",
+        "_keywords": ["salmon", "rice", "avocado", "cucumber", "mediterranean", "lunch", "dinner", "lemon", "bowl"],
+        "image": "/static/images/salmon-rice-bowls.jpg",
+        "intro": "Pan-seared salmon over fluffy rice with cucumber, avocado, and a bright lemon-herb dressing, a clean, protein-rich Mediterranean bowl that comes together in 20 minutes.",
+        "base": {
+            "title": "Mediterranean Salmon Rice Bowls",
+            "ingredients": [
+                "4 salmon fillets (6 oz each)",
+                "1 tbsp olive oil",
+                "1 tsp smoked paprika",
+                "1/2 tsp garlic powder",
+                "Salt and pepper",
+                "1.5 cups dry rice, cooked",
+                "1 English cucumber, sliced",
+                "1 avocado, sliced",
+                "1/2 cup cherry tomatoes, halved",
+                "[ Dressing ]",
+                "3 tbsp lemon juice",
+                "3 tbsp olive oil",
+                "1 tsp dried oregano",
+                "Salt",
+            ],
+            "steps": [
+                "Pat salmon dry. Season with paprika, garlic powder, salt, and pepper.",
+                "Heat olive oil in a non-stick skillet over medium-high. Cook salmon 3–4 minutes per side until golden and cooked through.",
+                "Whisk lemon juice, olive oil, oregano, and salt into a dressing.",
+                "Build bowls: rice, salmon, cucumber, avocado, and tomatoes.",
+                "Drizzle dressing over everything. Serve immediately.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Bowl",
+                "subtitle": "salmon over rice with cucumber, avocado, and lemon dressing",
+                "extras": ["Extra lemon", "Fresh dill", "Kalamata olives"],
+                "steps": [
+                    "Arrange rice in a wide bowl. Flake or place salmon on top.",
+                    "Add cucumber slices, avocado, and tomatoes around the bowl.",
+                    "Drizzle generously with lemon dressing. Scatter dill and olives.",
+                ],
+                "tip": "Flake the salmon into large chunks rather than small pieces, better texture in every bite.",
+            },
+            {
+                "name": "Salmon Tacos",
+                "subtitle": "flaked salmon in warm tortillas with avocado and lemon slaw",
+                "extras": ["Small flour or corn tortillas", "Shredded cabbage", "Extra lemon", "Hot sauce"],
+                "steps": [
+                    "Warm tortillas in a dry skillet.",
+                    "Toss shredded cabbage with lemon juice and a pinch of salt.",
+                    "Fill tortillas with flaked salmon, cabbage slaw, avocado, and a drizzle of lemon dressing.",
+                ],
+                "tip": "A smear of yogurt or tzatziki inside each taco replaces the need for a sauce.",
+            },
+            {
+                "name": "Deconstructed Sushi Bowl",
+                "subtitle": "salmon over sushi rice with soy, sesame, and cucumber",
+                "extras": ["Sushi rice", "Soy sauce", "Sesame oil", "Sesame seeds", "Pickled ginger", "Nori strips"],
+                "steps": [
+                    "Use seasoned sushi rice as the base.",
+                    "Arrange salmon, cucumber, and avocado over the rice.",
+                    "Drizzle with soy sauce and a few drops of sesame oil. Scatter sesame seeds and nori strips.",
+                ],
+                "tip": "This is a nice pivot from Mediterranean to Japanese without changing the main ingredients.",
+            },
+        ],
+    },
+    {
+        "_id": "greek-sheet-pan-chicken",
+        "_keywords": ["chicken", "greek", "sheet pan", "lemon", "olives", "potatoes", "mediterranean", "lunch", "dinner"],
+        "image": "/static/images/greek-sheet-pan-chicken.jpg",
+        "intro": "Herb-marinated chicken thighs roasted on one pan with lemon, garlic, Kalamata olives, cherry tomatoes, and potatoes, a complete Greek dinner with zero cleanup, and great leftovers for lunch.",
+        "base": {
+            "title": "Greek Sheet Pan Chicken",
+            "ingredients": [
+                "6 bone-in, skin-on chicken thighs",
+                "1.5 lbs baby potatoes, halved",
+                "1 cup Kalamata olives",
+                "1 cup cherry tomatoes",
+                "1 lemon, sliced into rounds",
+                "6 cloves garlic, smashed",
+                "[ Marinade ]",
+                "3 tbsp olive oil",
+                "2 tbsp lemon juice",
+                "1 tsp dried oregano",
+                "1 tsp smoked paprika",
+                "1/2 tsp cumin",
+                "Salt and black pepper",
+                "Fresh parsley to serve",
+            ],
+            "steps": [
+                "Preheat oven to 425°F. Whisk together olive oil, lemon juice, oregano, paprika, cumin, salt, and pepper.",
+                "Toss chicken and potatoes with the marinade. Marinate 15 minutes (or overnight in the fridge).",
+                "Spread potatoes on a large sheet pan. Nestle chicken thighs on top, skin side up.",
+                "Add garlic, lemon slices, olives, and cherry tomatoes around the chicken.",
+                "Roast 35–40 minutes until chicken skin is golden and crispy and potatoes are tender. Scatter fresh parsley before serving.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Greek Dinner Plate",
+                "subtitle": "serve straight from the pan with pita and tzatziki",
+                "extras": ["Tzatziki", "Warm pita", "Extra lemon wedge", "Crumbled feta"],
+                "steps": [
+                    "Serve 1–2 chicken thighs with a generous scoop of roasted potatoes, olives, and tomatoes.",
+                    "Add a dollop of tzatziki and warm pita on the side.",
+                    "Crumble feta over the plate and finish with a lemon wedge.",
+                ],
+                "tip": "Let the chicken rest 5 minutes before serving, the skin stays crispier.",
+            },
+            {
+                "name": "Greek Chicken Grain Bowl",
+                "subtitle": "leftover chicken sliced over farro with roasted vegetables and hummus",
+                "extras": ["1.5 cups cooked farro or quinoa", "Hummus", "Baby spinach", "Pickled red onion"],
+                "steps": [
+                    "Slice or shred leftover chicken thigh meat off the bone.",
+                    "Build a bowl with farro, chicken, roasted potatoes and tomatoes from the pan.",
+                    "Add hummus, spinach, and pickled onion. Drizzle with olive oil and lemon.",
+                ],
+                "tip": "The roasted pan juices make an excellent drizzle over the grain bowl, spoon them on before serving.",
+            },
+            {
+                "name": "Greek Chicken Pita",
+                "subtitle": "shredded leftover chicken stuffed into warm pita with tzatziki and salad",
+                "extras": ["Whole wheat pitas", "Tzatziki", "Shredded romaine", "Diced cucumber", "Diced tomato"],
+                "steps": [
+                    "Shred or slice leftover chicken. Warm pita in a dry skillet.",
+                    "Spread tzatziki inside the pita.",
+                    "Fill with chicken, romaine, cucumber, and tomato. Fold and eat.",
+                ],
+                "tip": "A great next-day lunch, the chicken reheats well in a skillet for 2–3 minutes.",
+            },
+        ],
+    },
+    {
+        "_id": "chicken-shawarma",
+        "_keywords": ["chicken", "shawarma", "pita", "mediterranean", "lunch", "middle eastern", "garlic sauce", "spiced"],
+        "image": "/static/images/chicken-shawarma.jpg",
+        "intro": "Warmly spiced marinated chicken thighs roasted until charred at the edges, stuffed into warm pita with creamy garlic sauce, tomatoes, and pickled vegetables, a fast, vibrant Mediterranean lunch.",
+        "base": {
+            "title": "Chicken Shawarma",
+            "ingredients": [
+                "1.5 lbs boneless, skinless chicken thighs",
+                "[ Marinade ]",
+                "3 tbsp olive oil",
+                "2 tbsp lemon juice",
+                "1 tsp cumin",
+                "1 tsp smoked paprika",
+                "1/2 tsp turmeric",
+                "1/2 tsp coriander",
+                "1/4 tsp cinnamon",
+                "1/4 tsp cayenne",
+                "4 cloves garlic, minced",
+                "Salt and pepper",
+                "[ To Serve ]",
+                "Whole wheat pitas or flatbread",
+                "1/2 cup Greek yogurt + 1 tbsp tahini + 1 tbsp lemon (garlic sauce)",
+                "Sliced tomatoes",
+                "Sliced cucumber",
+                "Pickled turnips or red onion",
+                "Fresh parsley",
+            ],
+            "steps": [
+                "Combine all marinade ingredients and toss with chicken. Marinate at least 30 minutes (overnight is best).",
+                "Preheat oven to 425°F (or heat a grill pan). Spread chicken on a sheet pan.",
+                "Roast 22–25 minutes until cooked through and beginning to char at the edges.",
+                "Rest 5 minutes, then slice thinly.",
+                "Whisk yogurt, tahini, lemon, and garlic for the sauce. Warm pitas. Assemble: pita, sauce, chicken, tomato, cucumber, pickled onion, and parsley.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Shawarma Pita",
+                "subtitle": "sliced chicken in warm pita with garlic sauce and pickled vegetables",
+                "extras": ["Extra garlic sauce", "Hot sauce", "Pickled turnips", "Romaine shreds"],
+                "steps": [
+                    "Warm pita in a dry skillet or oven until soft and slightly puffed.",
+                    "Spread garlic sauce generously. Add chicken, tomato, cucumber, and pickled vegetables.",
+                    "Wrap or fold and eat immediately.",
+                ],
+                "tip": "The marinade can be made 3 days ahead, marinated raw chicken stores well in the fridge.",
+            },
+            {
+                "name": "Shawarma Bowl",
+                "subtitle": "shawarma chicken over rice or couscous with garlic sauce and a simple salad",
+                "extras": ["1.5 cups cooked rice or couscous", "Hummus", "Cucumber-tomato salad", "Lemon wedge"],
+                "steps": [
+                    "Build a bowl with rice or couscous as the base.",
+                    "Arrange sliced chicken, a scoop of hummus, and cucumber-tomato salad.",
+                    "Drizzle garlic sauce over everything. Finish with a squeeze of lemon.",
+                ],
+                "tip": "Roast a double batch of chicken, it makes excellent shawarma bowls for 4 days of lunches.",
+            },
+            {
+                "name": "Shawarma Salad",
+                "subtitle": "sliced chicken over a bright salad with garlic dressing",
+                "extras": ["3 cups romaine or mixed greens", "Chickpeas", "Kalamata olives", "Crumbled feta", "Pita chips"],
+                "steps": [
+                    "Thin the garlic sauce with a splash of water and extra lemon into a dressing.",
+                    "Toss greens with chickpeas, olives, and feta.",
+                    "Top with warm shawarma chicken and pita chips. Drizzle dressing.",
+                ],
+                "tip": "The pita chips add crunch that holds up even after dressing, better than croutons here.",
+            },
+        ],
+    },
+    {
+        "_id": "italian-chicken-meatballs",
+        "_keywords": ["chicken", "meatballs", "italian", "baked", "dinner", "marinara", "herbs", "pasta"],
+        "image": "/static/images/italian-chicken-meatballs.jpg",
+        "intro": "Tender herb-seasoned chicken meatballs baked until golden, serving as the base for three Italian meals, over pasta with marinara, stuffed into a sub roll, or served as a protein bowl.",
+        "base": {
+            "title": "Italian Baked Chicken Meatballs",
+            "ingredients": [
+                "1.5 lbs ground chicken",
+                "1/2 cup breadcrumbs (plain or seasoned)",
+                "1/4 cup grated Parmesan",
+                "1 egg",
+                "3 cloves garlic, minced",
+                "1/4 cup fresh parsley, finely chopped",
+                "1 tsp dried oregano",
+                "1/2 tsp fennel seeds (optional)",
+                "Salt and black pepper",
+                "2 tbsp olive oil (for brushing)",
+            ],
+            "steps": [
+                "Preheat oven to 400°F. Line a baking sheet with parchment.",
+                "Combine ground chicken, breadcrumbs, Parmesan, egg, garlic, parsley, oregano, fennel seeds, salt, and pepper. Mix until just combined, don't overwork.",
+                "Roll into 1.5-inch balls (about 20–24). Arrange on the baking sheet.",
+                "Brush lightly with olive oil. Bake 18–22 minutes until golden and cooked through (internal temp 165°F).",
+                "Serve immediately or refrigerate, they reheat perfectly in marinara sauce.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Pasta and Meatballs",
+                "subtitle": "meatballs simmered in marinara and served over spaghetti with Parmesan",
+                "extras": ["12 oz spaghetti or penne", "2 cups marinara", "Extra Parmesan", "Fresh basil"],
+                "steps": [
+                    "Cook pasta per package. Warm marinara in a large skillet.",
+                    "Add meatballs to the sauce and simmer 5 minutes to heat through and absorb flavors.",
+                    "Toss pasta with sauce and meatballs. Serve topped with Parmesan and torn basil.",
+                ],
+                "tip": "Let meatballs simmer in the sauce at least 5 minutes, they absorb flavor and stay juicy.",
+            },
+            {
+                "name": "Meatball Sub",
+                "subtitle": "meatballs and marinara stuffed into a toasted sub roll with melted mozzarella",
+                "extras": ["4 sub or hoagie rolls", "1 cup marinara", "4 oz shredded mozzarella", "Fresh basil"],
+                "steps": [
+                    "Warm meatballs in marinara. Split rolls and place on a baking sheet.",
+                    "Spoon 3–4 meatballs and sauce onto each roll. Top with mozzarella.",
+                    "Broil 2–3 minutes until cheese is melted and bubbly. Scatter fresh basil.",
+                ],
+                "tip": "Toast the roll cut-side down in the same skillet first, it keeps the bread from going soggy under the sauce.",
+            },
+            {
+                "name": "Italian Meatball Bowl",
+                "subtitle": "meatballs over polenta or farro with roasted vegetables",
+                "extras": ["Creamy polenta or cooked farro", "Roasted zucchini or broccoli", "Marinara", "Parmesan"],
+                "steps": [
+                    "Make creamy polenta (or use cooked farro as a grain base).",
+                    "Spoon polenta into bowls. Add meatballs and a ladle of marinara.",
+                    "Arrange roasted vegetables alongside. Finish with Parmesan.",
+                ],
+                "tip": "Polenta made with chicken broth instead of water gives the bowl a richer backbone.",
+            },
+        ],
+    },
+    {
+        "_id": "baked-salmon-vegetables",
+        "_keywords": ["salmon", "vegetables", "sheet pan", "mediterranean", "dinner", "olive oil", "lemon", "herbs"],
+        "image": "/static/images/baked-salmon-vegetables.jpg",
+        "intro": "Sheet pan salmon fillets roasted alongside colorful Mediterranean vegetables in olive oil and herbs until caramelized and tender, a complete, light dinner ready in 30 minutes.",
+        "base": {
+            "title": "Mediterranean Baked Salmon with Vegetables",
+            "ingredients": [
+                "4 salmon fillets (6 oz each)",
+                "[ Vegetables ]",
+                "1 zucchini, sliced into half-moons",
+                "1 red bell pepper, sliced",
+                "1 yellow bell pepper, sliced",
+                "1 cup cherry tomatoes",
+                "1/2 red onion, sliced",
+                "[ Seasoning ]",
+                "3 tbsp olive oil",
+                "2 tbsp lemon juice",
+                "1 tsp dried oregano",
+                "1/2 tsp smoked paprika",
+                "3 cloves garlic, minced",
+                "Salt and black pepper",
+                "Fresh parsley and lemon wedges to serve",
+            ],
+            "steps": [
+                "Preheat oven to 400°F. Whisk olive oil, lemon juice, oregano, paprika, garlic, salt, and pepper.",
+                "Toss vegetables with half the seasoning. Spread on a large sheet pan.",
+                "Roast vegetables 15 minutes. Push to the sides to make room for the salmon.",
+                "Place salmon in the center, skin side down. Brush with remaining seasoning.",
+                "Roast 12–15 minutes until salmon flakes easily and vegetables are caramelized. Serve with parsley and lemon.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Dinner Plate",
+                "subtitle": "salmon and vegetables served straight from the pan",
+                "extras": ["Lemon wedge", "Tzatziki or yogurt sauce", "Warm pita"],
+                "steps": [
+                    "Serve a salmon fillet with a generous scoop of roasted vegetables.",
+                    "Add a dollop of tzatziki and a lemon wedge. Serve with warm pita on the side.",
+                ],
+                "tip": "Use a fish spatula to lift salmon off the skin, the skin sticks to the pan and comes away cleanly.",
+            },
+            {
+                "name": "Mediterranean Grain Bowl",
+                "subtitle": "leftover salmon and vegetables over farro or quinoa with hummus",
+                "extras": ["1.5 cups cooked farro or quinoa", "Hummus", "Kalamata olives", "Crumbled feta"],
+                "steps": [
+                    "Build bowls with farro or quinoa as the base.",
+                    "Flake leftover salmon and arrange over the grain with reheated vegetables.",
+                    "Add a spoonful of hummus and scatter olives and feta.",
+                ],
+                "tip": "The vegetables reheat well in a skillet or microwave, they stay flavorful for up to 4 days.",
+            },
+            {
+                "name": "Salmon and Vegetable Pasta",
+                "subtitle": "flaked salmon and roasted vegetables tossed with pasta and olive oil",
+                "extras": ["12 oz linguine or penne", "Extra olive oil", "Lemon zest", "Capers", "Fresh parsley"],
+                "steps": [
+                    "Cook pasta and reserve 1/2 cup pasta water.",
+                    "Toss warm pasta with a drizzle of olive oil, lemon zest, and a splash of pasta water.",
+                    "Fold in flaked salmon and roasted vegetables. Top with capers and parsley.",
+                ],
+                "tip": "This is the best use for leftover salmon, the olive oil and lemon make it taste freshly made.",
+            },
+        ],
+    },
+    {
+        "_id": "mediterranean-beef-bowl",
+        "_keywords": ["beef", "bowl", "ground beef", "mediterranean", "dinner", "rice", "hummus", "tzatziki", "cucumber"],
+        "image": "/static/images/mediterranean-beef-bowl.jpg",
+        "intro": "Warmly spiced ground beef seasoned with cumin, coriander, and garlic, served over rice with hummus, cucumber-tomato salad, and a drizzle of tzatziki, a fast, protein-packed Mediterranean dinner.",
+        "base": {
+            "title": "Mediterranean Beef Bowl",
+            "ingredients": [
+                "1.5 lbs lean ground beef",
+                "1 yellow onion, diced",
+                "4 cloves garlic, minced",
+                "1 tsp cumin",
+                "1 tsp coriander",
+                "1/2 tsp smoked paprika",
+                "1/4 tsp cinnamon",
+                "Salt and black pepper",
+                "1 tbsp olive oil",
+                "1.5 cups dry rice, cooked",
+                "1/2 cup hummus",
+                "1 English cucumber, diced",
+                "1 cup cherry tomatoes, halved",
+                "1/4 red onion, finely diced",
+                "Fresh parsley",
+                "Tzatziki for drizzling",
+            ],
+            "steps": [
+                "Heat olive oil in a large skillet over medium-high. Add diced onion and cook 3–4 minutes until softened.",
+                "Add garlic and cook 30 seconds. Add ground beef and cook, breaking it up, until browned, 6–8 minutes.",
+                "Add cumin, coriander, paprika, cinnamon, salt, and pepper. Stir and cook 1 minute.",
+                "Combine cucumber, tomatoes, and red onion with a drizzle of olive oil and lemon juice for the salad.",
+                "Build bowls: rice, beef, hummus, cucumber-tomato salad, and a drizzle of tzatziki. Scatter parsley.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Bowl",
+                "subtitle": "spiced beef over rice with hummus, salad, and tzatziki",
+                "extras": ["Extra tzatziki", "Crumbled feta", "Kalamata olives", "Lemon wedge"],
+                "steps": [
+                    "Build the bowl: start with rice, add beef, hummus on the side, and cucumber-tomato salad.",
+                    "Drizzle tzatziki over everything. Add feta and olives.",
+                    "Finish with a squeeze of lemon and fresh parsley.",
+                ],
+                "tip": "Make the spiced beef mixture in bulk, it reheats perfectly in a skillet for meal prep bowls all week.",
+            },
+            {
+                "name": "Beef Pita",
+                "subtitle": "beef filling stuffed into warm pita with tzatziki and salad",
+                "extras": ["Whole wheat pitas", "Romaine shreds", "Extra tzatziki"],
+                "steps": [
+                    "Warm pita in a dry skillet. Open and spread tzatziki inside.",
+                    "Fill with the spiced beef, romaine, cucumber, and tomato.",
+                    "Fold and serve immediately.",
+                ],
+                "tip": "A drizzle of hot sauce inside the pita balances the richness of the beef.",
+            },
+            {
+                "name": "Beef and Greens Salad",
+                "subtitle": "warm spiced beef over arugula or romaine with Mediterranean dressing",
+                "extras": ["3 cups arugula or romaine", "Lemon-olive oil dressing", "Shaved Parmesan", "Pita chips"],
+                "steps": [
+                    "Whisk 2 tbsp lemon juice, 3 tbsp olive oil, salt, and pepper.",
+                    "Toss greens with dressing and spread on a platter.",
+                    "Spoon warm beef over the greens. Top with cucumber-tomato salad, a dollop of hummus, and pita chips.",
+                ],
+                "tip": "Warm beef over cold greens is the move, the contrast in temperature and texture makes the salad feel substantial.",
             },
         ],
     },
@@ -5043,7 +6801,7 @@ RECIPE_DB = [
                     "Build bowl: rice, sliced chicken, kachumber on one side.",
                     "Spoon raita over chicken and serve with mango chutney and a lemon wedge.",
                 ],
-                "tip": "The char on the chicken is the flavor [ don't be afraid to let it get dark edges under the broiler.",
+                "tip": "The char on the chicken is the flavor. Don't be afraid to let it get dark edges under the broiler.",
             },
             {
                 "name": "Chicken Tikka Naan Wrap",
@@ -5054,7 +6812,7 @@ RECIPE_DB = [
                     "Slice chicken and arrange down the center of naan.",
                     "Add baby spinach, red onion, mint chutney, and mango chutney. Roll or fold and eat.",
                 ],
-                "tip": "Layer both chutneys ] mint for brightness, mango for sweetness. They balance each other.",
+                "tip": "Layer both chutneys. Mint for brightness, mango for sweetness. They balance each other.",
             },
             {
                 "name": "Tandoori Chicken Salad",
@@ -5106,9 +6864,9 @@ RECIPE_DB = [
                 "2 cups basmati rice",
             ],
             "steps": [
-                "Make koftas: combine cauliflower, mashed potato, peas, onion, spices, and flour. Mix well [ the mixture should hold together. Form into 1.5-inch balls.",
+                "Make koftas: combine cauliflower, mashed potato, peas, onion, spices, and flour. Mix well. The mixture should hold together. Form into 1.5-inch balls.",
                 "Fry koftas in oil over medium heat, turning, until golden brown on all sides, 6–8 minutes. Set aside.",
-                "Make dal: sauté onion in oil until golden, 8 minutes. Add garlic, ginger, and spices ] cook 1 minute.",
+                "Make dal: sauté onion in oil until golden, 8 minutes. Add garlic, ginger, and spices. Cook 1 minute.",
                 "Add lentils, crushed tomatoes, broth, and coconut milk. Bring to a boil, then simmer 20–25 minutes until lentils are completely soft and dal is thick.",
                 "Stir in lemon juice and season with salt. Finish with fresh cilantro.",
                 "Cook basmati rice per package directions.",
@@ -5121,15 +6879,15 @@ RECIPE_DB = [
                 "subtitle": "rice, silky dal, and crispy vegetable koftas with green chutney",
                 "extras": ["Green chutney (store-bought or blended cilantro-mint)", "Extra lemon wedge", "Fresh cilantro", "Sliced chili"],
                 "steps": [
-                    "Reheat dal with a splash of water [ it thickens overnight.",
+                    "Reheat dal with a splash of water. It thickens overnight.",
                     "Warm koftas in the oven at 350°F for 8 minutes or in a skillet.",
                     "Plate rice, ladle dal alongside, and add koftas. Serve with green chutney and lemon.",
                 ],
-                "tip": "The dal reheats beautifully ] it's actually better on day 2 after the spices meld.",
+                "tip": "The dal reheats beautifully. It's actually better on day 2 after the spices meld.",
             },
             {
                 "name": "Cauliflower Potato Curry Bowl",
-                "subtitle": "skip the dal [ serve just the kofta filling as a dry aloo gobi over rice",
+                "subtitle": "skip the dal. Serve just the kofta filling as a dry aloo gobi over rice",
                 "extras": ["Extra cauliflower florets, roasted", "Pickled red onion", "Fresh cilantro", "Yogurt dollop (dairy or vegan)"],
                 "steps": [
                     "Crumble koftas into a hot skillet and stir-fry with extra cauliflower florets for 3 minutes.",
@@ -5147,7 +6905,7 @@ RECIPE_DB = [
                     "Ladle thick dal over each naan.",
                     "Top with cilantro, a squeeze of lemon, and a drizzle of yogurt.",
                 ],
-                "tip": "Use thick, slightly re-cooked dal for this ] it should be spreadable, not soupy.",
+                "tip": "Use thick, slightly re-cooked dal for this. It should be spreadable, not soupy.",
             },
         ],
     },
@@ -5206,7 +6964,7 @@ RECIPE_DB = [
                     "Plate rice, add paneer tikka, fresh romaine and cucumber.",
                     "Spoon raita over paneer. Finish with mango chutney and fresh mint.",
                 ],
-                "tip": "Re-searing the paneer in a hot dry skillet revives the char [ much better than microwaving.",
+                "tip": "Re-searing the paneer in a hot dry skillet revives the char. Much better than microwaving.",
             },
             {
                 "name": "Paneer Tikka Kebabs",
@@ -5217,7 +6975,7 @@ RECIPE_DB = [
                     "Serve skewers directly on warm naan with mint chutney, pickled onion, sliced tomatoes, and a squeeze of lemon.",
                     "Eat as a handheld kebab, pulling pieces off the skewer onto the naan.",
                 ],
-                "tip": "Char is flavor ] if you have a grill, use it. The smoke makes the paneer taste completely different.",
+                "tip": "Char is flavor. If you have a grill, use it. The smoke makes the paneer taste completely different.",
             },
             {
                 "name": "Paneer Tikka Wrap",
@@ -5266,7 +7024,7 @@ RECIPE_DB = [
             "steps": [
                 "Cook turmeric rice: bring water to a boil, add rice, turmeric, cumin, and salt. Simmer until cooked through.",
                 "Heat oil in a large pot over medium-high. Add onion and cook 5 minutes until golden.",
-                "Add garlic and ginger [ stir 1 minute until fragrant.",
+                "Add garlic and ginger. Stir 1 minute until fragrant.",
                 "Add all spices and stir 30 seconds to bloom them.",
                 "Add crushed tomatoes and cook 3 minutes, stirring.",
                 "Add chickpeas, zucchini, and coconut milk. Stir to combine. Bring to a simmer.",
@@ -5296,7 +7054,7 @@ RECIPE_DB = [
                     "Warm naan in a dry skillet or oven.",
                     "Serve curry in a bowl alongside naan, yogurt, and mango chutney.",
                 ],
-                "tip": "A thicker curry works better for naan dipping ] let it simmer an extra 5 minutes uncovered.",
+                "tip": "A thicker curry works better for naan dipping. Let it simmer an extra 5 minutes uncovered.",
             },
             {
                 "name": "Curry Stuffed Baked Potato",
@@ -5307,7 +7065,7 @@ RECIPE_DB = [
                     "Reheat curry and spoon generously over each potato.",
                     "Top with Greek yogurt, scallions, and chili flakes.",
                 ],
-                "tip": "This is a great way to make the curry go further [ one potato per person with a generous scoop of curry is a full meal.",
+                "tip": "This is a great way to make the curry go further. One potato per person with a generous scoop of curry is a full meal.",
             },
         ],
     },
@@ -5315,7 +7073,7 @@ RECIPE_DB = [
         "_id": "coconut-chicken-curry",
         "_keywords": ["chicken", "coconut", "curry", "indian", "spicy", "potato", "peppers", "dinner"],
         "image": "/static/images/coconut-chicken-curry.jpg",
-        "intro": "Chicken thighs, golden potatoes, and bell peppers braised in a fragrant coconut curry sauce ] spiced just enough to be exciting, rich enough to feel like a real meal.",
+        "intro": "Chicken thighs, golden potatoes, and bell peppers braised in a fragrant coconut curry sauce. Spiced just enough to be exciting, rich enough to feel like a real meal.",
         "base": {
             "title": "Spicy Coconut Chicken Curry",
             "ingredients": [
@@ -5343,7 +7101,7 @@ RECIPE_DB = [
             "steps": [
                 "Season chicken with salt, pepper, and 1 tsp garam masala.",
                 "Heat oil over medium-high. Sear chicken in batches until golden, 4–5 minutes per side. Remove and set aside.",
-                "In the same pot, cook onion 5 minutes until soft. Add garlic, ginger, and remaining spices [ stir 1 minute.",
+                "In the same pot, cook onion 5 minutes until soft. Add garlic, ginger, and remaining spices. Stir 1 minute.",
                 "Add crushed tomatoes and cook 3 minutes.",
                 "Return chicken to pot. Add potatoes, bell peppers, coconut milk, and thyme. Stir.",
                 "Bring to a boil, then reduce to a simmer. Cover and cook 25–30 minutes until chicken is tender and potatoes are cooked through.",
@@ -5361,7 +7119,7 @@ RECIPE_DB = [
                     "Serve over fresh basmati rice.",
                     "Finish with cilantro, lime, and a spoonful of plain yogurt to cool the heat.",
                 ],
-                "tip": "The potatoes absorb the sauce overnight ] day-2 curry is noticeably better.",
+                "tip": "The potatoes absorb the sauce overnight. Day-2 curry is noticeably better.",
             },
             {
                 "name": "Coconut Curry with Naan",
@@ -5372,7 +7130,7 @@ RECIPE_DB = [
                     "Warm naan in the oven or skillet.",
                     "Serve curry in a bowl with naan on the side and mango chutney for dipping.",
                 ],
-                "tip": "Thin the curry slightly for naan [ it should pour, not scoop.",
+                "tip": "Thin the curry slightly for naan. It should pour, not scoop.",
             },
             {
                 "name": "Curry Chicken Lettuce Cups",
@@ -5383,7 +7141,7 @@ RECIPE_DB = [
                     "Lay out lettuce cups on a platter.",
                     "Spoon curry into each cup. Top with cucumber, mint, a squeeze of lime, and crushed peanuts.",
                 ],
-                "tip": "Shred or chop the chicken before filling the cups ] easier to eat and distribute evenly.",
+                "tip": "Shred or chop the chicken before filling the cups. Easier to eat and distribute evenly.",
             },
         ],
     },
@@ -5416,7 +7174,7 @@ RECIPE_DB = [
             ],
             "steps": [
                 "Heat oil over medium. Add onion and cook 8 minutes until deeply golden.",
-                "Add garlic and ginger [ cook 1 minute.",
+                "Add garlic and ginger. Cook 1 minute.",
                 "Add all spices and stir 30 seconds to bloom.",
                 "Add lentils, diced tomatoes, broth, and coconut milk. Stir well.",
                 "Bring to a boil, then reduce to a low simmer. Cook uncovered 20–25 minutes, stirring occasionally, until lentils dissolve into a thick creamy sauce.",
@@ -5427,14 +7185,14 @@ RECIPE_DB = [
         "uses": [
             {
                 "name": "Over Basmati Rice",
-                "subtitle": "the classic way ] creamy lentil curry ladled over fluffy basmati",
+                "subtitle": "the classic way. Creamy lentil curry ladled over fluffy basmati",
                 "extras": ["2 cups basmati rice, cooked", "Coconut cream swirl", "Fresh cilantro", "Naan on the side"],
                 "steps": [
                     "Reheat lentil curry with a splash of broth or water, stirring until smooth.",
                     "Ladle over basmati rice.",
                     "Swirl coconut cream over the top and finish with cilantro.",
                 ],
-                "tip": "Red lentil curry thickens dramatically in the fridge [ always add a splash of water when reheating.",
+                "tip": "Red lentil curry thickens dramatically in the fridge. Always add a splash of water when reheating.",
             },
             {
                 "name": "Lentil Curry Soup",
@@ -5442,10 +7200,10 @@ RECIPE_DB = [
                 "extras": ["1–2 cups extra vegetable broth", "Crusty bread or naan", "Yogurt or coconut cream", "Chili flakes"],
                 "steps": [
                     "Add extra broth to the curry and simmer 5 minutes to create a soup consistency.",
-                    "Adjust seasoning ] a thinner curry needs more salt and lemon.",
+                    "Adjust seasoning. A thinner curry needs more salt and lemon.",
                     "Serve in bowls with crusty bread and a swirl of coconut cream.",
                 ],
-                "tip": "A squeeze of extra lemon brightens the soup version [ the spice flavor can get muted when diluted.",
+                "tip": "A squeeze of extra lemon brightens the soup version. The spice flavor can get muted when diluted.",
             },
             {
                 "name": "Lentil Curry over Roasted Vegetables",
@@ -5457,7 +7215,7 @@ RECIPE_DB = [
                     "Arrange roasted vegetables in a bowl and spoon lentil curry over the top.",
                     "Finish with fresh cilantro and a squeeze of lemon.",
                 ],
-                "tip": "Roasting the vegetables separately keeps them from going mushy ] the contrast of crispy edges against the creamy curry is the point.",
+                "tip": "Roasting the vegetables separately keeps them from going mushy. The contrast of crispy edges against the creamy curry is the point.",
             },
         ],
     },
@@ -5465,7 +7223,7 @@ RECIPE_DB = [
         "_id": "indian-veggie-rice-bowl",
         "_keywords": ["vegetable", "indian", "curry", "cauliflower", "sweet potato", "broccoli", "rice", "yogurt", "lunch"],
         "image": "/static/images/indian-veggie-rice-bowl.webp",
-        "intro": "Indian-spiced roasted vegetables [ cauliflower, sweet potato, and broccoli ] over fluffy rice with a tangy curry yogurt sauce that pulls it all together.",
+        "intro": "Indian-spiced roasted vegetables. Cauliflower, sweet potato, and broccoli. Over fluffy rice with a tangy curry yogurt sauce that pulls it all together.",
         "base": {
             "title": "Indian Curry Vegetable Rice Bowls",
             "ingredients": [
@@ -5513,7 +7271,7 @@ RECIPE_DB = [
                     "Arrange over rice and drizzle with curry yogurt.",
                     "Finish with fresh cilantro and a squeeze of lime.",
                 ],
-                "tip": "Reheat vegetables in the oven so they re-crisp [ microwaving makes them steam and go soggy.",
+                "tip": "Reheat vegetables in the oven so they re-crisp. Microwaving makes them steam and go soggy.",
             },
             {
                 "name": "Veggie Bowl with Chickpeas",
@@ -5524,7 +7282,7 @@ RECIPE_DB = [
                     "Build the bowl with rice, roasted vegetables, and crispy chickpeas.",
                     "Drizzle with curry yogurt and serve immediately so chickpeas stay crisp.",
                 ],
-                "tip": "Roasted chickpeas lose their crunch quickly ] add them right before eating, not during meal prep.",
+                "tip": "Roasted chickpeas lose their crunch quickly. Add them right before eating, not during meal prep.",
             },
             {
                 "name": "Curry Veggie Flatbread",
@@ -5535,7 +7293,7 @@ RECIPE_DB = [
                     "Spread a thick layer of curry yogurt over each naan.",
                     "Top with warm roasted vegetables, a handful of arugula, pickled onion, and cheese crumbles.",
                 ],
-                "tip": "This is a great lunch when you want something handheld [ slice the naan in half before serving.",
+                "tip": "This is a great lunch when you want something handheld. Slice the naan in half before serving.",
             },
         ],
     },
@@ -5543,21 +7301,21 @@ RECIPE_DB = [
         "_id": "indian-savory-toast",
         "_keywords": ["french toast", "savory", "indian", "egg", "masala", "breakfast", "spiced", "casserole"],
         "image": "/static/images/indian-savory-toast.jpg",
-        "intro": "Thick-cut bread dipped in a spiced egg mixture with onion, green chili, and cilantro, then pan-fried until golden ] Indian masala French toast that's savory, crispy, and done in 10 minutes.",
+        "servings": 2,
+        "calories_per_serving": 181,
+        "intro": "Thick-cut bread dipped in a spiced egg mixture with onion, green chili, and cilantro, then pan-fried until golden. Indian masala French toast that's savory, crispy, and done in 10 minutes.",
         "base": {
             "title": "Indian Savory French Toast",
             "ingredients": [
-                "8 thick slices white or sourdough bread",
                 "4 large eggs",
-                "1/4 cup milk",
-                "1/2 small red onion, finely minced",
-                "1 green chili or jalapeño, finely minced (seeds removed for less heat)",
-                "3 tbsp fresh cilantro, finely chopped",
-                "1/2 tsp cumin",
-                "1/4 tsp turmeric",
-                "1/4 tsp black pepper",
-                "Salt to taste",
-                "2 tbsp butter or oil for frying",
+                "4 tbsp red onion, finely minced",
+                "2 tsp green chili or jalapeño, finely minced",
+                "1/2 tsp ground turmeric",
+                "1 tsp kosher salt",
+                "4 tbsp cilantro, finely chopped",
+                "2/3 cup milk or water",
+                "4 slices sourdough, multigrain, or whole wheat bread",
+                "Oil or butter for frying",
             ],
             "steps": [
                 "Whisk together eggs, milk, onion, green chili, cilantro, cumin, turmeric, pepper, and salt in a wide, shallow bowl.",
@@ -5575,14 +7333,14 @@ RECIPE_DB = [
                 "steps": [
                     "Cook toast in batches, keeping finished pieces warm in a low oven (200°F).",
                     "Serve on a plate with mint chutney and ketchup alongside.",
-                    "Eat with chai [ the traditional pairing.",
+                    "Eat with chai. The traditional pairing.",
                 ],
-                "tip": "Don't press down on the toast while it cooks ] let the crust form naturally for crispier edges.",
+                "tip": "Don't press down on the toast while it cooks. Let the crust form naturally for crispier edges.",
             },
             {
                 "name": "Savory French Toast Casserole",
-                "subtitle": "make a big batch baked in a casserole dish [ perfect for meal prep or brunch",
-                "extras": ["1 loaf sourdough, cubed", "8 eggs (double batch of mixture)", "1/2 cup milk", "Extra onion and cilantro", "Cheese (optional ] cheddar or paneer)"],
+                "subtitle": "make a big batch baked in a casserole dish. Perfect for meal prep or brunch",
+                "extras": ["1 loaf sourdough, cubed", "8 eggs (double batch of mixture)", "1/2 cup milk", "Extra onion and cilantro", "Cheese (optional. Cheddar or paneer)"],
                 "steps": [
                     "Grease a 9×13 baking dish. Cut bread into 1-inch cubes and spread in dish.",
                     "Make a double batch of the egg mixture. Pour over bread and press down gently so all bread soaks.",
@@ -5590,7 +7348,7 @@ RECIPE_DB = [
                     "Bake at 375°F for 30–35 minutes until top is golden and egg is set.",
                     "Slice and serve with mint chutney and ketchup.",
                 ],
-                "tip": "Overnight soak makes the casserole richer [ assemble the night before for an effortless morning.",
+                "tip": "Overnight soak makes the casserole richer. Assemble the night before for an effortless morning.",
             },
             {
                 "name": "Masala Toast Sandwich",
@@ -5606,10 +7364,536 @@ RECIPE_DB = [
         ],
     },
     {
+        "_id": "chana-masala",
+        "_keywords": ["chickpea", "chana", "masala", "indian", "vegan", "tomato", "spiced", "dinner", "lunch"],
+        "image": "/static/images/chana.jpg",
+        "servings": 4,
+        "calories_per_serving": 277,
+        "intro": "Bold, tangy chickpea curry simmered with tomatoes, onions, and a deeply spiced masala, the backbone of Indian home cooking, better the next day.",
+        "base": {
+            "title": "Chana Masala",
+            "ingredients": [
+                "2 cans (15 oz each) chickpeas, drained",
+                "2 large tomatoes, diced (or 1 can crushed tomatoes)",
+                "1 yellow onion, finely diced",
+                "4 cloves garlic, minced",
+                "1 tbsp ginger, grated",
+                "2 tbsp oil",
+                "2 tsp cumin",
+                "1.5 tsp coriander",
+                "1 tsp turmeric",
+                "1 tsp garam masala",
+                "1 tsp amchur (dry mango powder) or lemon juice",
+                "1/2 tsp chili powder",
+                "Salt",
+                "Fresh cilantro",
+                "[ To serve ]",
+                "2 cups basmati rice",
+            ],
+            "steps": [
+                "Heat oil in a heavy pot over medium-high. Add onion and cook 8–10 minutes until deeply golden.",
+                "Add garlic and ginger, cook 1 minute.",
+                "Add cumin, coriander, turmeric, and chili powder. Stir 30 seconds to bloom.",
+                "Add tomatoes. Cook 5–7 minutes, stirring, until oil separates from the masala.",
+                "Add chickpeas and 1/2 cup water. Stir to coat. Simmer 15 minutes.",
+                "Stir in garam masala and amchur (or lemon). Season with salt.",
+                "Finish with fresh cilantro. Serve over basmati rice.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Chana Masala Bowl",
+                "subtitle": "over basmati rice with fresh cilantro and a squeeze of lemon",
+                "extras": ["Fresh cilantro", "Lemon wedge", "Sliced red onion", "Green chili"],
+                "steps": [
+                    "Reheat chana masala with a splash of water.",
+                    "Serve over rice.",
+                    "Top with fresh cilantro, sliced red onion, and a squeeze of lemon.",
+                ],
+                "tip": "Chana masala improves dramatically overnight, the spices meld and the chickpeas absorb the sauce.",
+            },
+            {
+                "name": "Chana with Naan",
+                "subtitle": "the thick gravy served alongside warm naan for scooping",
+                "extras": ["2–3 naans", "Yogurt", "Sliced red onion", "Green chutney"],
+                "steps": [
+                    "Cook the chana down until very thick by simmering uncovered 5 extra minutes.",
+                    "Toast naan in a dry skillet.",
+                    "Serve the thick chana alongside naan with yogurt, raw onion, and chutney.",
+                ],
+                "tip": "Thick chana works better for naan dipping, the gravy clings to the bread perfectly.",
+            },
+            {
+                "name": "Chana Stuffed Baked Potato",
+                "subtitle": "spoon the curry over a split baked potato with yogurt and cilantro",
+                "extras": ["4 russet potatoes", "Plain yogurt", "Pickled red onion", "Cilantro", "Chili flakes"],
+                "steps": [
+                    "Bake potatoes at 400°F for 55 minutes until tender. Split and fluff.",
+                    "Reheat chana masala and spoon generously over each potato.",
+                    "Top with yogurt, pickled onion, and cilantro.",
+                ],
+                "tip": "The potato absorbs the masala sauce, one of the most satisfying ways to eat chana.",
+            },
+        ],
+    },
+    {
+        "_id": "aloo-gobi",
+        "_keywords": ["potato", "cauliflower", "aloo", "gobi", "indian", "dry curry", "vegan", "turmeric", "dinner", "lunch"],
+        "image": "/static/images/aloo-gobi.jpg",
+        "intro": "A classic Indian dry curry of golden potatoes and cauliflower spiced with cumin, turmeric, and garam masala. No sauce, just toasty, deeply spiced vegetables.",
+        "base": {
+            "title": "Aloo Gobi",
+            "ingredients": [
+                "1 small head cauliflower, cut into florets",
+                "3 medium potatoes, peeled and cubed",
+                "1 yellow onion, thinly sliced",
+                "3 cloves garlic, minced",
+                "1 tbsp ginger, grated",
+                "1 tsp cumin seeds",
+                "1 tsp turmeric",
+                "1 tsp coriander",
+                "1/2 tsp garam masala",
+                "1/2 tsp chili powder",
+                "3 tbsp oil",
+                "Salt",
+                "Fresh cilantro",
+            ],
+            "steps": [
+                "Heat oil in a wide heavy pan over medium-high. Add cumin seeds and sizzle 30 seconds.",
+                "Add onion and cook 6–8 minutes until golden. Add garlic and ginger  1 minute.",
+                "Add turmeric, coriander, and chili powder. Stir 30 seconds.",
+                "Add potatoes and toss to coat in the spice base. Cover and cook 8 minutes, stirring occasionally.",
+                "Add cauliflower florets. Stir to combine. Season with salt.",
+                "Cover and cook 10–12 minutes until both are tender.",
+                "Uncover, raise heat, and stir-fry 3–4 minutes to caramelize the edges.",
+                "Finish with garam masala and fresh cilantro.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Aloo Gobi with Roti",
+                "subtitle": "served alongside warm roti or naan as a dry sabzi",
+                "extras": ["4 rotis or naans", "Plain yogurt", "Mango chutney", "Lemon wedge"],
+                "steps": [
+                    "Reheat aloo gobi in a skillet over medium-high to re-crisp the edges.",
+                    "Warm roti in a dry skillet.",
+                    "Serve aloo gobi on the side with yogurt and chutney.",
+                ],
+                "tip": "The pan should be hot when you reheat, you want caramelized edges, not steamed vegetables.",
+            },
+            {
+                "name": "Aloo Gobi Rice Bowl",
+                "subtitle": "served over basmati with raita and pickled onions",
+                "extras": ["2 cups basmati rice, cooked", "Cucumber raita", "Pickled red onion", "Fresh cilantro"],
+                "steps": [
+                    "Plate rice. Pile aloo gobi over the top.",
+                    "Add a generous spoonful of raita on the side.",
+                    "Top with pickled red onion and cilantro.",
+                ],
+                "tip": "Cool raita against the spiced dry curry is the pairing, don't skip it.",
+            },
+            {
+                "name": "Aloo Gobi Paratha Wrap",
+                "subtitle": "use the filling inside a pan-fried flatbread with chutney",
+                "extras": ["Whole wheat lavash or large tortilla", "Butter", "Yogurt", "Mango chutney"],
+                "steps": [
+                    "Mash the aloo gobi slightly with a fork, chunky but cohesive.",
+                    "Warm a large tortilla in a buttered pan.",
+                    "Spoon filling onto half, fold over, and press. Cook 2 minutes per side until golden.",
+                    "Serve with yogurt and mango chutney.",
+                ],
+                "tip": "Mash the filling slightly so it stays inside, too chunky and it falls out.",
+            },
+        ],
+    },
+    {
+        "_id": "palak-paneer",
+        "_keywords": ["spinach", "palak", "paneer", "indian", "vegetarian", "cream", "curry", "dinner"],
+        "image": "/static/images/palak-paneer.jpg",
+        "servings": 6,
+        "calories_per_serving": 350,
+        "intro": "Silky blanched spinach blended into a velvety spiced sauce with crispy golden paneer cubes, the richest, creamiest Indian vegetarian main.",
+        "base": {
+            "title": "Palak Paneer",
+            "ingredients": [
+                "[ Spinach Sauce ]",
+                "1.5 lbs fresh spinach",
+                "1 yellow onion, diced",
+                "4 cloves garlic",
+                "1 tbsp ginger",
+                "2 green chilies, roughly chopped",
+                "1 tsp cumin seeds",
+                "1 tsp coriander",
+                "1/2 tsp turmeric",
+                "1/2 tsp garam masala",
+                "3 tbsp oil or ghee",
+                "1/4 cup heavy cream",
+                "Salt",
+                "[ Paneer ]",
+                "14 oz paneer, cut into 1-inch cubes",
+                "1 tbsp oil",
+                "Salt",
+                "[ To serve ]",
+                "Basmati rice or naan",
+            ],
+            "steps": [
+                "Blanch spinach in boiling water 2 minutes. Drain, cool under cold water, and blend smooth. Set aside.",
+                "Pan-fry paneer cubes in 1 tbsp oil over medium-high until golden on two sides, 2–3 minutes per side. Set aside.",
+                "Heat ghee in the same pan. Add cumin seeds and sizzle 30 seconds.",
+                "Add onion and cook 8 minutes until golden. Add garlic, ginger, and green chilies  1 minute.",
+                "Add coriander and turmeric. Stir 30 seconds.",
+                "Add the blended spinach. Simmer 5 minutes.",
+                "Add cream and garam masala. Simmer 2 more minutes.",
+                "Add paneer. Season with salt and serve over rice or naan.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Palak Paneer Rice Bowl",
+                "subtitle": "the classic: rich spinach curry over fluffy basmati",
+                "extras": ["2 cups basmati rice", "Naan on the side", "Extra cream drizzle", "Lemon wedge"],
+                "steps": [
+                    "Reheat palak paneer gently with a splash of water, it thickens in the fridge.",
+                    "Serve over freshly cooked or reheated basmati rice.",
+                    "Add a drizzle of cream and a squeeze of lemon.",
+                ],
+                "tip": "Palak paneer gets thicker overnight, always add water or cream when reheating.",
+            },
+            {
+                "name": "Palak Paneer with Naan",
+                "subtitle": "served with warm naan for scooping the thick spinach sauce",
+                "extras": ["3 naans", "Yogurt", "Pickled red onion"],
+                "steps": [
+                    "Reheat and cook down palak paneer until quite thick.",
+                    "Toast naan in a dry pan or directly over a gas flame.",
+                    "Serve in a bowl with naan and yogurt on the side.",
+                ],
+                "tip": "A thicker palak paneer works better for naan dipping, reduce uncovered a few minutes.",
+            },
+            {
+                "name": "Palak Paneer Toast",
+                "subtitle": "spoon the thick sauce over sourdough toast for a quick lunch",
+                "extras": ["2 thick slices sourdough", "Extra paneer pan-fried crispy", "Chili flakes", "Lemon zest"],
+                "steps": [
+                    "Toast sourdough until very crispy.",
+                    "Warm palak paneer until thick, not soupy.",
+                    "Spoon over toast, top with extra crispy paneer, chili flakes, and lemon zest.",
+                ],
+                "tip": "Pan-fry extra paneer until extra crispy for the topping, the texture contrast is the point.",
+            },
+        ],
+    },
+    {
+        "_id": "dal-tadka",
+        "_keywords": ["dal", "tadka", "lentil", "indian", "vegan", "yellow lentils", "tempering", "dinner", "lunch"],
+        "image": "/static/images/dal-tadka.jpg",
+        "intro": "Yellow lentils cooked until silky, then finished with a sizzling tadka of butter, cumin, garlic, and dried red chilies. The tempering transforms a simple dal into something extraordinary.",
+        "base": {
+            "title": "Dal Tadka",
+            "ingredients": [
+                "[ Dal ]",
+                "1.5 cups yellow lentils (toor dal or chana dal), rinsed",
+                "1 yellow onion, diced",
+                "2 tomatoes, diced",
+                "3 cloves garlic, minced",
+                "1 tbsp ginger, grated",
+                "1 green chili, slit",
+                "1 tsp turmeric",
+                "1 tsp coriander",
+                "Salt",
+                "4 cups water",
+                "[ Tadka ]",
+                "3 tbsp ghee or butter",
+                "1 tsp cumin seeds",
+                "4 cloves garlic, thinly sliced",
+                "2–3 dried red chilies",
+                "1/2 tsp Kashmiri chili powder",
+                "Fresh cilantro",
+            ],
+            "steps": [
+                "Combine lentils, onion, tomatoes, garlic, ginger, green chili, turmeric, coriander, salt, and water in a pot.",
+                "Bring to a boil, then reduce to a simmer. Cook 25–30 minutes until lentils are completely soft and the dal is thick.",
+                "Mash partially with a spoon, texture should be between soup and purée.",
+                "Make the tadka: heat ghee in a small pan over medium-high until shimmering. Add cumin seeds and sizzle 30 seconds.",
+                "Add sliced garlic, cook until just golden. Add dried chilies and chili powder.",
+                "Immediately pour the sizzling tadka over the dal.",
+                "Stir once and top with fresh cilantro.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Dal Tadka over Rice",
+                "subtitle": "the classic way: ladled over fluffy basmati with a fresh tadka",
+                "extras": ["2 cups basmati rice", "Extra ghee", "Fresh cilantro", "Lemon wedge"],
+                "steps": [
+                    "Reheat dal with a splash of water, stirring until smooth.",
+                    "Make a fresh mini tadka if you have time: 1 tbsp ghee, pinch of cumin, 1 garlic clove.",
+                    "Ladle over rice and top with fresh tadka and cilantro.",
+                ],
+                "tip": "A fresh mini tadka poured over reheated dal makes it taste just made, takes 90 seconds.",
+            },
+            {
+                "name": "Dal as Soup",
+                "subtitle": "thin with extra broth for a warming, spoonable soup with crusty bread",
+                "extras": ["1–2 cups vegetable broth", "Crusty bread or naan", "Yogurt swirl", "Chili oil"],
+                "steps": [
+                    "Add extra broth to the dal and heat through until soup consistency.",
+                    "Adjust with more salt and lemon.",
+                    "Serve in bowls with crusty bread and a drizzle of yogurt or chili oil.",
+                ],
+                "tip": "Thinned dal makes a beautiful soup, brighter and more balanced than it is thick.",
+            },
+            {
+                "name": "Dal with Naan",
+                "subtitle": "serve the thick dal in a bowl alongside warm naan for dipping",
+                "extras": ["2–3 naans", "Raw sliced onion", "Green chutney", "Lemon"],
+                "steps": [
+                    "Heat dal until very thick, almost like a dip.",
+                    "Toast naan in a skillet or oven.",
+                    "Serve dal with naan, raw onion, green chutney, and lemon.",
+                ],
+                "tip": "Raw red onion with dal is a classic accompaniment, the sharpness cuts through the richness.",
+            },
+        ],
+    },
+    {
+        "_id": "bhindi-do-pyaza",
+        "_keywords": ["okra", "bhindi", "do pyaza", "indian", "vegan", "dry curry", "onion", "lunch", "dinner"],
+        "image": "/static/images/bhindi.jpg",
+        "intro": "Crispy stir-fried okra with double the onions, do pyaza means twice the onion, added at two stages for sweetness and crunch. A beloved Indian dry vegetable dish.",
+        "base": {
+            "title": "Bhindi Do Pyaza (Okra with Double Onion)",
+            "ingredients": [
+                "1.5 lbs okra, tops trimmed, cut into 1-inch pieces",
+                "3 medium onions (2 for cooking, 1 raw for finish)",
+                "3 cloves garlic, minced",
+                "1 tsp ginger, grated",
+                "2 tomatoes, diced",
+                "1 tsp cumin seeds",
+                "1 tsp coriander",
+                "1/2 tsp turmeric",
+                "1/2 tsp garam masala",
+                "1/2 tsp chili powder",
+                "3 tbsp oil",
+                "Salt",
+                "Fresh cilantro",
+            ],
+            "steps": [
+                "IMPORTANT: okra must be completely dry before cutting. Pat dry and air-dry 15 minutes.",
+                "Heat 2 tbsp oil in a wide pan over high. Add okra and cook WITHOUT stirring 3–4 minutes. Stir and cook 5 more minutes until lightly browned. Remove and set aside.",
+                "In the same pan, heat remaining oil. Add cumin seeds and sizzle 30 seconds.",
+                "Add 2 diced onions. Cook 8–10 minutes until deep golden brown.",
+                "Add garlic and ginger  1 minute. Add coriander, turmeric, and chili powder.",
+                "Add tomatoes. Cook 4 minutes, mashing, until oil separates.",
+                "Return okra. Stir gently. Season with salt.",
+                "Thinly slice the third onion raw and add now. Stir in garam masala and cilantro.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Bhindi with Roti",
+                "subtitle": "served as a side sabzi with warm roti and plain yogurt",
+                "extras": ["4 rotis or chapatis", "Plain yogurt", "Lemon wedge"],
+                "steps": [
+                    "Reheat bhindi in a hot dry pan to re-crisp (avoid microwave, it softens the okra).",
+                    "Serve with roti and a bowl of plain yogurt on the side.",
+                ],
+                "tip": "Dry heat is everything with okra, always reheat in a hot pan, never microwave it.",
+            },
+            {
+                "name": "Bhindi Rice Bowl",
+                "subtitle": "over basmati rice with a dollop of raita",
+                "extras": ["2 cups basmati rice, cooked", "Cucumber raita", "Pickled onion", "Lemon"],
+                "steps": [
+                    "Reheat bhindi in a skillet over high heat to crisp the edges.",
+                    "Plate over rice. Add cucumber raita on the side.",
+                    "Finish with pickled red onion and a squeeze of lemon.",
+                ],
+                "tip": "Crispy texture is what makes this dish, serve immediately over the rice.",
+            },
+            {
+                "name": "Bhindi Wrap",
+                "subtitle": "roll the okra and onions into a flatbread with chutney",
+                "extras": ["Whole wheat lavash or large tortilla", "Green chutney", "Sliced cucumber", "Plain yogurt"],
+                "steps": [
+                    "Reheat bhindi in a hot pan.",
+                    "Warm lavash in a dry skillet.",
+                    "Spread green chutney and yogurt down the center, layer bhindi and sliced cucumber.",
+                    "Roll and eat immediately.",
+                ],
+                "tip": "Eat right away, the okra will steam and lose its crunch if you wait.",
+            },
+        ],
+    },
+    {
+        "_id": "butter-chicken",
+        "_keywords": ["butter chicken", "murgh makhani", "chicken", "indian", "cream", "tomato", "tikka", "dinner"],
+        "image": "/static/images/Butter-Chicken.jpg",
+        "intro": "Tender marinated chicken tikka in a silky tomato-butter sauce with cream and aromatic spices. The most beloved Indian dish, rich, warming, and deeply satisfying.",
+        "base": {
+            "title": "Butter Chicken (Murgh Makhani)",
+            "ingredients": [
+                "[ Chicken Tikka ]",
+                "2 lbs boneless chicken thighs, cut into chunks",
+                "1/2 cup Greek yogurt",
+                "2 tbsp lemon juice",
+                "1 tbsp ginger, grated",
+                "3 cloves garlic, grated",
+                "1.5 tsp garam masala",
+                "1 tsp smoked paprika",
+                "1/2 tsp turmeric",
+                "1/2 tsp chili powder",
+                "Salt",
+                "[ Makhani Sauce ]",
+                "1 yellow onion, diced",
+                "4 cloves garlic",
+                "1 tbsp ginger",
+                "1 can (14 oz) crushed tomatoes",
+                "3 tbsp butter",
+                "1/2 cup heavy cream",
+                "1/4 cup raw cashews",
+                "1 tsp garam masala",
+                "1 tsp coriander",
+                "1/2 tsp turmeric",
+                "1/2 tsp chili powder",
+                "Salt",
+                "[ To serve ]",
+                "Basmati rice and naan",
+            ],
+            "steps": [
+                "Marinate chicken: combine yogurt, lemon, ginger, garlic, and spices. Coat chicken and refrigerate 1 hour minimum.",
+                "Broil chicken at 450°F for 12–15 minutes until charred at edges and cooked through. Set aside.",
+                "Make sauce: cook onion in 1 tbsp butter until golden, 8 minutes. Add garlic and ginger  1 minute.",
+                "Add spices and stir 30 seconds. Add crushed tomatoes and cashews. Simmer 15 minutes.",
+                "Blend sauce completely smooth. Return to pan.",
+                "Add remaining butter and cream. Simmer 5 minutes until silky.",
+                "Add chicken. Simmer 5 more minutes. Serve over basmati with naan.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Butter Chicken Bowl",
+                "subtitle": "over basmati with extra sauce and warm naan on the side",
+                "extras": ["2 cups basmati rice", "Warm naan", "Extra cream drizzle", "Fresh cilantro"],
+                "steps": [
+                    "Reheat butter chicken gently, the cream sauce can break on high heat.",
+                    "Serve over rice with plenty of sauce.",
+                    "Finish with a swirl of cream and fresh cilantro.",
+                ],
+                "tip": "Reheat on medium-low with a splash of water, the cream sauce splits if overheated.",
+            },
+            {
+                "name": "Butter Chicken Naan Pizza",
+                "subtitle": "use the sauce as a pizza base over toasted naan with mozzarella",
+                "extras": ["2 naans", "Shredded mozzarella", "Sliced red onion", "Fresh cilantro"],
+                "steps": [
+                    "Spread a thick layer of butter chicken sauce over each naan.",
+                    "Top with shredded chicken, mozzarella, and sliced red onion.",
+                    "Bake at 400°F for 8–10 minutes until cheese bubbles.",
+                    "Finish with fresh cilantro.",
+                ],
+                "tip": "The butter chicken sauce makes an incredible pizza base, spiced, rich, and slightly sweet.",
+            },
+            {
+                "name": "Butter Chicken Wrap",
+                "subtitle": "roll the chicken in a warm lavash with crunchy cabbage and mint chutney",
+                "extras": ["2 large lavash or tortillas", "Shredded red cabbage", "Mint chutney", "Sliced cucumber", "Yogurt"],
+                "steps": [
+                    "Warm lavash in a dry skillet.",
+                    "Spread mint chutney and yogurt down the center.",
+                    "Layer chicken pieces, a spoonful of sauce, shredded cabbage, and cucumber.",
+                    "Roll tightly and wrap in foil, holds well for lunch.",
+                ],
+                "tip": "Raw cabbage cuts through the richness of the sauce, don't skip it.",
+            },
+        ],
+    },
+    {
+        "_id": "tofu-tikka-masala",
+        "_keywords": ["tofu", "tikka masala", "indian", "vegan", "tomato", "coconut", "dinner"],
+        "image": "/static/images/tofu-tikka.jpg",
+        "servings": 6,
+        "calories_per_serving": 223,
+        "intro": "Extra-firm tofu marinated and broiled until crispy, then simmered in a velvety tikka masala sauce. All the depth of the original, completely plant-based.",
+        "base": {
+            "title": "Tofu Tikka Masala",
+            "ingredients": [
+                "[ Tofu Tikka ]",
+                "2 blocks (14 oz each) extra-firm tofu, pressed and cubed",
+                "1/2 cup coconut yogurt",
+                "2 tbsp lemon juice",
+                "2 cloves garlic, grated",
+                "1 tsp ginger",
+                "1.5 tsp garam masala",
+                "1 tsp smoked paprika",
+                "1/2 tsp turmeric",
+                "Salt",
+                "[ Tikka Masala Sauce ]",
+                "1 yellow onion, diced",
+                "4 cloves garlic",
+                "1 tbsp ginger",
+                "1 can (14 oz) crushed tomatoes",
+                "1 can (14 oz) coconut cream",
+                "2 tbsp oil",
+                "1.5 tsp garam masala",
+                "1 tsp coriander",
+                "1/2 tsp turmeric",
+                "1/2 tsp chili powder",
+                "Salt",
+                "[ To serve ]",
+                "Basmati rice or naan",
+            ],
+            "steps": [
+                "Press tofu: wrap in towels, place something heavy on top for 20 minutes.",
+                "Marinate tofu: mix coconut yogurt, lemon, garlic, ginger, and spices. Toss with tofu cubes. Marinate 30 min.",
+                "Broil tofu on a lined baking sheet at 450°F for 15–18 minutes, turning once, until charred and firm.",
+                "Make sauce: cook onion in oil until golden, 8 minutes. Add garlic and ginger  1 minute.",
+                "Add spices. Stir 30 seconds. Add crushed tomatoes and simmer 10 minutes.",
+                "Add coconut cream. Simmer 5 minutes until sauce is silky.",
+                "Add broiled tofu. Simmer 5 more minutes. Serve over rice.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Tikka Masala Bowl",
+                "subtitle": "over basmati rice with extra sauce and warm naan",
+                "extras": ["2 cups basmati rice", "Naan", "Fresh cilantro", "Coconut yogurt drizzle"],
+                "steps": [
+                    "Reheat tikka masala gently with a splash of water.",
+                    "Serve over rice.",
+                    "Drizzle coconut yogurt over the top and finish with cilantro.",
+                ],
+                "tip": "Coconut yogurt adds a subtle tropical note, it keeps this fully vegan.",
+            },
+            {
+                "name": "Tikka Masala with Naan",
+                "subtitle": "served thick with warm naan for dipping",
+                "extras": ["2–3 naans", "Mint chutney", "Sliced red onion"],
+                "steps": [
+                    "Cook tikka masala down until thick.",
+                    "Toast naan in a dry pan.",
+                    "Serve masala in a bowl with naan, mint chutney, and raw red onion.",
+                ],
+                "tip": "Reduce the sauce a little more than usual for naan, thick enough to cling.",
+            },
+            {
+                "name": "Tikka Masala Grain Bowl",
+                "subtitle": "serve over quinoa with roasted chickpeas and baby spinach",
+                "extras": ["2 cups quinoa, cooked", "1 can chickpeas, roasted", "Baby spinach", "Lemon"],
+                "steps": [
+                    "Roast chickpeas at 425°F with olive oil and cumin for 20 minutes until crispy.",
+                    "Layer: grains, baby spinach (it wilts in the warm sauce), tofu tikka masala.",
+                    "Top with crispy chickpeas and a squeeze of lemon.",
+                ],
+                "tip": "Crispy chickpeas on top add texture contrast, add them right before eating so they stay crunchy.",
+            },
+        ],
+    },
+    {
         "_id": "spanish-breakfast-hash",
         "_keywords": ["chorizo", "eggs", "potatoes", "peppers", "spanish", "sheet pan", "hash", "breakfast"],
         "image": "/static/images/spanish-breakfast-hash.jpg",
-        "intro": "Crispy sliced potatoes, spiced chorizo, and roasted peppers all on one sheet pan with eggs cracked in at the end ] a bold Spanish breakfast hash that goes from oven to table.",
+        "intro": "Crispy sliced potatoes, spiced chorizo, and roasted peppers all on one sheet pan with eggs cracked in at the end. A bold Spanish breakfast hash that goes from oven to table.",
         "base": {
             "title": "Spanish Sheet Pan Breakfast Hash",
             "ingredients": [
@@ -5643,14 +7927,14 @@ RECIPE_DB = [
         "uses": [
             {
                 "name": "Classic Sheet Pan Hash",
-                "subtitle": "everything from the pan [ chorizo, eggs, potatoes, and a labneh drizzle",
+                "subtitle": "everything from the pan. Chorizo, eggs, potatoes, and a labneh drizzle",
                 "extras": ["Extra labneh or Greek yogurt", "Lemon wedge", "Chili flakes", "Crusty bread"],
                 "steps": [
                     "Serve directly from the sheet pan at the table.",
                     "Drizzle labneh over the top, scatter parsley, and add lemon wedges.",
                     "Eat with crusty bread to mop up the yolk and labneh.",
                 ],
-                "tip": "Bring the whole sheet pan to the table ] it keeps the hash warm longer and looks dramatic.",
+                "tip": "Bring the whole sheet pan to the table. It keeps the hash warm longer and looks dramatic.",
             },
             {
                 "name": "Hash in a Warm Tortilla",
@@ -5658,10 +7942,10 @@ RECIPE_DB = [
                 "extras": ["4 flour tortillas", "Salsa or hot sauce", "Shredded manchego or cheddar"],
                 "steps": [
                     "Warm tortillas in a dry skillet 30 seconds per side.",
-                    "Scoop a portion of hash [ chorizo, potato, peppers, and egg ] into each tortilla.",
+                    "Scoop a portion of hash. Chorizo, potato, peppers, and egg. Into each tortilla.",
                     "Top with a drizzle of labneh, a sprinkle of cheese, and hot sauce.",
                 ],
-                "tip": "This is the best way to use leftover hash the next morning [ reheat in a skillet and wrap.",
+                "tip": "This is the best way to use leftover hash the next morning. Reheat in a skillet and wrap.",
             },
             {
                 "name": "Hash Over Toast",
@@ -5669,39 +7953,41 @@ RECIPE_DB = [
                 "extras": ["4 thick slices sourdough, toasted", "Extra labneh", "Chili flakes", "Fresh herbs"],
                 "steps": [
                     "Toast bread until golden and sturdy.",
-                    "Spoon a generous portion of hash ] including an egg [ over each slice.",
+                    "Spoon a generous portion of hash. Including an egg. Over each slice.",
                     "Drizzle with labneh and finish with chili flakes and fresh herbs.",
                 ],
-                "tip": "Press the toast down slightly under the hash so it doesn't slide ] it doubles as the base.",
+                "tip": "Press the toast down slightly under the hash so it doesn't slide. It doubles as the base.",
             },
         ],
     },
     {
         "_id": "spanish-scrambled-eggs",
-        "_keywords": ["eggs", "scrambled", "spanish", "chickpeas", "vegetables", "peppers", "parmesan", "breakfast"],
+        "_keywords": ["eggs", "scrambled", "spanish", "chickpeas", "vegetables", "peppers", "manchego", "spinach", "breakfast"],
         "image": "/static/images/spanish-scrambled-eggs.jpg",
-        "intro": "Soft scrambled eggs folded with chickpeas, bell peppers, zucchini, and fresh herbs, finished with grated Parmesan [ a hearty Spanish-style breakfast that's as satisfying as it is easy.",
+        "servings": 4,
+        "calories_per_serving": 296,
+        "intro": "Soft scrambled eggs folded with chickpeas, bell peppers, spinach, and Manchego, finished with smoked paprika and fresh parsley. A hearty Spanish-style breakfast that's as satisfying as it is easy.",
         "base": {
             "title": "Spanish Scrambled Eggs with Vegetables and Chickpeas",
             "ingredients": [
-                "8 large eggs",
-                "1 can (15 oz) chickpeas, drained",
+                "2 tbsp extra virgin olive oil",
+                "1 small onion, finely diced",
+                "4 cloves garlic, minced",
                 "1 red bell pepper, finely diced",
                 "1 green bell pepper, finely diced",
-                "1 small zucchini, diced",
-                "1/2 yellow onion, finely diced",
-                "3 cloves garlic, minced",
-                "1/4 cup fresh parsley, chopped",
-                "1/4 cup grated Parmesan (plus more to finish)",
-                "2 tbsp olive oil",
-                "1/2 tsp smoked paprika",
-                "Salt and pepper",
-                "Crusty bread, to serve",
+                "1/2 tsp sweet smoked Spanish paprika",
+                "1 tsp dried oregano",
+                "3 oz (100g) fresh spinach",
+                "15.5 oz (440g) can chickpeas, drained and rinsed",
+                "6 cage-free organic eggs",
+                "2 tbsp finely grated Manchego cheese",
+                "Sea salt and black pepper",
+                "Fresh parsley, for garnish",
             ],
             "steps": [
                 "Heat olive oil in a large skillet over medium. Add onion and cook 4 minutes until soft.",
                 "Add bell peppers and zucchini. Cook 4–5 minutes until slightly softened.",
-                "Add garlic and smoked paprika ] stir 1 minute.",
+                "Add garlic and smoked paprika. Stir 1 minute.",
                 "Add chickpeas and toss to heat through, 2 minutes.",
                 "Whisk eggs with a pinch of salt and pepper. Reduce heat to medium-low.",
                 "Pour eggs over the vegetables. Gently fold with a spatula, pulling from the edges inward. Cook until just set but still soft and creamy.",
@@ -5719,7 +8005,7 @@ RECIPE_DB = [
                     "Grate extra Parmesan generously over the top and drizzle with olive oil.",
                     "Serve with thick slices of crusty bread.",
                 ],
-                "tip": "Cook the eggs low and slow [ they should be creamy and soft, not dry. Pull off heat while they still look slightly underdone.",
+                "tip": "Cook the eggs low and slow. They should be creamy and soft, not dry. Pull off heat while they still look slightly underdone.",
             },
             {
                 "name": "In a Warm Baguette",
@@ -5730,7 +8016,7 @@ RECIPE_DB = [
                     "Rub with a cut garlic clove and drizzle with olive oil.",
                     "Pile egg mixture inside, add sliced tomato and a shaving of manchego.",
                 ],
-                "tip": "Rubbing the bread with raw garlic while it's still warm is the Spanish way ] you get the flavor without overwhelming it.",
+                "tip": "Rubbing the bread with raw garlic while it's still warm is the Spanish way. You get the flavor without overwhelming it.",
             },
             {
                 "name": "Over Rice",
@@ -5741,29 +8027,31 @@ RECIPE_DB = [
                     "Spoon the egg and chickpea mixture over the top.",
                     "Drizzle with olive oil and a pinch of smoked paprika. Top with scallions.",
                 ],
-                "tip": "This is the version that travels well for meal prep [ keep eggs and rice separate and combine when reheating.",
+                "tip": "This is the version that travels well for meal prep. Keep eggs and rice separate and combine when reheating.",
             },
         ],
     },
     {
         "_id": "spanish-tortilla",
         "_keywords": ["tortilla", "spanish", "potato", "omelette", "eggs", "breakfast", "meal prep"],
-        "image": "",
-        "intro": "The classic Spanish omelette ] slowly confited potatoes and onion folded into silky beaten eggs, then cooked into a thick, golden tortilla that slices like a pie and travels perfectly.",
+        "image": "/static/images/spanish-tortilla.jpg",
+        "servings": 6,
+        "calories_per_serving": 190,
+        "intro": "The classic Spanish omelette. Slowly confited potatoes and onion folded into silky beaten eggs, then cooked into a thick, golden tortilla that slices like a pie and travels perfectly.",
         "base": {
             "title": "Spanish Tortilla (Tortilla Española)",
             "ingredients": [
-                "8 large eggs",
-                "1.5 lbs Yukon Gold potatoes, peeled and very thinly sliced",
+                "1 lb Yukon Gold potatoes, peeled and very thinly sliced",
                 "1 medium yellow onion, thinly sliced",
-                "1 cup olive oil (for confiting)",
-                "1.5 tsp salt",
-                "Black pepper",
+                "1 cup extra virgin olive oil (for confiting; most drains off)",
+                "6 large eggs",
+                "1 tsp sweet Spanish paprika (optional)",
+                "1 tsp kosher salt",
             ],
             "steps": [
                 "Heat olive oil in a 10-inch non-stick skillet over medium-low. Add potato slices and onion in layers, seasoning with salt as you go.",
                 "Cook slowly, stirring gently occasionally, 20–25 minutes until potatoes are completely tender but not browned. They should almost melt.",
-                "Drain potatoes and onion through a colander set over a bowl [ reserve the oil.",
+                "Drain potatoes and onion through a colander set over a bowl. Reserve the oil.",
                 "Beat eggs well with salt and pepper in a large bowl. Fold in the warm potato-onion mixture. Let sit 5 minutes.",
                 "Heat 2 tbsp of the reserved oil in the skillet over medium. Pour in the egg-potato mixture and spread evenly.",
                 "Cook 4–5 minutes, shaking the pan gently, until edges are set. The center should still be slightly jiggly.",
@@ -5774,25 +8062,25 @@ RECIPE_DB = [
         "uses": [
             {
                 "name": "Room Temperature Slices",
-                "subtitle": "served at room temp the Spanish way ] with alioli and crusty bread",
+                "subtitle": "served at room temp the Spanish way. With alioli and crusty bread",
                 "extras": ["Alioli or garlic mayo", "Crusty bread or baguette", "Sliced tomatoes", "Flaky sea salt"],
                 "steps": [
-                    "Let the tortilla cool to room temperature [ this is how it's traditionally served in Spain.",
+                    "Let the tortilla cool to room temperature. This is how it's traditionally served in Spain.",
                     "Slice into wedges like a pie.",
                     "Serve with alioli for dipping, sliced tomatoes, and crusty bread.",
                 ],
-                "tip": "Tortilla is actually better at room temperature than hot ] the texture firms into something custardy and sliceable.",
+                "tip": "Tortilla is actually better at room temperature than hot. The texture firms into something custardy and sliceable.",
             },
             {
                 "name": "Tortilla Bocadillo",
-                "subtitle": "a wedge of tortilla stuffed in a crusty roll [ the classic Spanish sandwich",
+                "subtitle": "a wedge of tortilla stuffed in a crusty roll. The classic Spanish sandwich",
                 "extras": ["Crusty rolls or baguette, halved", "Alioli or mayonnaise", "Sliced tomato", "Sliced piquillo peppers"],
                 "steps": [
                     "Spread alioli on both sides of the roll.",
                     "Tuck a wedge of tortilla inside.",
                     "Add sliced tomato and piquillo peppers.",
                 ],
-                "tip": "This is the definitive Spanish train station or roadtrip food ] it gets better as it sits.",
+                "tip": "This is the definitive Spanish train station or roadtrip food. It gets better as it sits.",
             },
             {
                 "name": "Tortilla Squares for Meal Prep",
@@ -5803,7 +8091,7 @@ RECIPE_DB = [
                     "Pack with a simple dressed salad of greens, cherry tomatoes, and vinaigrette.",
                     "Include a small container of alioli for dipping.",
                 ],
-                "tip": "Tortilla keeps in the fridge for 4 days [ make one on Sunday and eat it all week.",
+                "tip": "Tortilla keeps in the fridge for 4 days. Make one on Sunday and eat it all week.",
             },
         ],
     },
@@ -5811,7 +8099,7 @@ RECIPE_DB = [
         "_id": "spanish-tortilla-muffins",
         "_keywords": ["tortilla", "muffins", "spanish", "potato", "eggs", "breakfast", "meal prep", "grab and go"],
         "image": "/static/images/spanish-tortilla-muffins.jpg",
-        "intro": "All the flavors of Spanish tortilla baked into individual muffin cups ] crispy potato, caramelized onion, and egg [ with alioli for dipping. Meal prep in 30 minutes, grab 2 every morning.",
+        "intro": "All the flavors of Spanish tortilla baked into individual muffin cups. Crispy potato, caramelized onion, and egg. With alioli for dipping. Meal prep in 30 minutes, grab 2 every morning.",
         "base": {
             "title": "Spanish Tortilla Egg Muffins",
             "ingredients": [
@@ -5866,7 +8154,7 @@ RECIPE_DB = [
                     "Spread alioli on both sides of a slider roll.",
                     "Stack with a muffin half, lettuce, tomato, and piquillo peppers.",
                 ],
-                "tip": "Two muffin halves in a slider is a perfectly portioned breakfast sandwich [ no fork needed.",
+                "tip": "Two muffin halves in a slider is a perfectly portioned breakfast sandwich. No fork needed.",
             },
         ],
     },
@@ -5874,7 +8162,7 @@ RECIPE_DB = [
         "_id": "chipotle-rice-bowl",
         "_keywords": ["chicken", "brown rice", "black beans", "grain bowl", "chipotle", "kale", "meal prep", "lunch"],
         "image": "/static/images/chipotle-rice-bowl.jpg",
-        "intro": "Seasoned grilled chicken over nutty brown rice with black beans, cherry tomatoes, kale, and a bright cilantro-lime green sauce ] a clean, protein-packed grain bowl that meal preps for the whole week.",
+        "intro": "Seasoned grilled chicken over nutty brown rice with black beans, cherry tomatoes, kale, and a bright cilantro-lime green sauce. A clean, protein-packed grain bowl that meal preps for the whole week.",
         "base": {
             "title": "Chipotle Brown Rice Grain Bowl",
             "ingredients": [
@@ -5915,14 +8203,14 @@ RECIPE_DB = [
         "uses": [
             {
                 "name": "Classic Grain Bowl",
-                "subtitle": "brown rice, chicken, black beans, and green sauce [ the full build",
+                "subtitle": "brown rice, chicken, black beans, and green sauce. The full build",
                 "extras": ["Extra green sauce", "Lime wedge", "Sliced avocado", "Hot sauce"],
                 "steps": [
                     "Reheat rice, chicken, and beans separately.",
                     "Build the bowl and drizzle green sauce generously over everything.",
                     "Add avocado and a squeeze of lime.",
                 ],
-                "tip": "The green sauce is what makes this ] make a double batch and use it on everything all week.",
+                "tip": "The green sauce is what makes this. Make a double batch and use it on everything all week.",
             },
             {
                 "name": "Grain Bowl Burrito",
@@ -5933,7 +8221,7 @@ RECIPE_DB = [
                     "Layer rice, chicken, beans, tomatoes, and kale down the center.",
                     "Add cheese, guac, and a drizzle of green sauce. Fold and roll tightly.",
                 ],
-                "tip": "Toast the rolled burrito seam-side down in the skillet 1 minute [ it seals it and gives a crispy exterior.",
+                "tip": "Toast the rolled burrito seam-side down in the skillet 1 minute. It seals it and gives a crispy exterior.",
             },
             {
                 "name": "Grain Bowl Salad",
@@ -5944,58 +8232,50 @@ RECIPE_DB = [
                     "Top with cold chicken, black beans, tomatoes, red onion, and cheese.",
                     "Drizzle with green sauce and add tortilla chips for crunch.",
                 ],
-                "tip": "Massage the kale until it darkens slightly ] it transforms from tough and bitter to tender and sweet.",
+                "tip": "Massage the kale until it darkens slightly. It transforms from tough and bitter to tender and sweet.",
             },
         ],
     },
     {
         "_id": "mexican-chorizo-casserole",
-        "_keywords": ["chorizo", "breakfast", "casserole", "mexican", "eggs", "cheese", "peppers", "meal prep"],
+        "_keywords": ["chorizo", "breakfast", "casserole", "mexican", "eggs", "cheese", "hash brown", "meal prep"],
         "image": "/static/images/mexican-chorizo-casserole.jpg",
-        "intro": "Spiced Mexican chorizo crumbled with peppers and onions, baked with eggs and melted cheese into a hearty breakfast casserole that slices cleanly and reheats perfectly all week.",
+        "servings": 8,
+        "calories_per_serving": 490,
+        "intro": "Hash browns layered with spiced chorizo, 12 eggs, and melted Mexican cheese — baked into a bold breakfast casserole that slices cleanly and reheats perfectly all week.",
         "base": {
             "title": "Mexican Chorizo Breakfast Casserole",
             "ingredients": [
-                "1 lb fresh Mexican chorizo, casings removed",
-                "10 large eggs",
-                "1/2 cup milk",
-                "1 cup shredded Mexican cheese blend or pepper jack",
-                "1 red bell pepper, diced",
-                "1 green bell pepper, diced",
-                "1 jalapeño, minced (seeds removed for mild)",
-                "1/2 yellow onion, diced",
-                "3 cloves garlic, minced",
-                "1 tsp cumin",
-                "1/2 tsp smoked paprika",
-                "Salt and pepper",
-                "Cooking spray",
+                "1 bag (20 oz) cooked shredded hash brown potatoes, thawed",
+                "1 packet taco seasoning mix",
+                "1 lb fresh Mexican chorizo or pork sausage",
+                "12 large eggs",
+                "2 cups shredded Mexican cheese blend",
+                "1/4 cup milk",
+                "1/2 tsp salt",
+                "1/4 tsp ground pepper",
                 "[ To Serve ]",
-                "Salsa or hot sauce",
-                "Sour cream",
-                "Fresh cilantro",
-                "Sliced avocado",
+                "1 1/2 cups salsa",
             ],
             "steps": [
-                "Preheat oven to 375°F. Spray a 9×13 baking dish.",
-                "Cook chorizo in a skillet over medium-high, breaking it up, until browned, 6–8 minutes. Remove and drain excess fat.",
-                "In the same skillet, sauté onion, peppers, and jalapeño 4–5 minutes until soft. Add garlic, cumin, and paprika [ stir 1 minute.",
-                "Spread chorizo and vegetable mixture evenly in the baking dish.",
-                "Whisk eggs with milk, salt, and pepper. Pour over the chorizo mixture.",
-                "Top with shredded cheese.",
-                "Bake 30–35 minutes until eggs are set and cheese is golden. Let cool 10 minutes before slicing.",
+                "Preheat oven to 350°F. Spray a 9×13 baking dish.",
+                "Toss thawed hash browns with taco seasoning; spread in an even layer in the baking dish.",
+                "Cook chorizo in a skillet over medium-high, breaking it up, until browned, 6–8 minutes. Drain excess fat and spread over hash browns.",
+                "Whisk eggs with milk, salt, and pepper. Pour evenly over the chorizo layer.",
+                "Top with shredded Mexican cheese.",
+                "Bake 35–40 minutes until eggs are set and cheese is golden. Let cool 10 minutes before slicing.",
             ],
         },
         "uses": [
             {
                 "name": "Classic Casserole Slice",
-                "subtitle": "a warm slice with salsa, sour cream, and fresh cilantro",
-                "extras": ["Salsa or pico de gallo", "Sour cream", "Fresh cilantro", "Sliced avocado"],
+                "subtitle": "a warm slice served with salsa",
+                "extras": ["Salsa", "Sour cream", "Fresh cilantro", "Sliced avocado"],
                 "steps": [
                     "Reheat a slice in the microwave 90 seconds or in the oven at 350°F for 10 minutes.",
-                    "Top with salsa, sour cream, and fresh cilantro.",
-                    "Serve with sliced avocado on the side.",
+                    "Top with salsa and sour cream. Serve with sliced avocado on the side.",
                 ],
-                "tip": "The casserole actually slices more cleanly when cold from the fridge ] heat individual slices rather than the whole dish.",
+                "tip": "The casserole slices more cleanly when cold from the fridge — cut first, then reheat individual portions.",
             },
             {
                 "name": "Breakfast Casserole Burrito",
@@ -6025,7 +8305,7 @@ RECIPE_DB = [
         "_id": "mexican-street-corn",
         "_keywords": ["street corn", "elote", "corn", "mexican", "cotija", "lime", "chili", "lunch", "snack", "dip"],
         "image": "/static/images/mexican-street-corn.jpg",
-        "intro": "Charred corn tossed with cotija, lime, chili powder, and a creamy mayo-sour cream sauce [ Mexican street corn off the cob, packed and ready to eat with chips all week.",
+        "intro": "Charred corn tossed with cotija, lime, chili powder, and a creamy mayo-sour cream sauce. Mexican street corn off the cob, packed and ready to eat with chips all week.",
         "base": {
             "title": "Mexican Street Corn Dip",
             "ingredients": [
@@ -6043,25 +8323,25 @@ RECIPE_DB = [
                 "Tortilla chips, to serve",
             ],
             "steps": [
-                "Heat a large cast iron or skillet over high heat. Add corn in a single layer ] do not stir for 2–3 minutes until charred. Toss and char the other side. Work in batches for best charring.",
+                "Heat a large cast iron or skillet over high heat. Add corn in a single layer. Do not stir for 2–3 minutes until charred. Toss and char the other side. Work in batches for best charring.",
                 "Let corn cool 5 minutes.",
                 "Mix mayo and sour cream together in a large bowl.",
                 "Add warm corn, cotija, lime juice, chili powder, paprika, garlic powder, scallions, and cilantro. Toss to combine.",
-                "Taste and adjust [ more lime, chili, or cotija as needed.",
+                "Taste and adjust. More lime, chili, or cotija as needed.",
                 "Divide into meal prep containers with tortilla chips on the side.",
             ],
         },
         "uses": [
             {
                 "name": "Dip with Chips",
-                "subtitle": "the classic ] street corn dip straight with a big handful of chips",
+                "subtitle": "the classic. Street corn dip straight with a big handful of chips",
                 "extras": ["Tortilla chips", "Extra cotija", "Extra Tajín or chili powder", "Lime wedge"],
                 "steps": [
                     "Serve cold or at room temperature in a bowl.",
                     "Extra cotija crumbled on top and a fresh pinch of chili powder.",
                     "Eat with chips for scooping.",
                 ],
-                "tip": "Keep chips separate until eating [ they go soggy in a few hours if packed together.",
+                "tip": "Keep chips separate until eating. They go soggy in a few hours if packed together.",
             },
             {
                 "name": "Street Corn Bowl",
@@ -6072,7 +8352,7 @@ RECIPE_DB = [
                     "Add a generous scoop of street corn dip over the top.",
                     "Add avocado and extra lime.",
                 ],
-                "tip": "The street corn dip acts as the dressing for the whole bowl ] no extra sauce needed.",
+                "tip": "The street corn dip acts as the dressing for the whole bowl. No extra sauce needed.",
             },
             {
                 "name": "Street Corn Tacos",
@@ -6092,7 +8372,7 @@ RECIPE_DB = [
         "_id": "spanish-chicken",
         "_keywords": ["chicken", "chorizo", "olives", "tomatoes", "white beans", "spanish", "dinner", "one pot"],
         "image": "/static/images/spanish-chicken.webp",
-        "intro": "Golden chicken thighs braised with chorizo, green olives, white beans, and cherry tomatoes in a rich tomato sauce [ a one-pan Spanish dinner that's weeknight easy and dinner-party impressive.",
+        "intro": "Golden chicken thighs braised with chorizo, green olives, white beans, and cherry tomatoes in a rich tomato sauce. A one-pan Spanish dinner that's weeknight easy and dinner-party impressive.",
         "base": {
             "title": "Easy Spanish Chicken",
             "ingredients": [
@@ -6134,7 +8414,7 @@ RECIPE_DB = [
                     "Serve each portion with a piece of chicken, chorizo, olives, and plenty of sauce.",
                     "Use crusty bread to soak up the tomato-chorizo pan juices.",
                 ],
-                "tip": "The sauce is the star ] make sure everyone gets plenty of it.",
+                "tip": "The sauce is the star. Make sure everyone gets plenty of it.",
             },
             {
                 "name": "Over Rice",
@@ -6145,7 +8425,7 @@ RECIPE_DB = [
                     "Ladle chicken, chorizo, beans, and plenty of sauce over the rice.",
                     "Finish with parsley and lemon.",
                 ],
-                "tip": "Use the sauce as a built-in gravy over the rice [ this version is more filling and works great for meal prep.",
+                "tip": "Use the sauce as a built-in gravy over the rice. This version is more filling and works great for meal prep.",
             },
             {
                 "name": "Shredded Chicken Flatbread",
@@ -6156,7 +8436,7 @@ RECIPE_DB = [
                     "Reduce the sauce in the pan until very thick.",
                     "Toast flatbreads, spoon sauce over, pile with shredded chicken, arugula, and Manchego.",
                 ],
-                "tip": "Reducing the sauce makes it jammy enough to spread ] this turns the braise into something completely different.",
+                "tip": "Reducing the sauce makes it jammy enough to spread. This turns the braise into something completely different.",
             },
         ],
     },
@@ -6164,7 +8444,7 @@ RECIPE_DB = [
         "_id": "gambas-al-ajillo",
         "_keywords": ["shrimp", "garlic", "spanish", "gambas", "olive oil", "chili", "tapas", "dinner"],
         "image": "/static/images/gambas-al-ajillo.webp",
-        "intro": "Plump shrimp sizzled in a cazuela of hot olive oil with garlic, dried chili, and a splash of sherry [ the definitive Spanish tapas dish, on the table in 10 minutes.",
+        "intro": "Plump shrimp sizzled in a cazuela of hot olive oil with garlic, dried chili, and a splash of sherry. The definitive Spanish tapas dish, on the table in 10 minutes.",
         "base": {
             "title": "Gambas al Ajillo (Spanish Garlic Shrimp)",
             "ingredients": [
@@ -6184,7 +8464,7 @@ RECIPE_DB = [
                 "Cook slowly, stirring, 3–4 minutes until garlic is light golden and very fragrant. Do not let it burn.",
                 "Raise heat to high. Add shrimp in a single layer.",
                 "Cook 1 minute, flip, add sherry and paprika, and cook 1 more minute until shrimp are just pink and curled.",
-                "Remove immediately from heat ] they finish cooking in the hot oil.",
+                "Remove immediately from heat. They finish cooking in the hot oil.",
                 "Scatter with fresh parsley. Serve sizzling in the pan with crusty bread.",
             ],
         },
@@ -6197,7 +8477,7 @@ RECIPE_DB = [
                     "Bring the skillet or cazuela directly to the table.",
                     "Scatter parsley and serve with torn crusty bread for dipping in the garlic-chili oil.",
                 ],
-                "tip": "The oil is half the dish [ make sure everyone dips their bread into it.",
+                "tip": "The oil is half the dish. Make sure everyone dips their bread into it.",
             },
             {
                 "name": "Shrimp and Rice Bowl",
@@ -6208,7 +8488,7 @@ RECIPE_DB = [
                     "Plate rice in bowls. Lay shrimp over the top.",
                     "Spoon garlic oil from the pan generously over the shrimp and rice.",
                 ],
-                "tip": "Don't waste a drop of that garlic oil ] it's liquid gold poured over the rice.",
+                "tip": "Don't waste a drop of that garlic oil. It's liquid gold poured over the rice.",
             },
             {
                 "name": "Shrimp Pasta",
@@ -6220,15 +8500,15 @@ RECIPE_DB = [
                     "Toss everything together, adding pasta water a splash at a time to create a silky sauce.",
                     "Finish with lemon zest and extra parsley.",
                 ],
-                "tip": "Add the pasta while the pan is still hot [ the starchy water emulsifies the garlic oil into a proper sauce.",
+                "tip": "Add the pasta while the pan is still hot. The starchy water emulsifies the garlic oil into a proper sauce.",
             },
         ],
     },
     {
         "_id": "spanish-garlic-soup",
         "_keywords": ["soup", "garlic", "egg", "croutons", "spanish", "sopa de ajo", "paprika", "dinner", "bread"],
-        "image": "",
-        "intro": "Sopa de Ajo ] the ancient Spanish bread and garlic soup with smoked paprika, poached eggs, and crispy croutons. Humble ingredients, deeply warming, ready in 20 minutes.",
+        "image": "/static/images/spanish-garlic-soup.jpg",
+        "intro": "Sopa de Ajo. The ancient Spanish bread and garlic soup with smoked paprika, poached eggs, and crispy croutons. Humble ingredients, deeply warming, ready in 20 minutes.",
         "base": {
             "title": "Spanish Garlic Soup with Egg and Croutons",
             "ingredients": [
@@ -6244,7 +8524,7 @@ RECIPE_DB = [
             ],
             "steps": [
                 "Heat olive oil in a large pot or deep skillet over medium. Add garlic and cook slowly, stirring, 3–4 minutes until golden and fragrant.",
-                "Add smoked paprika and cayenne [ stir 30 seconds to bloom.",
+                "Add smoked paprika and cayenne. Stir 30 seconds to bloom.",
                 "Add bread chunks and toss to coat in the paprika oil. Toast 2–3 minutes.",
                 "Pour in chicken broth. Bring to a simmer and cook 8–10 minutes until bread begins to dissolve and thicken the broth slightly.",
                 "Make wells in the soup and crack one egg into each. Cover and simmer 4–5 minutes until whites are set but yolks are still runny.",
@@ -6258,10 +8538,10 @@ RECIPE_DB = [
                 "extras": ["Extra crispy croutons", "Smoked paprika pinch", "Fresh parsley", "Crusty bread on the side"],
                 "steps": [
                     "Ladle into deep bowls, making sure each bowl has an egg.",
-                    "Break the yolk into the hot broth ] it enriches the soup instantly.",
+                    "Break the yolk into the hot broth. It enriches the soup instantly.",
                     "Finish with a pinch of smoked paprika and parsley.",
                 ],
-                "tip": "The yolk is the seasoning [ break it gently into the broth and stir as you eat.",
+                "tip": "The yolk is the seasoning. Break it gently into the broth and stir as you eat.",
             },
             {
                 "name": "Thicker Bread Soup",
@@ -6269,10 +8549,10 @@ RECIPE_DB = [
                 "extras": ["2 extra slices stale bread, crumbled", "Extra smoked paprika", "Manchego shavings"],
                 "steps": [
                     "Add extra bread and simmer 5 more minutes until the soup is thick.",
-                    "Stir vigorously ] the bread will fully dissolve into the broth.",
+                    "Stir vigorously. The bread will fully dissolve into the broth.",
                     "Serve topped with Manchego shavings and extra paprika.",
                 ],
-                "tip": "This thicker version is what's traditionally made in the Spanish countryside [ it's sustaining and filling on a cold night.",
+                "tip": "This thicker version is what's traditionally made in the Spanish countryside. It's sustaining and filling on a cold night.",
             },
             {
                 "name": "Soup with Chorizo",
@@ -6283,7 +8563,7 @@ RECIPE_DB = [
                     "Add broth and continue as the base recipe.",
                     "The chorizo fat will color the broth red and add a smoky depth.",
                 ],
-                "tip": "Adding chorizo turns a humble peasant soup into a proper dinner ] the fat it renders does the heavy lifting.",
+                "tip": "Adding chorizo turns a humble peasant soup into a proper dinner. The fat it renders does the heavy lifting.",
             },
         ],
     },
@@ -6291,7 +8571,7 @@ RECIPE_DB = [
         "_id": "spanish-beef-rice",
         "_keywords": ["beef", "rice", "spanish", "ground beef", "peppers", "tomatoes", "meal prep", "lunch"],
         "image": "/static/images/spanish-beef-rice.jpg",
-        "intro": "Seasoned ground beef cooked with green peppers, onion, and tomatoes into a savory Spanish-style rice [ a classic high-protein meal prep that portions easily and reheats perfectly.",
+        "intro": "Seasoned ground beef cooked with green peppers, onion, and tomatoes into a savory Spanish-style rice. A classic high-protein meal prep that portions easily and reheats perfectly.",
         "base": {
             "title": "Spanish Beef Rice",
             "ingredients": [
@@ -6318,7 +8598,7 @@ RECIPE_DB = [
                 "Add uncooked rice and beef broth. Stir to combine.",
                 "Bring to a boil, then reduce heat to low. Cover and cook 18–20 minutes until rice has absorbed the liquid and is fully cooked.",
                 "Fluff with a fork. Season with salt and pepper. Garnish with fresh parsley.",
-                "Divide into meal prep containers ] makes 4–5 portions.",
+                "Divide into meal prep containers. Makes 4–5 portions.",
             ],
         },
         "uses": [
@@ -6331,7 +8611,7 @@ RECIPE_DB = [
                     "Top with a spoonful of salsa and fresh parsley.",
                     "Add avocado if you have it.",
                 ],
-                "tip": "This recipe scales well [ double it for 8–10 meals with no extra effort.",
+                "tip": "This recipe scales well. Double it for 8–10 meals with no extra effort.",
             },
             {
                 "name": "Stuffed Bell Peppers",
@@ -6343,7 +8623,7 @@ RECIPE_DB = [
                     "Bake 25–30 minutes until peppers are soft and cheese is bubbly.",
                     "Serve with salsa.",
                 ],
-                "tip": "Use slightly undercooked rice when stuffing ] it finishes cooking inside the pepper without going mushy.",
+                "tip": "Use slightly undercooked rice when stuffing. It finishes cooking inside the pepper without going mushy.",
             },
             {
                 "name": "Beef Rice Skillet with Egg",
@@ -6354,17 +8634,2281 @@ RECIPE_DB = [
                     "Make wells and crack in eggs. Cover and cook 3–4 minutes until whites are set.",
                     "Finish with hot sauce, cilantro, and scallions.",
                 ],
-                "tip": "A cast iron skillet gives the rice a slightly crispy bottom layer [ a bonus texture.",
+                "tip": "A cast iron skillet gives the rice a slightly crispy bottom layer. A bonus texture.",
             },
         ],
     },
     {
-        "_id": "peanut-chicken-noodle-bowls",
-        "_keywords": ["chicken", "noodle", "peanut", "vietnamese", "cabbage", "carrots"],
-        "image": "/static/images/peanut-chicken-noodle-bowls.jpg",
-        "intro": "Chicken tossed with noodles, shredded carrots, red cabbage, and a rich peanut sauce. Keep extra sauce on the side so the noodles stay loose all week.",
+        "_id": "spanish-torrijas",
+        "_keywords": ["torrijas", "spanish", "french toast", "bread", "dessert", "cinnamon", "honey", "milk"],
+        "image": "/static/images/spanish-torrijas.jpg",
+        "intro": "The Spanish answer to French toast, thick slices of day-old bread soaked in warm spiced milk, dipped in egg, fried golden, and finished with cinnamon sugar and honey. A traditional Easter treat that works any time.",
         "base": {
-            "title": "Peanut Chicken Noodle Bowls",
+            "title": "Spanish Torrijas",
+            "ingredients": [
+                "1 loaf day-old Spanish bread or baguette, sliced 1-inch thick",
+                "2 cups whole milk",
+                "1 cinnamon stick",
+                "Zest of 1 lemon",
+                "3 tbsp sugar (for milk mixture)",
+                "3 eggs, beaten",
+                "Olive oil or neutral oil for frying",
+                "[ Finish ]",
+                "3 tbsp sugar mixed with 1 tsp ground cinnamon",
+                "Honey for drizzling",
+            ],
+            "steps": [
+                "Warm milk with cinnamon stick, lemon zest, and sugar over low heat for 5 minutes. Let cool slightly.",
+                "Arrange bread slices in a single layer in a shallow dish. Pour warm milk over and let soak 10–15 minutes per side until absorbed.",
+                "Beat eggs in a shallow bowl. Heat a generous layer of oil in a skillet over medium heat.",
+                "Lift each bread slice, let excess milk drip off, then dip in beaten egg to coat both sides.",
+                "Fry 2–3 minutes per side until deep golden and crisp. Drain on paper towels.",
+                "Immediately dust with cinnamon sugar. Drizzle with honey before serving.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Torrijas",
+                "subtitle": "cinnamon-sugared and drizzled with honey, served warm",
+                "extras": ["Extra honey", "Fresh berries", "Lemon wedge"],
+                "steps": [
+                    "Plate 2–3 torrijas still warm from the pan.",
+                    "Drizzle generously with honey. Add a handful of fresh berries on the side.",
+                ],
+                "tip": "Day-old bread is key, fresh bread absorbs too much milk and falls apart in the pan.",
+            },
+            {
+                "name": "Torrijas with Whipped Cream",
+                "subtitle": "served with lightly sweetened whipped cream and caramel",
+                "extras": ["Whipped cream", "Caramel sauce or dulce de leche", "Toasted almonds"],
+                "steps": [
+                    "Plate torrijas warm. Add a dollop of whipped cream alongside.",
+                    "Drizzle caramel sauce over the torrijas and cream. Scatter toasted almonds.",
+                ],
+                "tip": "Dulce de leche instead of caramel gives a richer, more Spanish-influenced finish.",
+            },
+            {
+                "name": "Syrup-Soaked Torrijas",
+                "subtitle": "soaked in a light honey-lemon syrup instead of dusted with cinnamon sugar",
+                "extras": ["1/4 cup honey", "1/4 cup water", "Zest of 1 lemon", "1 cinnamon stick"],
+                "steps": [
+                    "Simmer honey, water, lemon zest, and cinnamon stick 3 minutes into a light syrup.",
+                    "Place fried torrijas in a shallow dish and pour warm syrup over. Let sit 10 minutes.",
+                    "Serve at room temperature, spooning extra syrup from the dish over each piece.",
+                ],
+                "tip": "The syrup-soaked version keeps better in the fridge for 3 days, great for make-ahead entertaining.",
+            },
+        ],
+    },
+    {
+        "_id": "ceviche",
+        "_keywords": ["ceviche", "fish", "lime", "peruvian", "fresh", "tomato", "cilantro", "latin", "dinner", "lunch"],
+        "image": "/static/images/ceviche.jpg",
+        "intro": "Fresh white fish cured in lime juice with red onion, jalapeño, and cilantro. The acid 'cooks' the fish, a 20-minute Peruvian classic that's light, bright, and stunning.",
+        "base": {
+            "title": "Classic Ceviche",
+            "ingredients": [
+                "1.5 lbs fresh white fish (halibut, tilapia, or sea bass), cut into 1/2-inch cubes",
+                "1 cup fresh lime juice (about 8 limes)",
+                "1/2 red onion, thinly sliced",
+                "1 jalapeño, minced (seeds removed for less heat)",
+                "1 tomato, seeded and diced",
+                "1/2 cup cilantro, roughly chopped",
+                "1 tsp salt",
+                "Pinch of black pepper",
+                "[ Optional ]",
+                "1 avocado, diced",
+                "1 cup cucumber, diced",
+            ],
+            "steps": [
+                "Combine fish cubes with lime juice and salt in a glass or ceramic bowl. Fish should be submerged.",
+                "Refrigerate 15–20 minutes for firmer texture, 10 minutes for a raw center.",
+                "Meanwhile, soak red onion slices in cold water 10 minutes to mellow the sharpness. Drain.",
+                "Drain most of the lime juice from the fish, keeping a few tablespoons (this is the leche de tigre).",
+                "Combine fish with red onion, jalapeño, tomato, and cilantro. Toss gently.",
+                "Taste and adjust lime juice and salt. Add avocado and cucumber if using.",
+                "Serve immediately or within 1 hour.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Ceviche with Tostadas",
+                "subtitle": "piled over crispy tostadas with avocado and hot sauce",
+                "extras": ["Tostadas or tortilla chips", "Sliced avocado", "Hot sauce", "Extra cilantro", "Lime wedge"],
+                "steps": [
+                    "Spoon ceviche generously over tostadas.",
+                    "Add sliced avocado, a drizzle of hot sauce, and extra cilantro.",
+                    "Eat immediately, the tostada softens quickly.",
+                ],
+                "tip": "Eat tostadas fast, the moisture from ceviche softens them within minutes.",
+            },
+            {
+                "name": "Ceviche Tacos",
+                "subtitle": "in warm corn tortillas with avocado crema and pickled jalapeño",
+                "extras": ["Corn tortillas", "1 avocado blended with lime and salt", "Pickled jalapeños", "Shredded cabbage"],
+                "steps": [
+                    "Warm tortillas on a dry skillet or directly over a gas flame.",
+                    "Blend avocado with lime juice and salt into a smooth crema.",
+                    "Spoon ceviche into each tortilla with avocado crema, cabbage, and pickled jalapeño.",
+                ],
+                "tip": "Blended avocado crema is more stable than sliced avocado, it won't brown as quickly.",
+            },
+            {
+                "name": "Ceviche with Leche de Tigre",
+                "subtitle": "serve the ceviche with its curing liquid as a shot on the side",
+                "extras": ["Extra lime juice", "Pinch of ginger", "Corn nuts"],
+                "steps": [
+                    "Reserve all the leche de tigre when draining the ceviche.",
+                    "Season with extra lime, salt, and a pinch of ginger.",
+                    "Serve ceviche in a bowl with the leche de tigre poured alongside. Top with corn nuts for crunch.",
+                ],
+                "tip": "Leche de tigre is Peruvian gold, bright, spicy, and briny. Don't pour it out.",
+            },
+        ],
+    },
+    {
+        "_id": "peruvian-chicken",
+        "_keywords": ["peruvian", "chicken", "aji panca", "sheet pan", "latin", "roasted", "dinner"],
+        "image": "/static/images/peru-chicken.jpg",
+        "intro": "Chicken marinated in aji panca, cumin, and garlic, roasted until the skin crisps and the meat turns deeply red and smoky. The Peruvian green aji verde sauce is not optional.",
+        "base": {
+            "title": "Sheet Pan Peruvian Chicken",
+            "ingredients": [
+                "[ Chicken ]",
+                "3 lbs bone-in, skin-on chicken pieces",
+                "3 tbsp aji panca paste (or ancho chili paste)",
+                "4 cloves garlic, minced",
+                "2 tbsp olive oil",
+                "2 tbsp soy sauce",
+                "1 tbsp lime juice",
+                "1.5 tsp cumin",
+                "1 tsp smoked paprika",
+                "Salt and pepper",
+                "[ Aji Verde ]",
+                "1 jalapeño",
+                "1 cup cilantro",
+                "2 cloves garlic",
+                "1/4 cup mayonnaise",
+                "1 tbsp lime juice",
+                "2 tbsp olive oil",
+                "Salt",
+                "[ Vegetables ]",
+                "1 lb baby potatoes, halved",
+                "2 bell peppers, sliced",
+            ],
+            "steps": [
+                "Marinate: combine aji panca, garlic, oil, soy sauce, lime, cumin, and paprika. Coat chicken and marinate 2 hours minimum.",
+                "Preheat oven to 425°F. Toss potatoes with olive oil and salt on a sheet pan.",
+                "Place marinated chicken on top of potatoes. Add bell peppers around the edges.",
+                "Roast 35–40 minutes until chicken skin is deeply golden and cooked through to 165°F.",
+                "Make aji verde: blend jalapeño, cilantro, garlic, mayo, lime, and olive oil until smooth. Season.",
+                "Rest chicken 5 minutes before serving with aji verde and vegetables.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Platter",
+                "subtitle": "straight from the pan with aji verde and roasted vegetables",
+                "extras": ["Extra aji verde", "Lime wedges", "Crusty bread"],
+                "steps": [
+                    "Plate chicken with roasted potatoes and peppers from the sheet pan.",
+                    "Pour any pan drippings over the chicken.",
+                    "Serve with plenty of aji verde on the side.",
+                ],
+                "tip": "Pour pan drippings back over everything before serving, liquid gold.",
+            },
+            {
+                "name": "Peruvian Chicken Rice Bowl",
+                "subtitle": "shredded over cilantro rice with aji verde drizzle",
+                "extras": ["2 cups cilantro lime rice", "Extra aji verde", "Sliced avocado", "Pickled red onion"],
+                "steps": [
+                    "Pull chicken off the bone and shred roughly.",
+                    "Serve over cilantro lime rice.",
+                    "Drizzle aji verde over the top and add avocado and pickled onion.",
+                ],
+                "tip": "Aji verde doubles as a salad dressing, drizzle it over everything.",
+            },
+            {
+                "name": "Peruvian Chicken Sandwich",
+                "subtitle": "shredded chicken in a crusty roll with aji verde and pickled onion",
+                "extras": ["Crusty rolls or ciabatta", "Aji verde", "Pickled red onion", "Sliced avocado", "Shredded lettuce"],
+                "steps": [
+                    "Shred chicken and reheat in a pan with a splash of the marinade.",
+                    "Toast the roll.",
+                    "Pile chicken, aji verde, pickled onion, avocado, and lettuce into the roll.",
+                ],
+                "tip": "Aji verde is the sandwich sauce, use it generously on both sides of the bread.",
+            },
+        ],
+    },
+    {
+        "_id": "brazilian-black-bean-stew",
+        "_keywords": ["feijoada", "black bean", "pork", "sausage", "brazilian", "stew", "latin", "dinner"],
+        "image": "/static/images/stew.jpg",
+        "intro": "A simplified feijoada. Brazil's national dish of black beans braised with smoky sausage and spices. Rich, smoky, and deeply satisfying with a fraction of the work.",
+        "base": {
+            "title": "Brazilian Black Bean Stew (Feijoada-Style)",
+            "ingredients": [
+                "2 cans (15 oz each) black beans, drained",
+                "8 oz linguiça or smoked kielbasa, sliced",
+                "4 oz bacon, chopped",
+                "1 yellow onion, diced",
+                "4 cloves garlic, minced",
+                "1 jalapeño, diced",
+                "2 cups chicken broth",
+                "1 can (14 oz) diced tomatoes",
+                "1 tsp cumin",
+                "1/2 tsp smoked paprika",
+                "2 bay leaves",
+                "Salt and pepper",
+                "[ To serve ]",
+                "White rice",
+                "Orange slices",
+                "Hot sauce",
+            ],
+            "steps": [
+                "Cook bacon in a large pot over medium until fat renders, 5 minutes. Add sausage and brown 4 minutes. Remove meat, leaving fat.",
+                "Add onion and jalapeño to the pot. Cook 5 minutes until soft.",
+                "Add garlic, cumin, and smoked paprika. Stir 1 minute.",
+                "Add black beans, diced tomatoes, broth, and bay leaves. Return sausage and bacon.",
+                "Bring to a boil, reduce to a simmer. Cook uncovered 25–30 minutes until stew thickens.",
+                "Remove bay leaves. Smash some beans against the pot to thicken further.",
+                "Season with salt and pepper. Serve over white rice with orange slices and hot sauce.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Feijoada Bowl",
+                "subtitle": "over white rice with orange slices and sautéed collard greens",
+                "extras": ["White rice", "Orange slices", "Hot sauce", "Collard greens, thinly sliced and sautéed"],
+                "steps": [
+                    "Reheat stew, adding a splash of water.",
+                    "Serve over rice with orange slices, hot sauce, and sautéed collard greens.",
+                ],
+                "tip": "Orange is traditional with feijoada, the acidity cuts through the richness of the beans.",
+            },
+            {
+                "name": "Black Bean Stew with Tortillas",
+                "subtitle": "served with warm tortillas and pickled jalapeños",
+                "extras": ["Corn or flour tortillas", "Sour cream", "Pickled jalapeños", "Shredded cheese"],
+                "steps": [
+                    "Reheat stew until thick.",
+                    "Warm tortillas on a dry skillet.",
+                    "Serve stew in a bowl with tortillas for scooping, topped with sour cream and cheese.",
+                ],
+                "tip": "Smash extra beans against the pot wall as you reheat, makes it thicker and creamier.",
+            },
+            {
+                "name": "Black Bean Soup",
+                "subtitle": "blend half the stew smooth and thin with extra broth for a velvety soup",
+                "extras": ["1 cup extra broth", "Sour cream", "Chili oil", "Lime wedge", "Crusty bread"],
+                "steps": [
+                    "Blend half the stew smooth, return to pot and stir together. Add extra broth to soup consistency.",
+                    "Serve in bowls with a dollop of sour cream, drizzle of chili oil, and lime.",
+                ],
+                "tip": "Half-blended gives you thick creamy soup without losing all the whole beans.",
+            },
+        ],
+    },
+    {
+        "_id": "venezuelan-chili",
+        "_keywords": ["chili", "ground beef", "venezuelan", "beans", "latin", "tomato", "dinner", "lunch"],
+        "image": "/static/images/chili.jpg",
+        "intro": "Lean ground beef chili made Venezuelan style with Worcestershire, cumin, and double beans, fuller-bodied than Tex-Mex but just as satisfying for weekly meal prep.",
+        "base": {
+            "title": "Venezuelan-Style Chili con Carne",
+            "ingredients": [
+                "1.5 lbs lean ground beef (90/10)",
+                "1 can (15 oz) black beans, drained",
+                "1 can (15 oz) kidney beans, drained",
+                "1 can (28 oz) crushed tomatoes",
+                "1 yellow onion, diced",
+                "1 green bell pepper, diced",
+                "4 cloves garlic, minced",
+                "1 tbsp Worcestershire sauce",
+                "1.5 tsp cumin",
+                "1 tsp smoked paprika",
+                "1 tsp chili powder",
+                "1/2 tsp dried oregano",
+                "Salt",
+                "2 tbsp oil",
+            ],
+            "steps": [
+                "Heat oil in a large pot over medium-high. Add onion and pepper. Cook 5 minutes until soft.",
+                "Add garlic and cook 1 minute.",
+                "Add ground beef, breaking it up. Cook until browned, 7–8 minutes. Drain excess fat.",
+                "Add Worcestershire, cumin, paprika, chili powder, and oregano. Stir 1 minute.",
+                "Add crushed tomatoes and both cans of beans. Stir to combine.",
+                "Bring to a boil, then simmer uncovered 20–25 minutes until thick.",
+                "Season with salt. Serve over rice or with corn bread.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Chili Bowl",
+                "subtitle": "topped with sour cream, cheese, scallions, and corn chips",
+                "extras": ["Sour cream", "Shredded cheddar", "Sliced scallions", "Corn chips"],
+                "steps": [
+                    "Reheat chili with a splash of water.",
+                    "Serve in bowls topped with sour cream, cheese, and scallions.",
+                    "Add corn chips on top for crunch.",
+                ],
+                "tip": "This chili is better on day 2, the flavors develop overnight.",
+            },
+            {
+                "name": "Chili over Rice",
+                "subtitle": "spooned over white or brown rice for a full meal prep bowl",
+                "extras": ["2 cups cooked rice", "Diced avocado", "Hot sauce", "Fresh cilantro"],
+                "steps": [
+                    "Reheat chili and serve over rice.",
+                    "Top with diced avocado, hot sauce, and cilantro.",
+                ],
+                "tip": "Avocado on top adds richness without cooking, just dice and add at serving.",
+            },
+            {
+                "name": "Chili Stuffed Arepas",
+                "subtitle": "spoon chili inside split corn arepas with melted cheese",
+                "extras": ["4 corn arepas (or thick corn tortillas)", "Shredded white cheese", "Avocado slices", "Salsa"],
+                "steps": [
+                    "Cook arepas: mix arepa flour with water and salt, form patties, pan-fry until golden.",
+                    "Split open and stuff with warm chili and shredded cheese.",
+                    "Add avocado slices and salsa.",
+                ],
+                "tip": "Stuffing chili into arepas is the Venezuelan way, the corn masa soaks up the sauce.",
+            },
+        ],
+    },
+    {
+        "_id": "dominican-chicken-rice",
+        "_keywords": ["dominican", "chicken", "rice", "sofrito", "latin", "one pot", "dinner"],
+        "image": "/static/images/chicken-and-rice.jpg",
+        "intro": "Pollo guisado and arroz con pollo in one pot, golden chicken simmered in a sofrito-based sauce then cooked with rice until everything melds together. Classic Dominican comfort food.",
+        "base": {
+            "title": "Dominican Style Chicken and Rice",
+            "ingredients": [
+                "[ Chicken ]",
+                "3 lbs bone-in, skin-on chicken pieces",
+                "1 tsp cumin",
+                "1 tsp oregano",
+                "1 tsp garlic powder",
+                "1/2 tsp turmeric",
+                "Salt and black pepper",
+                "2 tbsp oil",
+                "[ Rice and Sauce ]",
+                "1 yellow onion, diced",
+                "1 green pepper, diced",
+                "4 cloves garlic, minced",
+                "2 tbsp tomato paste",
+                "1 can (14 oz) diced tomatoes",
+                "1 cup chicken broth",
+                "1.5 cups long-grain white rice, rinsed",
+                "1/2 cup green olives (optional)",
+                "1/2 cup frozen peas",
+                "Fresh cilantro",
+            ],
+            "steps": [
+                "Season chicken with cumin, oregano, garlic powder, turmeric, salt, and pepper.",
+                "Heat oil in a wide heavy pot over medium-high. Sear chicken skin-side down until deep golden, 6–8 minutes. Flip 3 more minutes. Remove.",
+                "In the same pot, cook onion and green pepper 5 minutes. Add garlic  1 minute.",
+                "Add tomato paste and cook 2 minutes until it darkens. Add diced tomatoes.",
+                "Return chicken to pot. Add broth. Cover and simmer 20 minutes.",
+                "Remove chicken. Add rice and olives to the pot, stirring into the cooking liquid. Return chicken on top.",
+                "Cover tightly and cook over low heat 20–25 minutes until rice has absorbed all liquid.",
+                "Scatter frozen peas over top, cover, and rest 5 minutes. Fluff and serve with cilantro.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Straight from the Pot",
+                "subtitle": "served directly with sliced avocado and a squeeze of lime",
+                "extras": ["Sliced avocado", "Lime wedges", "Hot sauce", "Fresh cilantro"],
+                "steps": [
+                    "Serve directly from the pot with avocado, lime, and hot sauce.",
+                ],
+                "tip": "The bottom of the pot (pegao) gets crispy and golden, scrape it out, it's the best part.",
+            },
+            {
+                "name": "Chicken Rice Bowl with Fried Plantains",
+                "subtitle": "with sweet fried plantains alongside",
+                "extras": ["1 ripe plantain, sliced", "2 tbsp oil", "Salt", "Sour cream"],
+                "steps": [
+                    "Pan-fry plantain slices in oil over medium-high, 2–3 minutes per side until golden and caramelized.",
+                    "Serve chicken and rice in a bowl alongside fried plantains and sour cream.",
+                ],
+                "tip": "Ripe plantains (black-spotted skin) get sweet and caramelized, unripe ones stay starchy.",
+            },
+            {
+                "name": "Chicken Rice Quesadillas",
+                "subtitle": "pull the chicken, mix with rice, and press into cheesy quesadillas",
+                "extras": ["Large flour tortillas", "Shredded cheese", "Salsa", "Sour cream"],
+                "steps": [
+                    "Shred chicken off the bone. Mix roughly with some of the rice.",
+                    "Fill tortillas with chicken-rice mix and shredded cheese.",
+                    "Cook in a dry skillet over medium, pressing down, until golden and crispy on both sides.",
+                    "Serve with salsa and sour cream.",
+                ],
+                "tip": "The sofrito-stained rice inside the quesadilla is unexpectedly delicious.",
+            },
+        ],
+    },
+    {
+        "_id": "peruvian-steak",
+        "_keywords": ["steak", "beef", "peruvian", "avocado", "peppers", "salsa", "dinner", "latin"],
+        "image": "/static/images/salsa-peppers.jpg",
+        "intro": "Thinly sliced beef seared at high heat with bell peppers and onions, served with creamy avocado salsa. Lomo saltado meets bistec a lo pobre, bold, colorful, unmistakably Peruvian.",
+        "base": {
+            "title": "Peruvian Steak with Avocado Salsa and Peppers",
+            "ingredients": [
+                "[ Steak ]",
+                "2 lbs flank steak or sirloin, thinly sliced against the grain",
+                "2 tbsp soy sauce",
+                "1 tbsp lime juice",
+                "1 tsp cumin",
+                "1 tsp smoked paprika",
+                "3 cloves garlic, minced",
+                "2 tbsp oil",
+                "[ Peppers & Onions ]",
+                "2 bell peppers (red and green), sliced",
+                "1 red onion, thinly sliced",
+                "2 jalapeños, sliced",
+                "1 tbsp soy sauce",
+                "[ Avocado Salsa ]",
+                "2 avocados",
+                "Juice of 1 lime",
+                "1/4 cup cilantro, chopped",
+                "1/4 red onion, finely diced",
+                "Salt",
+                "[ To serve ]",
+                "White rice or French fries",
+            ],
+            "steps": [
+                "Marinate beef: combine soy sauce, lime, cumin, paprika, and garlic. Toss with beef strips. 30 minutes.",
+                "Make avocado salsa: mash avocados with lime juice, cilantro, diced red onion, and salt. Keep chunky.",
+                "Cook peppers and onion: heat 1 tbsp oil in a very hot wok or skillet. Stir-fry peppers, onion, and jalapeño 3–4 minutes until charred at edges. Add soy sauce. Remove.",
+                "In same pan, add remaining oil on highest heat. Cook beef in batches without stirring 1–2 minutes until seared.",
+                "Return peppers and onions. Toss quickly.",
+                "Serve over white rice with avocado salsa alongside.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Lomo Saltado Bowl",
+                "subtitle": "over white rice with avocado salsa and extra soy-lime drizzle",
+                "extras": ["White rice", "Extra lime", "Soy sauce", "Cilantro"],
+                "steps": [
+                    "Reheat steak and peppers in a very hot pan, quick, high heat to re-sear.",
+                    "Serve over rice with fresh avocado salsa on the side.",
+                ],
+                "tip": "High heat is everything, if the pan isn't screaming hot, the beef steams instead of searing.",
+            },
+            {
+                "name": "Steak Tacos with Avocado Salsa",
+                "subtitle": "in warm corn tortillas with the avocado salsa and pickled jalapeño",
+                "extras": ["Corn tortillas", "Pickled jalapeños", "Sour cream", "Extra cilantro"],
+                "steps": [
+                    "Warm tortillas directly over a gas flame or in a dry skillet.",
+                    "Reheat steak and peppers quickly in a hot pan.",
+                    "Fill tortillas with steak-pepper mix, top with avocado salsa, pickled jalapeño, and sour cream.",
+                ],
+                "tip": "The avocado salsa replaces both guacamole and salsa in these tacos.",
+            },
+            {
+                "name": "Steak Sandwich",
+                "subtitle": "steak and peppers in a crusty roll with avocado salsa and arugula",
+                "extras": ["Ciabatta rolls or baguette", "Avocado salsa", "Arugula", "Pickled jalapeños"],
+                "steps": [
+                    "Toast the roll until crusty.",
+                    "Reheat steak and peppers and pile into the roll.",
+                    "Spoon avocado salsa over the top and add arugula and pickled jalapeños.",
+                ],
+                "tip": "Arugula's bitterness cuts through the rich steak and creamy avocado.",
+            },
+        ],
+    },
+    # ── New Italian recipes ───────────────────────────────────────────────────
+    {
+        "_id": "round-steak-italiano",
+        "_keywords": ["steak", "italian", "tomato", "braised", "beef", "red wine"],
+        "image": "/static/images/Round-Steak-Italiano.jpg",
+        "servings": 6,
+        "calories_per_serving": 357,
+        "intro": "Tender beef round steak braised low and slow in a rich Italian tomato sauce with garlic, herbs, and red wine, one cook session fills the week with hearty meals.",
+        "base": {
+            "title": "Italian Braised Round Steak",
+            "ingredients": [
+                "2 lbs beef round steak, cut into serving pieces",
+                "1 can (28 oz) crushed tomatoes",
+                "1 cup dry red wine",
+                "1 medium onion, diced",
+                "4 cloves garlic, minced",
+                "2 tbsp tomato paste",
+                "1 tsp dried oregano",
+                "1 tsp dried basil",
+                "1 tsp dried rosemary",
+                "Salt, pepper, olive oil",
+            ],
+            "steps": [
+                "Season steak pieces generously with salt and pepper.",
+                "Heat olive oil in a Dutch oven over high heat and sear steak 3 minutes per side until browned. Remove and set aside.",
+                "Reduce heat to medium; sauté onion 5 minutes until soft. Add garlic and tomato paste, cook 1 minute.",
+                "Pour in wine, scraping up any browned bits. Add crushed tomatoes, oregano, basil, and rosemary.",
+                "Return steak to the pot; liquid should come halfway up. Cover and braise on low heat 2–2.5 hours until fork-tender.",
+                "Taste and adjust seasoning. Shred or leave whole. Store steak submerged in sauce.",
+            ],
+            "tip": "Round steak needs time, don't rush the braise. It goes from tough to meltingly tender after 2 hours.",
+        },
+        "uses": [
+            {
+                "name": "Steak Italiano Rice Bowl",
+                "subtitle": "shredded braised steak over jasmine rice with parmesan and fresh basil",
+                "extras": ["Jasmine rice", "Parmesan", "Fresh basil", "Extra sauce"],
+                "steps": [
+                    "Cook jasmine rice per package directions.",
+                    "Warm steak and sauce together in a saucepan.",
+                    "Serve steak and sauce over rice, top with parmesan and torn fresh basil.",
+                ],
+                "tip": "Spoon extra sauce generously, it's the best part.",
+            },
+            {
+                "name": "Steak Italiano Pasta",
+                "subtitle": "braised steak shredded into pasta with tomato sauce and pecorino",
+                "extras": ["Pappardelle or rigatoni", "Pecorino Romano", "Red pepper flakes"],
+                "steps": [
+                    "Cook pasta al dente; reserve ½ cup pasta water.",
+                    "Shred steak into bite-sized pieces and warm with sauce.",
+                    "Toss with pasta, adding pasta water to loosen. Finish with pecorino and red pepper flakes.",
+                ],
+                "tip": "Shredding the steak finely turns it into a proper meat sauce.",
+            },
+            {
+                "name": "Steak Italiano Sandwich",
+                "subtitle": "braised steak on ciabatta with provolone and giardiniera",
+                "extras": ["Ciabatta rolls", "Provolone cheese", "Giardiniera", "Baby arugula"],
+                "steps": [
+                    "Slice ciabatta rolls and toast under the broiler.",
+                    "Warm steak and pile generously onto the roll.",
+                    "Top with provolone, place under broiler 1 minute to melt. Finish with giardiniera and arugula.",
+                ],
+                "tip": "Giardiniera's brine cuts through the richness of the braised beef.",
+            },
+        ],
+    },
+    {
+        "_id": "eggplant-parmesan",
+        "_keywords": ["eggplant", "parmesan", "italian", "vegetarian", "tomato", "mozzarella", "baked"],
+        "image": "/static/images/Eggplant-Parmesan.jpg",
+        "servings": 4,
+        "calories_per_serving": 265,
+        "intro": "Layers of golden baked eggplant, marinara, and bubbling mozzarella, a full vegetarian Italian prep that's just as satisfying reheated as it is fresh.",
+        "base": {
+            "title": "Baked Eggplant Parmesan",
+            "ingredients": [
+                "2 large eggplants (about 2 lbs total), sliced ½-inch thick",
+                "2 cups panko breadcrumbs",
+                "1 cup grated parmesan, divided",
+                "2 eggs, beaten",
+                "2 cups marinara sauce",
+                "8 oz fresh mozzarella, sliced",
+                "1 tsp garlic powder",
+                "1 tsp Italian seasoning",
+                "Salt, olive oil",
+            ],
+            "steps": [
+                "Salt eggplant slices and let sit 20 minutes to draw out moisture. Pat very dry.",
+                "Preheat oven to 425°F. Line two baking sheets with parchment and brush with olive oil.",
+                "Mix panko, ½ cup parmesan, garlic powder, and Italian seasoning. Dip eggplant in egg then breadcrumb mixture.",
+                "Arrange on baking sheets; spray or drizzle with olive oil. Bake 20 minutes, flip, bake another 15 minutes until golden and crispy.",
+                "In a 9×13 baking dish, spread ½ cup marinara. Layer eggplant, sauce, mozzarella, and remaining parmesan. Repeat.",
+                "Bake uncovered at 375°F for 25 minutes until bubbly and golden. Rest 10 minutes before slicing.",
+            ],
+            "tip": "Salting and drying the eggplant is essential, it prevents sogginess and concentrates flavor.",
+        },
+        "uses": [
+            {
+                "name": "Classic Eggplant Parm",
+                "subtitle": "a generous slab over spaghetti with extra marinara",
+                "extras": ["Spaghetti", "Extra marinara", "Fresh basil", "Parmesan for grating"],
+                "steps": [
+                    "Cook spaghetti al dente.",
+                    "Reheat eggplant parm in a 350°F oven for 10–12 minutes until warmed through.",
+                    "Serve over spaghetti with extra warm marinara, fresh basil, and grated parmesan.",
+                ],
+                "tip": "Cover with foil for the first 8 minutes so it heats through without drying out.",
+            },
+            {
+                "name": "Eggplant Parm Sub",
+                "subtitle": "layered into a hoagie roll with fresh mozzarella and marinara",
+                "extras": ["Hoagie rolls", "Extra marinara", "Fresh mozzarella", "Baby spinach"],
+                "steps": [
+                    "Split hoagie rolls and toast lightly.",
+                    "Warm eggplant parm slices in a pan with a splash of marinara.",
+                    "Layer into roll, add fresh mozzarella and baby spinach, spoon extra sauce over the top.",
+                ],
+                "tip": "Don't skip toasting the roll, it holds up to the sauce much better.",
+            },
+            {
+                "name": "Eggplant Parm Grain Bowl",
+                "subtitle": "sliced over farro with roasted cherry tomatoes and arugula pesto",
+                "extras": ["Farro or barley", "Cherry tomatoes", "Arugula pesto or store-bought basil pesto", "Lemon"],
+                "steps": [
+                    "Cook farro per package directions.",
+                    "Roast cherry tomatoes at 400°F with olive oil, salt, and pepper for 15 minutes.",
+                    "Slice eggplant parm into strips and warm briefly. Assemble over farro with tomatoes; drizzle arugula pesto and a squeeze of lemon.",
+                ],
+                "tip": "The pesto bridges the eggplant and grain, don't skip it.",
+            },
+        ],
+    },
+    {
+        "_id": "tuscan-ravioli",
+        "_keywords": ["ravioli", "tuscan", "spinach", "sun-dried tomato", "one-pan", "italian", "pasta"],
+        "image": "/static/images/One-Pan-Tuscan-Ravioli.jpg",
+        "intro": "Cheese ravioli cooked directly in a creamy Tuscan sauce with sun-dried tomatoes, spinach, and white beans, one pan, 25 minutes, deeply satisfying all week.",
+        "base": {
+            "title": "One-Pan Tuscan Ravioli",
+            "ingredients": [
+                "20 oz refrigerated or frozen cheese ravioli",
+                "1 can (15 oz) white beans, drained",
+                "½ cup sun-dried tomatoes in oil, chopped",
+                "3 cups fresh spinach",
+                "4 cloves garlic, minced",
+                "1½ cups chicken or vegetable broth",
+                "½ cup heavy cream",
+                "¼ cup grated parmesan",
+                "1 tsp Italian seasoning",
+                "Red pepper flakes, salt, olive oil",
+            ],
+            "steps": [
+                "Heat 1 tbsp olive oil from the sun-dried tomato jar in a large skillet over medium heat.",
+                "Sauté garlic 30 seconds until fragrant. Add sun-dried tomatoes and Italian seasoning.",
+                "Pour in broth and cream; bring to a gentle boil.",
+                "Add ravioli in a single layer; cook per package directions (usually 4–6 minutes), stirring gently.",
+                "Stir in white beans and spinach; cook 2 minutes until spinach wilts.",
+                "Finish with parmesan and red pepper flakes. Sauce will thicken as it stands.",
+            ],
+            "tip": "Don't overcook the ravioli, they continue cooking as the sauce thickens. Pull off heat when just al dente.",
+        },
+        "uses": [
+            {
+                "name": "Tuscan Ravioli Bowl",
+                "subtitle": "generous bowl with extra parmesan and crusty bread for dipping",
+                "extras": ["Extra parmesan", "Crusty Italian bread", "Lemon zest"],
+                "steps": [
+                    "Reheat ravioli gently in a saucepan with a splash of broth or cream, stirring slowly.",
+                    "Serve in a wide bowl; finish with extra parmesan and a pinch of lemon zest.",
+                    "Warm bread on the side for sauce scooping.",
+                ],
+                "tip": "A splash of liquid prevents the sauce from over-thickening when reheating.",
+            },
+            {
+                "name": "Tuscan Ravioli Stuffed Peppers",
+                "subtitle": "ravioli mixture spooned into roasted pepper halves",
+                "extras": ["3 large bell peppers", "Extra mozzarella", "Fresh basil"],
+                "steps": [
+                    "Halve bell peppers and roast cut-side up at 400°F for 15 minutes until just tender.",
+                    "Fill each pepper half with warm ravioli mixture.",
+                    "Top with mozzarella and return to oven for 5 minutes to melt. Garnish with basil.",
+                ],
+                "tip": "Go with red or yellow peppers, their sweetness complements the savory Tuscan sauce.",
+            },
+            {
+                "name": "Tuscan Ravioli Bake",
+                "subtitle": "baked with extra mozzarella for a bubbly, golden finish",
+                "extras": ["Shredded mozzarella", "Extra parmesan", "Italian breadcrumbs"],
+                "steps": [
+                    "Transfer ravioli to a baking dish. Top with mozzarella, parmesan, and a sprinkle of breadcrumbs.",
+                    "Bake at 375°F for 15–18 minutes until golden and bubbling.",
+                    "Rest 5 minutes before serving.",
+                ],
+                "tip": "The breadcrumbs add a welcome crunch that the original dish lacks.",
+            },
+        ],
+    },
+    {
+        "_id": "bruschetta-chicken-wraps",
+        "_keywords": ["chicken", "bruschetta", "tomato", "basil", "balsamic", "wrap", "italian", "lunch"],
+        "image": "/static/images/Bruschetta-Chicken-Wraps.jpg",
+        "intro": "Juicy herbed chicken with fresh bruschetta tomatoes, creamy mozzarella, and balsamic glaze, a refreshing Italian wrap that comes together in minutes once the chicken is prepped.",
+        "base": {
+            "title": "Bruschetta Chicken",
+            "ingredients": [
+                "1½ lbs chicken breast",
+                "1 tsp garlic powder",
+                "1 tsp Italian seasoning",
+                "1 tsp dried basil",
+                "Salt, pepper, olive oil",
+                "Bruschetta topping: 4 Roma tomatoes (diced), 3 cloves garlic (minced), 15 fresh basil leaves (chiffonade), 2 tbsp olive oil, 1 tbsp balsamic vinegar, salt, pepper",
+            ],
+            "steps": [
+                "Make bruschetta: toss diced tomatoes with garlic, basil, olive oil, balsamic, salt, and pepper. Let sit 20 minutes minimum.",
+                "Pound chicken breasts to even ½-inch thickness. Season with garlic powder, Italian seasoning, basil, salt, and pepper.",
+                "Heat a cast-iron skillet over medium-high with olive oil. Cook chicken 4–5 minutes per side until internal temp reaches 165°F.",
+                "Rest 5 minutes before slicing. Store bruschetta topping separately in fridge.",
+            ],
+            "tip": "Let the bruschetta sit before serving, the tomatoes release juices that become the dressing.",
+        },
+        "uses": [
+            {
+                "name": "Bruschetta Chicken Wrap",
+                "subtitle": "sliced chicken and bruschetta in a warm tortilla with mozzarella",
+                "extras": ["Large flour tortillas", "Fresh mozzarella or shredded", "Baby arugula", "Balsamic glaze"],
+                "steps": [
+                    "Warm tortilla in a dry pan 30 seconds per side.",
+                    "Layer arugula, sliced chicken, bruschetta topping, and mozzarella.",
+                    "Drizzle with balsamic glaze, roll tightly and slice on the diagonal.",
+                ],
+                "tip": "Squeeze the excess juice from the bruschetta before adding to the wrap to prevent sogginess.",
+            },
+            {
+                "name": "Bruschetta Chicken Salad",
+                "subtitle": "over mixed greens with crostini croutons and parmesan",
+                "extras": ["Mixed greens", "Crostini or crusty bread cubes", "Shaved parmesan", "Extra balsamic glaze"],
+                "steps": [
+                    "Toast bread cubes at 375°F for 10 minutes until golden to make croutons.",
+                    "Arrange greens on a plate, top with sliced chicken and bruschetta topping.",
+                    "Add croutons and shaved parmesan; drizzle with balsamic glaze.",
+                ],
+                "tip": "Make the croutons fresh so they stay crunchy against the juicy bruschetta.",
+            },
+            {
+                "name": "Bruschetta Chicken Flatbread",
+                "subtitle": "on toasted flatbread with ricotta and fresh basil",
+                "extras": ["Flatbreads or naan", "Ricotta cheese", "Extra basil leaves", "Balsamic glaze"],
+                "steps": [
+                    "Toast flatbreads in a 400°F oven for 5 minutes until crisp.",
+                    "Spread a thin layer of ricotta over each flatbread.",
+                    "Top with sliced chicken and bruschetta topping. Drizzle balsamic glaze and add fresh basil leaves.",
+                ],
+                "tip": "Ricotta adds creaminess that balances the acidity of the bruschetta.",
+            },
+        ],
+    },
+    {
+        "_id": "sheet-pan-chicken-parm",
+        "_keywords": ["chicken", "parmesan", "sheet pan", "italian", "mozzarella", "marinara", "baked"],
+        "image": "/static/images/Sheet-Pan-Chicken-Parmesan.jpg",
+        "intro": "Crispy-crusted chicken breasts baked on a sheet pan with marinara and bubbling mozzarella, all the satisfaction of traditional chicken parm without the frying mess.",
+        "base": {
+            "title": "Sheet Pan Chicken Parmesan",
+            "ingredients": [
+                "4 chicken breasts (about 6 oz each), pounded to ½ inch",
+                "1½ cups panko breadcrumbs",
+                "¾ cup grated parmesan, divided",
+                "2 eggs, beaten",
+                "½ cup all-purpose flour",
+                "1½ cups marinara sauce",
+                "6 oz fresh mozzarella, sliced",
+                "1 tsp garlic powder",
+                "1 tsp Italian seasoning",
+                "Salt, pepper, olive oil spray",
+            ],
+            "steps": [
+                "Preheat oven to 425°F. Line a sheet pan with parchment; brush with olive oil.",
+                "Set up three bowls: flour with salt/pepper, beaten eggs, panko with ½ cup parmesan, garlic powder, and Italian seasoning.",
+                "Coat each breast in flour, dip in egg, then press into panko mixture.",
+                "Place on sheet pan; spray tops with olive oil. Bake 15 minutes until golden.",
+                "Spoon marinara over each breast; top with mozzarella and remaining parmesan. Bake another 10 minutes until cheese is bubbly.",
+                "Rest 5 minutes before serving or storing.",
+            ],
+            "tip": "Don't skip the oil spray on the panko, it's what makes it genuinely crispy without frying.",
+        },
+        "uses": [
+            {
+                "name": "Chicken Parm Dinner",
+                "subtitle": "over angel hair pasta with extra marinara and fresh basil",
+                "extras": ["Angel hair or spaghetti", "Extra marinara", "Fresh basil", "Parmesan for grating"],
+                "steps": [
+                    "Cook pasta al dente in salted water.",
+                    "Reheat chicken parm in a 350°F oven for 10 minutes, covered in foil.",
+                    "Serve over pasta with warmed marinara, fresh basil, and grated parmesan.",
+                ],
+                "tip": "Cover the chicken with foil when reheating to keep it from drying out.",
+            },
+            {
+                "name": "Chicken Parm Sub",
+                "subtitle": "in a toasted hoagie with extra mozzarella and roasted peppers",
+                "extras": ["Hoagie rolls", "Extra mozzarella", "Roasted red peppers", "Baby spinach"],
+                "steps": [
+                    "Split and toast hoagie rolls under the broiler.",
+                    "Warm chicken parm with a spoonful of marinara in a skillet.",
+                    "Layer into roll with roasted peppers and spinach.",
+                ],
+                "tip": "Roasted peppers make the sub more interesting than plain tomato sauce.",
+            },
+            {
+                "name": "Chicken Parm Salad Bowl",
+                "subtitle": "sliced over romaine with caesar dressing and parmesan crisps",
+                "extras": ["Romaine hearts", "Caesar dressing", "Parmesan crisps or croutons", "Lemon"],
+                "steps": [
+                    "Chop romaine and toss with caesar dressing.",
+                    "Slice chicken parm and place on top.",
+                    "Garnish with parmesan crisps and a squeeze of lemon.",
+                ],
+                "tip": "A cold salad base with warm chicken is the best kind of contrast here.",
+            },
+        ],
+    },
+    {
+        "_id": "squash-pasta-toss",
+        "_keywords": ["squash", "pasta", "butternut", "sage", "brown butter", "parmesan", "italian", "vegetarian"],
+        "image": "/static/images/squashtoss.jpg",
+        "intro": "Roasted butternut squash tossed with pasta in a brown butter–sage sauce with toasted pecans and parmesan, a seasonal Italian pantry dinner that's effortlessly elegant.",
+        "base": {
+            "title": "Brown Butter Squash Pasta",
+            "ingredients": [
+                "1 medium butternut squash (about 2 lbs), peeled and cubed",
+                "12 oz short pasta (rigatoni, orecchiette, or penne)",
+                "4 tbsp unsalted butter",
+                "10 fresh sage leaves",
+                "¼ cup toasted pecans or walnuts, roughly chopped",
+                "½ cup grated parmesan, plus more for serving",
+                "3 cloves garlic, minced",
+                "Pinch of nutmeg",
+                "Salt, pepper, olive oil",
+            ],
+            "steps": [
+                "Toss squash cubes with olive oil, salt, and pepper. Roast at 425°F for 25–30 minutes until caramelized and tender.",
+                "Cook pasta al dente in heavily salted water; reserve 1 cup pasta water before draining.",
+                "In a large skillet over medium heat, melt butter and cook until it begins to foam and turn golden-brown, about 4 minutes.",
+                "Add sage leaves; fry 30–45 seconds until crispy. Remove sage and set aside.",
+                "Add garlic to brown butter, cook 30 seconds. Add pasta and squash; toss to coat.",
+                "Add pasta water a splash at a time until sauce coats the pasta. Fold in parmesan and nutmeg. Top with crispy sage and toasted nuts.",
+            ],
+            "tip": "Brown butter moves fast, don't walk away. The moment it smells nutty and looks amber, take it off heat.",
+        },
+        "uses": [
+            {
+                "name": "Classic Squash Pasta Bowl",
+                "subtitle": "warm in a bowl with extra parmesan and a drizzle of olive oil",
+                "extras": ["Extra parmesan", "Good olive oil", "Flaky salt"],
+                "steps": [
+                    "Reheat pasta gently with a splash of water, tossing to revive the sauce.",
+                    "Serve in a wide bowl; finish with extra parmesan, a drizzle of good olive oil, and flaky salt.",
+                ],
+                "tip": "Don't overdo the water when reheating, just enough to loosen.",
+            },
+            {
+                "name": "Squash Pasta Frittata",
+                "subtitle": "leftover pasta baked into a golden egg frittata",
+                "extras": ["4 eggs", "¼ cup parmesan", "Fresh sage or parsley"],
+                "steps": [
+                    "Preheat broiler. Beat 4 eggs with parmesan, salt, and pepper.",
+                    "Warm pasta in an oven-safe skillet; pour egg mixture over. Cook on stovetop until edges set, 3–4 minutes.",
+                    "Transfer to broiler for 3–4 minutes until puffed and golden. Garnish with fresh herbs.",
+                ],
+                "tip": "This is the best possible use of day-old pasta, the eggs bind everything into a satisfying slab.",
+            },
+            {
+                "name": "Squash Pasta Stuffed Acorn Squash",
+                "subtitle": "pasta and squash filling spooned into roasted acorn squash halves",
+                "extras": ["2 acorn squash", "Ricotta", "Parmesan", "Fresh sage"],
+                "steps": [
+                    "Halve acorn squash, brush with olive oil and roast at 400°F, cut-side down, for 30 minutes.",
+                    "Flip squash halves and fill each with warm pasta.",
+                    "Dot with ricotta, dust with parmesan, and return to oven 5 minutes. Garnish with sage.",
+                ],
+                "tip": "Acorn squash halves make a dramatic presentation for guests.",
+            },
+        ],
+    },
+    {
+        "_id": "panzanella-burrata",
+        "_keywords": ["panzanella", "burrata", "bread salad", "tomato", "basil", "italian", "summer", "vegetarian"],
+        "image": "/static/images/panzanellaburatta.jpg",
+        "intro": "Rustic Italian bread salad with peak-season tomatoes, cucumbers, capers, and red onion, finished with creamy burrata, a prep-ahead Italian staple that feeds well all week.",
+        "base": {
+            "title": "Panzanella Base",
+            "ingredients": [
+                "1 day-old ciabatta or sourdough loaf (about 8 oz), torn into 1-inch chunks",
+                "2 lbs ripe mixed tomatoes, chopped or halved",
+                "1 English cucumber, roughly chopped",
+                "½ red onion, very thinly sliced",
+                "3 tbsp capers",
+                "½ cup fresh basil leaves",
+                "Dressing: 5 tbsp extra-virgin olive oil, 3 tbsp red wine vinegar, 1 tsp Dijon mustard, 1 clove garlic (minced), salt, pepper",
+            ],
+            "steps": [
+                "Toss bread chunks with 2 tbsp olive oil, salt, and pepper. Toast in a 400°F oven for 10–12 minutes until golden and crispy.",
+                "Whisk together olive oil, red wine vinegar, Dijon, garlic, salt, and pepper for the dressing.",
+                "Combine tomatoes, cucumber, red onion, and capers in a large bowl. Toss with ¾ of the dressing.",
+                "Add toasted bread and toss gently. Let sit 15–20 minutes so bread absorbs the tomato juices.",
+                "Fold in basil just before serving or storing. Keep remaining dressing separate.",
+            ],
+            "tip": "The magic of panzanella is the soak, stale bread absorbing tomato juice is the whole point. Don't rush it.",
+        },
+        "uses": [
+            {
+                "name": "Panzanella with Burrata",
+                "subtitle": "topped with a ball of creamy burrata and extra virgin olive oil",
+                "extras": ["Fresh burrata (one ball per serving)", "Flaky sea salt", "Good olive oil", "Cracked black pepper"],
+                "steps": [
+                    "Plate panzanella in a wide shallow bowl.",
+                    "Tear burrata and place in the center; season with flaky salt and pepper.",
+                    "Drizzle generously with good olive oil.",
+                ],
+                "tip": "Burrata should be at room temperature, pull it from the fridge 20 minutes before serving.",
+            },
+            {
+                "name": "Panzanella Grain Bowl",
+                "subtitle": "panzanella spooned over farro with white beans and lemon",
+                "extras": ["Farro", "White beans, drained", "Lemon zest", "Shaved parmesan"],
+                "steps": [
+                    "Cook farro per package directions; cool slightly.",
+                    "Combine warm farro with white beans in a bowl.",
+                    "Spoon panzanella on top; add lemon zest and shaved parmesan.",
+                ],
+                "tip": "Adding white beans makes this a complete protein-rich meal.",
+            },
+            {
+                "name": "Panzanella with Prosciutto",
+                "subtitle": "topped with torn prosciutto and fresh mozzarella for a fuller meal",
+                "extras": ["Prosciutto di Parma (3–4 slices per serving)", "Fresh mozzarella", "Basil oil or pesto"],
+                "steps": [
+                    "Plate panzanella generously.",
+                    "Tear prosciutto into ribbons and drape over the top.",
+                    "Add torn mozzarella and drizzle with a little basil oil or pesto.",
+                ],
+                "tip": "Prosciutto's saltiness amplifies the savory depth of the marinated bread.",
+            },
+        ],
+    },
+    {
+        "_id": "italian-lentil-salad",
+        "_keywords": ["lentil", "salad", "italian", "vegetarian", "roasted veg", "feta", "herbs"],
+        "image": "/static/images/lentildaladtop.jpg",
+        "intro": "French green lentils tossed with roasted vegetables, sun-dried tomatoes, and a herby Italian vinaigrette, a hearty, protein-packed salad that keeps beautifully in the fridge all week.",
+        "base": {
+            "title": "Italian Lentil Salad",
+            "ingredients": [
+                "1½ cups French green lentils (Puy lentils), rinsed",
+                "1 medium zucchini, diced",
+                "1 red bell pepper, diced",
+                "1 cup cherry tomatoes",
+                "¼ cup sun-dried tomatoes in oil, sliced",
+                "¼ cup Kalamata olives, halved",
+                "3 tbsp fresh parsley, chopped",
+                "Dressing: 4 tbsp olive oil, 3 tbsp red wine vinegar, 1 tsp Dijon mustard, 1 clove garlic (minced), 1 tsp dried oregano, salt, pepper",
+            ],
+            "steps": [
+                "Cook lentils in salted water for 20–25 minutes until tender but not mushy. Drain and cool.",
+                "Roast zucchini, bell pepper, and cherry tomatoes at 425°F with olive oil, salt, and pepper for 20 minutes.",
+                "Whisk together dressing ingredients until emulsified.",
+                "Combine lentils, roasted veg, sun-dried tomatoes, and olives. Toss with dressing.",
+                "Fold in parsley. Refrigerate at least 30 minutes before serving, it gets better as it sits.",
+            ],
+            "tip": "Puy lentils hold their shape after cooking, don't substitute regular brown lentils, which turn mushy.",
+        },
+        "uses": [
+            {
+                "name": "Lentil Salad with Whipped Feta",
+                "subtitle": "spooned over whipped feta with warm pita and extra herbs",
+                "extras": ["Feta cheese (4 oz)", "Greek yogurt (2 tbsp)", "Warm pita", "Lemon zest"],
+                "steps": [
+                    "Blend feta and Greek yogurt in a food processor until smooth and creamy. Spread on a plate.",
+                    "Spoon lentil salad generously over the whipped feta.",
+                    "Add lemon zest and serve with warm pita for scooping.",
+                ],
+                "tip": "Whipped feta is transformative, it makes the whole thing feel like a restaurant dish.",
+            },
+            {
+                "name": "Lentil Salad Wrap",
+                "subtitle": "rolled in a whole-grain tortilla with greens and hummus",
+                "extras": ["Whole-grain tortillas", "Hummus", "Baby spinach", "Cucumber slices"],
+                "steps": [
+                    "Spread hummus over a tortilla.",
+                    "Add a layer of baby spinach and cucumber, then a generous scoop of lentil salad.",
+                    "Roll tightly and slice in half.",
+                ],
+                "tip": "The hummus acts as a binder and adds extra protein, don't skip it.",
+            },
+            {
+                "name": "Lentil Salad Bruschetta",
+                "subtitle": "spooned onto toasted sourdough with goat cheese",
+                "extras": ["Thick-cut sourdough", "Soft goat cheese", "Honey drizzle", "Microgreens"],
+                "steps": [
+                    "Toast sourdough slices until golden. Spread goat cheese on each.",
+                    "Pile lentil salad on top.",
+                    "Drizzle with honey and top with microgreens.",
+                ],
+                "tip": "The honey offsets the acidity of the vinaigrette, it's surprisingly good.",
+            },
+        ],
+    },
+    {
+        "_id": "corn-zucchini-salad",
+        "_keywords": ["corn", "zucchini", "salad", "italian", "summer", "vegetarian", "basil", "feta"],
+        "image": "/static/images/cornzucchsalad.jpg",
+        "intro": "Sweet corn and tender zucchini with toasted pine nuts, basil, and lemon, a simple Italian-inspired summer salad that pairs with almost everything and comes together in 20 minutes.",
+        "base": {
+            "title": "Corn & Zucchini Salad",
+            "ingredients": [
+                "4 ears fresh corn (or 3 cups frozen corn kernels)",
+                "3 medium zucchini, diced",
+                "¼ cup pine nuts or slivered almonds",
+                "½ cup fresh basil leaves, torn",
+                "¼ cup feta or shaved parmesan",
+                "2 scallions, thinly sliced",
+                "Dressing: 3 tbsp olive oil, 2 tbsp lemon juice, 1 tsp lemon zest, 1 clove garlic (minced), ½ tsp honey, salt, pepper",
+            ],
+            "steps": [
+                "If using fresh corn, char on a dry skillet or grill over high heat, turning until kernels are spotted and golden. Cut from cobs.",
+                "Toss diced zucchini with olive oil, salt, and pepper. Sauté in a hot skillet 4–5 minutes until golden at the edges but still with a little bite.",
+                "Toast pine nuts in a dry pan over medium heat 2–3 minutes until golden.",
+                "Whisk together dressing ingredients.",
+                "Combine corn, zucchini, and scallions. Toss with dressing. Fold in basil and pine nuts.",
+                "Top with feta or parmesan. Serve warm or at room temperature.",
+            ],
+            "tip": "Charring the corn is the single most impactful step, raw corn is fine but charred corn is incredible.",
+        },
+        "uses": [
+            {
+                "name": "Corn & Zucchini Salad Bowl",
+                "subtitle": "over arugula with extra lemon and shaved parmesan",
+                "extras": ["Baby arugula", "Shaved parmesan", "Extra lemon juice"],
+                "steps": [
+                    "Toss arugula with a squeeze of lemon and a little olive oil.",
+                    "Pile corn and zucchini salad on top.",
+                    "Finish with shaved parmesan and black pepper.",
+                ],
+                "tip": "Arugula's bitterness makes this feel fresh and bright rather than heavy.",
+            },
+            {
+                "name": "Corn & Zucchini Pasta",
+                "subtitle": "tossed with orzo pasta and a lemon-herb dressing",
+                "extras": ["Orzo pasta", "Extra basil", "Lemon zest", "Parmesan"],
+                "steps": [
+                    "Cook orzo in salted water; drain and cool to room temperature.",
+                    "Toss orzo with corn and zucchini salad and extra lemon zest.",
+                    "Adjust seasoning; fold in extra basil. Serve at room temperature or slightly chilled.",
+                ],
+                "tip": "Orzo absorbs the dressing as it sits, make with a little extra dressing on the side.",
+            },
+            {
+                "name": "Corn & Zucchini Flatbread",
+                "subtitle": "on toasted flatbread with ricotta and chili flakes",
+                "extras": ["Flatbreads or naan", "Whole-milk ricotta", "Chili flakes", "Honey"],
+                "steps": [
+                    "Toast flatbreads at 400°F for 5 minutes.",
+                    "Spread ricotta generously over each flatbread.",
+                    "Top with warm corn and zucchini salad; scatter chili flakes and a drizzle of honey.",
+                ],
+                "tip": "Honey and chili is a classic Italian sweet-heat pairing that works beautifully with corn.",
+            },
+        ],
+    },
+    {
+        "_id": "italian-meatball-soup",
+        "_keywords": ["meatball", "soup", "italian", "beef", "tomato", "pasta", "one-pot"],
+        "image": "/static/images/meatballsoup.jpg",
+        "servings": 6,
+        "calories_per_serving": 268,
+        "intro": "Tender beef meatballs simmered in a rich Italian tomato broth with ditalini pasta and fresh spinach, a full one-pot meal that tastes even better the next day.",
+        "base": {
+            "title": "Italian Meatball Soup",
+            "ingredients": [
+                "Meatballs: 1 lb ground beef, ¼ cup panko, 1 egg, 2 tbsp parmesan, 2 cloves garlic (minced), 1 tsp Italian seasoning, salt, pepper",
+                "Soup: 1 can (28 oz) crushed tomatoes, 4 cups chicken broth, 1 can (15 oz) diced tomatoes",
+                "1 medium onion, diced",
+                "3 cloves garlic, minced",
+                "½ cup ditalini or small pasta",
+                "3 cups baby spinach",
+                "1 tsp dried oregano, 1 tsp dried basil, ½ tsp fennel seeds",
+                "Parmesan rind (optional but great), salt, pepper, olive oil",
+            ],
+            "steps": [
+                "Mix all meatball ingredients together; don't overwork. Roll into 1-inch balls (about 24). Refrigerate 15 minutes.",
+                "Heat olive oil in a Dutch oven over medium-high. Brown meatballs in batches, 2 minutes per side. Remove and set aside, they don't need to be cooked through yet.",
+                "In the same pot, sauté onion 5 minutes. Add garlic and fennel seeds, cook 1 minute.",
+                "Add crushed tomatoes, diced tomatoes, broth, oregano, basil, and parmesan rind if using. Bring to a simmer.",
+                "Return meatballs to the pot; simmer on low 20 minutes.",
+                "Add pasta and cook per package directions. Stir in spinach until wilted. Remove parmesan rind, adjust seasoning.",
+            ],
+            "tip": "The parmesan rind is optional but adds a deep savory backbone to the broth, worth keeping one in your freezer.",
+        },
+        "uses": [
+            {
+                "name": "Classic Meatball Soup Bowl",
+                "subtitle": "a generous bowl with extra parmesan and crusty garlic bread",
+                "extras": ["Crusty bread or garlic bread", "Parmesan for grating", "Fresh basil"],
+                "steps": [
+                    "Reheat soup gently on the stovetop, adding a splash of broth if thickened.",
+                    "Ladle into a wide bowl; top with fresh parmesan and basil.",
+                    "Serve with warm crusty bread for dipping.",
+                ],
+                "tip": "The pasta absorbs broth as it sits, add extra broth when reheating.",
+            },
+            {
+                "name": "Meatball Soup with Orzo",
+                "subtitle": "same broth and meatballs with orzo instead of ditalini",
+                "extras": ["Orzo pasta", "Extra broth", "Lemon zest", "Fresh parsley"],
+                "steps": [
+                    "When making a fresh batch, substitute orzo for the ditalini.",
+                    "Finish with lemon zest and fresh parsley for a brighter note.",
+                ],
+                "tip": "Orzo makes the soup feel lighter and more elegant, great if you want a different texture.",
+            },
+            {
+                "name": "Meatball Sub Soup",
+                "subtitle": "meatballs spooned over toasted hoagie halves with mozzarella",
+                "extras": ["Hoagie rolls", "Shredded mozzarella", "Fresh oregano"],
+                "steps": [
+                    "Halve and toast hoagie rolls. Ladle a few meatballs with some broth on each roll half.",
+                    "Top generously with shredded mozzarella.",
+                    "Broil 2–3 minutes until cheese is bubbly and golden.",
+                ],
+                "tip": "This is peak comfort food, think deconstructed meatball sub with a soup twist.",
+            },
+        ],
+    },
+    {
+        "_id": "roasted-garlic-soup",
+        "_keywords": ["garlic", "soup", "italian", "roasted", "parmesan", "vegetarian", "creamy"],
+        "image": "/static/images/garlicsoup.jpg",
+        "servings": 4,
+        "calories_per_serving": 242,
+        "intro": "Sweet, slow-roasted garlic blended with white beans and parmesan broth into a silky, deeply aromatic Italian soup, simple ingredients, extraordinary depth.",
+        "base": {
+            "title": "Roasted Garlic & White Bean Soup",
+            "ingredients": [
+                "4 heads garlic",
+                "2 cans (15 oz each) white cannellini beans, drained",
+                "4 cups vegetable or chicken broth",
+                "1 medium onion, diced",
+                "3 tbsp olive oil, plus more for garlic",
+                "½ cup grated parmesan or a parmesan rind",
+                "1 tsp dried rosemary",
+                "1 tsp dried thyme",
+                "¼ cup heavy cream (optional, for richness)",
+                "Salt, white pepper, good olive oil for finishing",
+            ],
+            "steps": [
+                "Cut tops off garlic heads to expose cloves. Drizzle with olive oil, wrap in foil, and roast at 400°F for 45 minutes until deeply caramelized and soft.",
+                "Squeeze roasted garlic cloves out of their skins, it should yield about 6–8 tbsp of paste.",
+                "Sauté onion in olive oil in a soup pot over medium heat, 7 minutes until soft.",
+                "Add roasted garlic paste, rosemary, and thyme; cook 1 minute.",
+                "Add beans and broth; bring to a simmer for 15 minutes. Add parmesan rind if using.",
+                "Remove rind; blend about two-thirds of the soup with an immersion blender for a creamy-but-chunky texture. Stir in cream if using. Season with salt and white pepper.",
+            ],
+            "tip": "Roasting the garlic is non-negotiable, raw or sautéed garlic gives a completely different, sharper result.",
+        },
+        "uses": [
+            {
+                "name": "Classic Roasted Garlic Soup",
+                "subtitle": "in a bowl with croutons, parmesan, and a rosemary oil drizzle",
+                "extras": ["Sourdough croutons", "Parmesan for grating", "Fresh rosemary oil or herb oil"],
+                "steps": [
+                    "Reheat soup gently, adding a splash of broth if too thick.",
+                    "Ladle into bowls; top with croutons and grated parmesan.",
+                    "Drizzle with herb oil and crack black pepper over the top.",
+                ],
+                "tip": "The croutons soften beautifully in the creamy broth, add right before eating.",
+            },
+            {
+                "name": "Garlic Soup Crostini Bake",
+                "subtitle": "soup poured over thick bread slices and baked with gruyère",
+                "extras": ["Thick sourdough slices", "Gruyère or fontina, grated", "Fresh thyme"],
+                "steps": [
+                    "Ladle hot soup into oven-safe bowls. Float a slice of sourdough on top.",
+                    "Cover with gruyère; bake at 375°F for 10 minutes until cheese is melted and golden.",
+                    "Garnish with fresh thyme.",
+                ],
+                "tip": "This is essentially an Italian-leaning onion soup gratin, incredibly satisfying.",
+            },
+            {
+                "name": "Garlic Soup with White Bean Bruschetta",
+                "subtitle": "topped with crispy white bean bruschetta and lemon zest",
+                "extras": ["Extra white beans (½ cup)", "Sourdough bread", "Lemon zest", "Extra olive oil"],
+                "steps": [
+                    "Toss extra white beans with olive oil, salt, pepper, and lemon zest; roast at 425°F for 15 minutes until crispy.",
+                    "Toast sourdough slices.",
+                    "Ladle soup into bowls. Pile crispy beans on toasted sourdough and rest across the bowl.",
+                ],
+                "tip": "Crispy beans on top add texture that makes the silky soup much more interesting.",
+            },
+        ],
+    },
+    {
+        "_id": "pumpkin-spice-soup",
+        "_keywords": ["pumpkin", "soup", "italian", "autumn", "sage", "cream", "vegetarian", "squash"],
+        "image": "/static/images/pumpkinspicesoup.jpg",
+        "intro": "Smooth Italian-style pumpkin soup with sage brown butter, toasted pepitas, and a swirl of cream, an elegant autumn prep that's ready in 35 minutes and pairs with almost any meal.",
+        "base": {
+            "title": "Italian Pumpkin Soup",
+            "ingredients": [
+                "2 cans (15 oz each) pure pumpkin purée (or 3 cups fresh roasted pumpkin)",
+                "1 medium onion, diced",
+                "4 cloves garlic, minced",
+                "3 cups vegetable broth",
+                "½ cup heavy cream or coconut cream",
+                "3 tbsp butter",
+                "10 fresh sage leaves",
+                "¼ tsp freshly grated nutmeg",
+                "1 tsp smoked paprika",
+                "Pinch of cinnamon",
+                "Salt, white pepper, olive oil",
+                "Garnish: toasted pepitas, extra cream, fresh sage",
+            ],
+            "steps": [
+                "Sauté onion in olive oil over medium heat for 7 minutes. Add garlic, cook 1 minute.",
+                "Add pumpkin purée, broth, nutmeg, paprika, and cinnamon. Stir to combine; simmer 15 minutes.",
+                "Blend until very smooth with an immersion blender. Stir in cream; season with salt and white pepper.",
+                "For the sage brown butter: melt butter in a small pan over medium heat until foaming and golden. Add sage leaves and fry 30–45 seconds until crispy. Remove sage; reserve butter.",
+                "Keep sage brown butter and crispy sage separate for serving.",
+            ],
+            "tip": "Nutmeg and cinnamon should be whispers, a pinch each. Too much makes it taste like a candle.",
+        },
+        "uses": [
+            {
+                "name": "Classic Pumpkin Soup Bowl",
+                "subtitle": "with sage brown butter, crispy sage, pepitas, and cream swirl",
+                "extras": ["Toasted pepitas", "Extra cream for swirling", "Crusty bread"],
+                "steps": [
+                    "Reheat soup gently; thin with broth if too thick.",
+                    "Ladle into bowls; swirl a spoonful of cream.",
+                    "Drizzle sage brown butter over; top with crispy sage leaves and pepitas. Serve with crusty bread.",
+                ],
+                "tip": "Brown butter and crispy sage is the most important part, don't skip it.",
+            },
+            {
+                "name": "Pumpkin Soup Pasta",
+                "subtitle": "thinned into a sauce and tossed with rigatoni and pancetta",
+                "extras": ["Rigatoni", "Pancetta or bacon (diced)", "Parmesan", "Fresh sage"],
+                "steps": [
+                    "Cook rigatoni al dente; reserve pasta water.",
+                    "Fry pancetta until crispy; set aside.",
+                    "Thin pumpkin soup with broth to a sauce consistency. Toss with pasta and pasta water. Top with pancetta and parmesan.",
+                ],
+                "tip": "Pancetta's saltiness and crunch perfectly offset the sweet, silky pumpkin.",
+            },
+            {
+                "name": "Pumpkin Soup Risotto",
+                "subtitle": "used as the cooking liquid for a pumpkin-flavored parmesan risotto",
+                "extras": ["Arborio rice", "½ cup dry white wine", "Parmesan", "Butter"],
+                "steps": [
+                    "Thin pumpkin soup with broth 1:1 and keep warm.",
+                    "Start risotto: toast Arborio in butter, deglaze with wine, then add warm pumpkin broth one ladle at a time, stirring constantly.",
+                    "Finish with parmesan and a knob of cold butter. Serve immediately.",
+                ],
+                "tip": "This turns a simple soup into an extraordinary risotto, the pumpkin becomes the flavor of the rice itself.",
+            },
+        ],
+    },
+    {
+        "_id": "italian-lentil-soup",
+        "_keywords": ["lentil", "soup", "italian", "sausage", "tomato", "rosemary", "vegetarian option"],
+        "image": "/static/images/lentilsoup.jpg",
+        "intro": "A hearty Italian lentil soup with rosemary, Parmigiano, and your choice of sausage or vegetarian, thick, deeply flavored, and one of the best things to pack for lunch all week.",
+        "base": {
+            "title": "Italian Lentil Soup",
+            "ingredients": [
+                "1½ cups brown or green lentils, rinsed",
+                "½ lb Italian sausage (sweet or spicy), casings removed, or omit for vegetarian",
+                "1 can (14 oz) diced tomatoes",
+                "1 medium onion, diced",
+                "3 carrots, diced",
+                "3 stalks celery, diced",
+                "4 cloves garlic, minced",
+                "6 cups chicken or vegetable broth",
+                "2 sprigs fresh rosemary or 1 tsp dried",
+                "1 parmesan rind",
+                "2 cups baby spinach",
+                "Salt, pepper, olive oil, red wine vinegar for finishing",
+            ],
+            "steps": [
+                "If using sausage: brown in a Dutch oven over medium-high heat, breaking into crumbles. Remove and set aside.",
+                "In the same pot, heat olive oil and sauté onion, carrots, and celery for 8 minutes.",
+                "Add garlic and rosemary; cook 1 minute. Add tomatoes and cook 2 minutes.",
+                "Add lentils, broth, parmesan rind, and sausage (if using). Bring to a boil, then simmer 30–35 minutes until lentils are fully tender.",
+                "Remove parmesan rind and rosemary sprigs. Stir in spinach until wilted.",
+                "Finish with a splash of red wine vinegar (it brightens everything), adjust seasoning.",
+            ],
+            "tip": "The splash of red wine vinegar at the end is the secret, lentil soups need acid to come alive.",
+        },
+        "uses": [
+            {
+                "name": "Classic Lentil Soup Bowl",
+                "subtitle": "with grated parmesan, a drizzle of olive oil, and crusty bread",
+                "extras": ["Parmesan for grating", "Good olive oil", "Crusty sourdough", "Extra red wine vinegar"],
+                "steps": [
+                    "Reheat soup with a splash of water or broth; lentils will have absorbed liquid.",
+                    "Ladle into a wide bowl; drizzle good olive oil and grate parmesan over the top.",
+                    "Serve with crusty bread and a small bottle of red wine vinegar at the table.",
+                ],
+                "tip": "A second hit of vinegar at the table lets everyone control the brightness.",
+            },
+            {
+                "name": "Lentil Soup with Fried Egg",
+                "subtitle": "topped with a crispy-edged fried egg and smoked paprika oil",
+                "extras": ["Eggs (one per serving)", "Smoked paprika", "Extra olive oil"],
+                "steps": [
+                    "Make smoked paprika oil: heat 2 tbsp olive oil, add ½ tsp smoked paprika, swirl 30 seconds.",
+                    "Fry egg in olive oil until edges are crispy and whites are set.",
+                    "Ladle soup into a bowl; place egg on top and drizzle paprika oil around it.",
+                ],
+                "tip": "A runny yolk stirred into lentil soup is one of those combinations that feels like a discovery.",
+            },
+            {
+                "name": "Lentil Soup Shakshuka",
+                "subtitle": "eggs poached directly in the lentil soup, North-African style",
+                "extras": ["Eggs (2 per serving)", "Feta", "Fresh cilantro or parsley", "Flatbread"],
+                "steps": [
+                    "Warm lentil soup in a wide skillet until just simmering. Make wells and crack eggs in.",
+                    "Cover and cook 4–5 minutes until whites set and yolks are still runny.",
+                    "Scatter feta and herbs over; serve directly from the pan with flatbread.",
+                ],
+                "tip": "Lentil soup makes a great shakshuka base, it's thicker and heartier than a tomato sauce.",
+            },
+        ],
+    },
+    {
+        "_id": "herb-pork-tenderloin",
+        "_keywords": ["pork", "tenderloin", "italian", "herb", "roasted", "garlic", "dinner"],
+        "image": "/static/images/porktenderloin.jpg",
+        "intro": "Juicy herb-crusted pork tenderloin roasted with garlic, fennel, and rosemary. Italian-style, ready in 30 minutes, and versatile enough to anchor three entirely different meals.",
+        "base": {
+            "title": "Italian Herb-Crusted Pork Tenderloin",
+            "ingredients": [
+                "2 pork tenderloins (about 1 lb each)",
+                "3 tbsp olive oil",
+                "4 cloves garlic, minced",
+                "2 tbsp fresh rosemary, finely chopped (or 2 tsp dried)",
+                "1 tbsp fresh thyme, finely chopped (or 1 tsp dried)",
+                "1 tsp fennel seeds, crushed",
+                "1 tsp smoked paprika",
+                "1 tsp Dijon mustard",
+                "Salt, pepper",
+            ],
+            "steps": [
+                "Combine olive oil, garlic, rosemary, thyme, fennel, paprika, mustard, salt, and pepper into a paste.",
+                "Rub paste all over the tenderloins. Marinate at least 30 minutes (up to overnight).",
+                "Preheat oven to 425°F. Heat an oven-safe skillet over high heat; sear tenderloins 2 minutes per side until browned all over.",
+                "Transfer skillet to oven; roast 12–15 minutes until internal temp reaches 145°F.",
+                "Rest on a cutting board 10 minutes before slicing. The center may look pink, that's correct for 145°F.",
+            ],
+            "tip": "Pork tenderloin dries out at 160°F, pull it at 145°F and rest it. It stays juicy and the pink is safe.",
+        },
+        "uses": [
+            {
+                "name": "Pork Tenderloin Dinner Plate",
+                "subtitle": "sliced over white beans and greens with pan juices",
+                "extras": ["White cannellini beans", "Sautéed leafy greens (kale or spinach)", "Lemon", "Crusty bread"],
+                "steps": [
+                    "Warm beans in a pan with olive oil, garlic, salt, and a splash of broth.",
+                    "Quickly sauté greens until just wilted.",
+                    "Slice tenderloin and arrange over beans and greens. Squeeze lemon over everything.",
+                ],
+                "tip": "White beans absorb the pork's herby juices and become incredible.",
+            },
+            {
+                "name": "Pork Tenderloin Sandwich",
+                "subtitle": "sliced thin on ciabatta with salsa verde and arugula",
+                "extras": ["Ciabatta rolls", "Salsa verde (parsley, capers, lemon, olive oil)", "Arugula"],
+                "steps": [
+                    "Make quick salsa verde: blend parsley, capers, lemon juice, olive oil, salt.",
+                    "Toast ciabatta rolls. Slice pork thin.",
+                    "Layer arugula, sliced pork, and a generous spoon of salsa verde on each roll.",
+                ],
+                "tip": "Salsa verde is the natural partner for roasted pork, bright and herby against the rich meat.",
+            },
+            {
+                "name": "Pork Tenderloin Pasta",
+                "subtitle": "sliced over creamy polenta with roasted cherry tomatoes",
+                "extras": ["Polenta (instant or coarse-ground)", "Cherry tomatoes", "Parmesan", "Fresh basil"],
+                "steps": [
+                    "Prepare polenta; stir in parmesan and butter until creamy.",
+                    "Roast cherry tomatoes at 400°F with olive oil, salt, and pepper for 15 minutes.",
+                    "Spoon polenta into bowls; arrange sliced pork and roasted tomatoes over the top. Finish with fresh basil.",
+                ],
+                "tip": "Creamy polenta is the ideal base for sliced roasted pork, it absorbs the juices beautifully.",
+            },
+        ],
+    },
+    {
+        "_id": "italian-pork-chops",
+        "_keywords": ["pork chops", "italian", "tomato", "olive", "capers", "braised", "dinner"],
+        "image": "/static/images/porkchop.jpg",
+        "intro": "Bone-in pork chops braised in a punchy Italian tomato sauce with olives, capers, and herbs, puttanesca-style flavors that transform a humble chop into something deeply memorable.",
+        "base": {
+            "title": "Italian-Style Braised Pork Chops",
+            "ingredients": [
+                "4 bone-in pork chops (¾ inch thick)",
+                "1 can (14 oz) crushed tomatoes",
+                "½ cup dry white wine",
+                "½ cup Kalamata olives, halved",
+                "2 tbsp capers",
+                "4 cloves garlic, sliced",
+                "1 medium onion, thinly sliced",
+                "1 tsp dried oregano",
+                "1 tsp red pepper flakes",
+                "2 tbsp olive oil",
+                "Salt, pepper, fresh parsley for serving",
+            ],
+            "steps": [
+                "Season chops generously with salt and pepper. Heat olive oil in a wide, heavy skillet over high heat.",
+                "Sear chops 3 minutes per side until deeply golden. Remove.",
+                "Reduce heat to medium; sauté onion 5 minutes, then add garlic slices, cook 1 minute.",
+                "Pour in wine and deglaze; cook until mostly evaporated. Add crushed tomatoes, olives, capers, oregano, and red pepper flakes.",
+                "Return chops to the pan, nestling them into the sauce. Simmer partially covered on low heat for 20–25 minutes until tender.",
+                "Adjust seasoning; scatter fresh parsley over before serving.",
+            ],
+            "tip": "High-heat searing first locks in juices; slow simmering in the sauce finishes them without drying out.",
+        },
+        "uses": [
+            {
+                "name": "Braised Pork Chops over Polenta",
+                "subtitle": "bone-in chop on a bed of creamy parmesan polenta",
+                "extras": ["Polenta", "Parmesan", "Butter", "Fresh parsley"],
+                "steps": [
+                    "Prepare polenta; stir in parmesan and butter until rich and creamy.",
+                    "Reheat chop in sauce in a covered pan over low heat.",
+                    "Spoon polenta, place chop on top, and ladle sauce generously around.",
+                ],
+                "tip": "Don't thin the sauce, it should be thick and glossy over the polenta.",
+            },
+            {
+                "name": "Pork Chop Pasta",
+                "subtitle": "sauce tossed with pasta, chop served on the side or sliced over",
+                "extras": ["Spaghetti or linguine", "Extra parmesan", "Bread for dipping"],
+                "steps": [
+                    "Cook pasta al dente; reserve ¼ cup pasta water.",
+                    "Remove pork from sauce and slice. Toss sauce with pasta and pasta water.",
+                    "Serve pasta topped with sliced chop; finish with parmesan.",
+                ],
+                "tip": "The olive-caper sauce is essentially a puttanesca, it's spectacular with pasta.",
+            },
+            {
+                "name": "Pork Chop Rice Bowl",
+                "subtitle": "sliced over jasmine rice with the braising sauce and roasted veg",
+                "extras": ["Jasmine rice", "Roasted bell peppers", "Fresh basil"],
+                "steps": [
+                    "Cook jasmine rice per package directions.",
+                    "Reheat pork chop in sauce. Slice or serve whole.",
+                    "Plate over rice with roasted peppers; spoon extra sauce generously. Top with fresh basil.",
+                ],
+                "tip": "Rice soaks up the briny, tomato-rich sauce in the best way possible.",
+            },
+        ],
+    },
+    {
+        "_id": "wine-braised-sausage",
+        "_keywords": ["sausage", "italian", "wine", "braised", "peppers", "onions", "dinner"],
+        "image": "/static/images/winesausagestop.jpg",
+        "intro": "Italian sausages slow-braised in red wine with sweet peppers and onions until the sauce is thick, glossy, and deeply caramelized, a classic that only gets better overnight.",
+        "base": {
+            "title": "Wine-Braised Italian Sausage",
+            "ingredients": [
+                "2 lbs Italian sausage links (sweet, hot, or a mix)",
+                "2 large bell peppers (red and yellow), sliced",
+                "2 large onions, sliced into half-moons",
+                "4 cloves garlic, minced",
+                "1 cup dry red wine (Chianti or any Italian red)",
+                "1 can (14 oz) crushed tomatoes",
+                "2 tbsp tomato paste",
+                "1 tsp fennel seeds",
+                "1 tsp dried oregano",
+                "Salt, pepper, olive oil",
+                "Fresh basil and parmesan for serving",
+            ],
+            "steps": [
+                "Prick sausages a few times with a fork. Brown in olive oil in a wide Dutch oven over medium-high, turning to color all sides, about 6 minutes. Remove.",
+                "In the same pot, sauté onions over medium heat for 10 minutes until deeply golden. Add peppers and cook another 5 minutes.",
+                "Add garlic, fennel seeds, and tomato paste; cook 1 minute.",
+                "Pour in wine; scrape up browned bits. Simmer 5 minutes until wine reduces by half.",
+                "Add crushed tomatoes and oregano. Return sausages. Cover and simmer on low heat for 30–35 minutes.",
+                "Uncover the last 10 minutes to thicken the sauce. Adjust seasoning.",
+            ],
+            "tip": "The long slow cook is what makes this, an impatient braise gives you cooked sausage; a patient one gives you magic.",
+        },
+        "uses": [
+            {
+                "name": "Sausage & Peppers Classic",
+                "subtitle": "sausage and peppers over soft polenta with fresh basil",
+                "extras": ["Polenta", "Parmesan", "Fresh basil", "Extra red pepper flakes"],
+                "steps": [
+                    "Prepare polenta with parmesan and butter until creamy.",
+                    "Reheat sausage and peppers gently in the sauce.",
+                    "Spoon polenta; add sausage links and peppers with sauce. Finish with basil and red pepper flakes.",
+                ],
+                "tip": "Creamy polenta is the most traditional partner for sausage and peppers in Italy.",
+            },
+            {
+                "name": "Sausage & Peppers Sub",
+                "subtitle": "in a toasted hoagie with provolone and giardiniera",
+                "extras": ["Hoagie rolls", "Provolone cheese", "Giardiniera", "Hot sauce"],
+                "steps": [
+                    "Toast hoagie rolls under the broiler.",
+                    "Slice sausages diagonally; reheat with peppers and onions.",
+                    "Pile into rolls; top with provolone and broil 1 minute. Add giardiniera and hot sauce.",
+                ],
+                "tip": "Slicing the sausages diagonally gives more surface area and fits better in the roll.",
+            },
+            {
+                "name": "Sausage & Peppers Pasta",
+                "subtitle": "sliced sausage and sauce tossed with rigatoni and parmesan",
+                "extras": ["Rigatoni", "Extra parmesan", "Fresh parsley", "Crusty bread"],
+                "steps": [
+                    "Cook rigatoni al dente; reserve ½ cup pasta water.",
+                    "Slice sausages into rounds. Toss with sauce and pasta; add pasta water to loosen.",
+                    "Serve topped with parmesan and parsley. Pass crusty bread at the table.",
+                ],
+                "tip": "Rigatoni's ridges grab the thick, glossy sauce, it's the ideal pasta shape here.",
+            },
+        ],
+    },
+    # ── Dessert + Italian/American recipes ───────────────────────────────────
+    {
+        "_id": "raspberry-ricotta-cake",
+        "_keywords": ["cake", "ricotta", "raspberry", "italian", "dessert", "baked"],
+        "image": "/static/images/raspberryricottacake.jpg",
+        "intro": "A moist, golden Italian ricotta cake studded with fresh raspberries, tender from the cheese, fragrant with lemon zest, and elegant enough for company with no fuss.",
+        "base": {
+            "title": "Raspberry Ricotta Cake",
+            "ingredients": [
+                "1½ cups (190g) all-purpose flour",
+                "1 cup (200g) sugar",
+                "1½ tsp baking powder",
+                "¼ tsp salt",
+                "3 large eggs",
+                "1½ cups (375g) whole-milk ricotta",
+                "½ cup (115g) unsalted butter, melted and cooled",
+                "1 tsp vanilla extract",
+                "1 tbsp lemon zest",
+                "1½ cups fresh raspberries",
+                "Powdered sugar for dusting",
+            ],
+            "steps": [
+                "Preheat oven to 350°F. Grease and flour a 9-inch springform or cake pan.",
+                "Whisk flour, sugar, baking powder, and salt together in a large bowl.",
+                "In another bowl, whisk eggs, ricotta, melted butter, vanilla, and lemon zest until smooth.",
+                "Fold wet ingredients into dry ingredients until just combined, a few lumps are fine.",
+                "Pour batter into prepared pan. Scatter raspberries evenly over the top; press lightly.",
+                "Bake 50–55 minutes until a toothpick inserted in the center comes out clean and top is golden.",
+                "Cool in pan 15 minutes, then unmold. Dust with powdered sugar before serving.",
+            ],
+            "tip": "Ricotta adds moisture without making the cake dense, don't substitute low-fat, it changes the texture.",
+        },
+        "uses": [
+            {
+                "name": "Classic Raspberry Ricotta Cake",
+                "subtitle": "a generous slice with powdered sugar and fresh cream",
+                "extras": ["Powdered sugar", "Whipped cream or crème fraîche", "Extra fresh raspberries"],
+                "steps": [
+                    "Dust cooled cake generously with powdered sugar.",
+                    "Slice and serve with a dollop of whipped cream and a few fresh raspberries alongside.",
+                ],
+                "tip": "Crème fraîche is more interesting than plain whipped cream here, slightly tangy against the sweet cake.",
+            },
+            {
+                "name": "Ricotta Cake with Lemon Glaze",
+                "subtitle": "drizzled with a sharp lemon icing for extra brightness",
+                "extras": ["½ cup powdered sugar", "2 tbsp fresh lemon juice"],
+                "steps": [
+                    "Whisk powdered sugar and lemon juice to a thin glaze.",
+                    "Drizzle over cooled cake. Let set 10 minutes before slicing.",
+                ],
+                "tip": "The lemon glaze amplifies the zest already in the batter, don't skip it.",
+            },
+            {
+                "name": "Ricotta Cake with Berry Compote",
+                "subtitle": "warm mixed berry compote spooned over each slice",
+                "extras": ["1 cup mixed berries", "2 tbsp sugar", "1 tbsp lemon juice"],
+                "steps": [
+                    "Cook berries with sugar and lemon juice over medium heat 8–10 minutes until jammy. Cool slightly.",
+                    "Spoon warm compote over cake slices. Serve with vanilla ice cream if desired.",
+                ],
+                "tip": "The compote keeps refrigerated for 5 days, make extra.",
+            },
+        ],
+    },
+    {
+        "_id": "apple-cinnamon-flatbread",
+        "_keywords": ["apple", "cinnamon", "flatbread", "focaccia", "italian", "dessert", "baked"],
+        "image": "/static/images/applefocaccia.jpg",
+        "intro": "An Italian sweet focaccia-style flatbread loaded with thinly sliced apples, cinnamon sugar, and a drizzle of honey, somewhere between bread and pastry, and brilliant for breakfast or dessert.",
+        "base": {
+            "title": "Apple Cinnamon Sweet Flatbread",
+            "ingredients": [
+                "2¼ tsp active dry yeast",
+                "1 cup warm water (110°F)",
+                "2 tbsp sugar, divided",
+                "2½ cups all-purpose flour",
+                "½ tsp salt",
+                "3 tbsp olive oil, divided",
+                "2 medium apples, cored and very thinly sliced",
+                "2 tbsp brown sugar",
+                "1 tsp cinnamon",
+                "2 tbsp honey",
+                "Pinch of flaky salt",
+            ],
+            "steps": [
+                "Dissolve yeast and 1 tsp sugar in warm water; let sit 5–10 minutes until foamy.",
+                "Mix flour, remaining sugar, and salt. Add yeast mixture and 2 tbsp olive oil; knead 8–10 minutes until smooth and elastic. Cover; rise 1 hour until doubled.",
+                "Preheat oven to 425°F. Grease a 9×13 baking pan with remaining olive oil.",
+                "Press dough into pan; dimple all over with your fingers. Let rest 20 minutes.",
+                "Arrange apple slices in overlapping rows over the dough.",
+                "Mix brown sugar and cinnamon; sprinkle evenly over apples. Drizzle honey over the top.",
+                "Bake 22–26 minutes until golden at the edges and apples are caramelized. Finish with flaky salt.",
+            ],
+            "tip": "Thin apple slices are key, use a mandoline or a sharp knife. Thick slices won't cook through.",
+        },
+        "uses": [
+            {
+                "name": "Apple Flatbread with Vanilla Cream",
+                "subtitle": "warm from the oven with sweetened mascarpone",
+                "extras": ["Mascarpone or cream cheese (4 oz)", "2 tbsp powdered sugar", "½ tsp vanilla"],
+                "steps": [
+                    "Beat mascarpone with powdered sugar and vanilla until smooth.",
+                    "Slice warm flatbread and serve with a generous spoonful of vanilla mascarpone.",
+                ],
+                "tip": "Mascarpone at room temperature is much easier to beat smooth.",
+            },
+            {
+                "name": "Apple Flatbread Breakfast Slice",
+                "subtitle": "a square with a drizzle of almond butter and extra cinnamon",
+                "extras": ["Almond butter", "Extra honey", "Cinnamon"],
+                "steps": [
+                    "Warm flatbread slices in a 300°F oven for 5 minutes.",
+                    "Drizzle with almond butter and honey; dust with cinnamon.",
+                ],
+                "tip": "This is a great make-ahead breakfast, the flatbread keeps well at room temperature for 2 days.",
+            },
+            {
+                "name": "Apple Flatbread à la Mode",
+                "subtitle": "warm slice with a scoop of vanilla or cinnamon ice cream",
+                "extras": ["Vanilla or cinnamon ice cream", "Caramel sauce"],
+                "steps": [
+                    "Warm flatbread briefly in the oven.",
+                    "Top each slice with a scoop of ice cream and a drizzle of caramel sauce.",
+                ],
+                "tip": "The contrast of warm flatbread and cold ice cream is the whole point here.",
+            },
+        ],
+    },
+    {
+        "_id": "peach-crostata",
+        "_keywords": ["peach", "crostata", "tart", "italian", "dessert", "pastry", "summer"],
+        "image": "/static/images/peachcrostata.jpg",
+        "intro": "A rustic Italian free-form tart with a buttery, flaky crust and a jammy peach filling, unfussy and forgiving, with the kind of homemade charm that impresses without effort.",
+        "base": {
+            "title": "Summer Peach Crostata",
+            "ingredients": [
+                "Pastry: 1½ cups (190g) all-purpose flour, 2 tbsp sugar, ½ tsp salt, ½ cup (115g) cold unsalted butter (cubed), 3–4 tbsp ice water",
+                "Filling: 4 ripe peaches (about 1½ lbs), peeled and sliced, 3 tbsp sugar, 1 tbsp cornstarch, 1 tsp lemon juice, ½ tsp vanilla, pinch of cinnamon",
+                "1 egg yolk + 1 tbsp water (egg wash)",
+                "1 tbsp turbinado sugar for sprinkling",
+            ],
+            "steps": [
+                "Make pastry: pulse flour, sugar, and salt in a food processor. Add butter and pulse until pea-sized crumbs form. Add ice water 1 tbsp at a time until dough just comes together. Flatten into a disk, wrap, and refrigerate 1 hour.",
+                "Mix peach slices with sugar, cornstarch, lemon juice, vanilla, and cinnamon. Let sit 15 minutes.",
+                "Preheat oven to 375°F. Line a baking sheet with parchment.",
+                "Roll dough into a rough 12-inch circle on a floured surface. Transfer to baking sheet.",
+                "Pile peach filling in the center, leaving a 2-inch border. Fold the edges over, pleating as you go.",
+                "Brush pastry with egg wash; sprinkle turbinado sugar. Bake 40–45 minutes until golden and bubbling.",
+                "Cool at least 20 minutes before slicing, filling needs time to set.",
+            ],
+            "tip": "The crostata is meant to be rustic, uneven folds are a feature, not a flaw.",
+        },
+        "uses": [
+            {
+                "name": "Classic Peach Crostata",
+                "subtitle": "a warm slice with vanilla gelato or crème fraîche",
+                "extras": ["Vanilla gelato or ice cream", "Crème fraîche"],
+                "steps": [
+                    "Warm crostata slices in a 325°F oven for 8 minutes.",
+                    "Serve with a scoop of vanilla gelato or a spoonful of crème fraîche.",
+                ],
+                "tip": "Gelato melts more slowly than ice cream, better for plating.",
+            },
+            {
+                "name": "Peach Crostata with Honey Ricotta",
+                "subtitle": "slices with a spread of honey-sweetened ricotta",
+                "extras": ["Whole-milk ricotta (½ cup)", "2 tbsp honey", "Lemon zest"],
+                "steps": [
+                    "Whisk ricotta with honey and lemon zest until smooth.",
+                    "Serve crostata slices alongside or with a generous spoonful of honey ricotta on top.",
+                ],
+                "tip": "Honey ricotta is also great spread on the crostata pastry edge.",
+            },
+            {
+                "name": "Peach Crostata Breakfast",
+                "subtitle": "a slice with morning coffee, the pastry holds up well",
+                "extras": ["Greek yogurt", "Extra honey"],
+                "steps": [
+                    "Serve a slice of crostata at room temperature with a side of Greek yogurt and a drizzle of honey.",
+                ],
+                "tip": "Crostata at room temperature the next morning is genuinely one of the best breakfasts.",
+            },
+        ],
+    },
+    {
+        "_id": "tiramisu-cake",
+        "_keywords": ["tiramisu", "cake", "espresso", "mascarpone", "italian", "dessert", "coffee"],
+        "image": "/static/images/tiramisucake.jpg",
+        "intro": "All the flavors of classic tiramisu in layered cake form, espresso-soaked sponge, silky mascarpone cream, and a heavy dusting of cocoa. Make it the day before; it only gets better.",
+        "base": {
+            "title": "Tiramisu Cake",
+            "ingredients": [
+                "Sponge: 4 eggs (separated), ¾ cup (150g) sugar, 1 cup (125g) all-purpose flour, 1 tsp baking powder, pinch of salt",
+                "Espresso soak: 1 cup strong espresso or very strong coffee, 2 tbsp coffee liqueur (optional)",
+                "Mascarpone cream: 16 oz (450g) mascarpone, 1 cup heavy cream, ½ cup (60g) powdered sugar, 1 tsp vanilla",
+                "Unsweetened cocoa powder for dusting",
+            ],
+            "steps": [
+                "Preheat oven to 350°F. Beat egg yolks with sugar until pale and thick. Beat whites to stiff peaks. Fold yolk mixture and sifted flour/baking powder alternately into whites.",
+                "Pour into a greased 9-inch pan; bake 25–30 minutes until springy. Cool completely.",
+                "Split cooled cake horizontally into 2 layers.",
+                "Whip mascarpone, heavy cream, powdered sugar, and vanilla together until thick and smooth.",
+                "Mix espresso and liqueur. Brush bottom layer generously with half the espresso soak. Spread half the mascarpone cream on top.",
+                "Add second cake layer; brush with remaining espresso soak. Spread remaining cream on top and sides.",
+                "Refrigerate at least 4 hours (overnight is best). Dust heavily with cocoa just before serving.",
+            ],
+            "tip": "The cake must be made ahead, minimum 4 hours, overnight is ideal. The espresso soak needs time to fully penetrate.",
+        },
+        "uses": [
+            {
+                "name": "Classic Tiramisu Cake Slice",
+                "subtitle": "a generous slice dusted with cocoa and a cup of espresso",
+                "extras": ["Extra cocoa powder for dusting", "Espresso or coffee"],
+                "steps": [
+                    "Remove cake from refrigerator 20 minutes before serving.",
+                    "Dust the top generously with cocoa through a fine sieve.",
+                    "Slice with a clean knife (wipe between cuts) and serve with espresso.",
+                ],
+                "tip": "A warm knife slides through the mascarpone layers much more cleanly.",
+            },
+            {
+                "name": "Tiramisu Cake with Chocolate Shavings",
+                "subtitle": "finished with dark chocolate curls for an elegant presentation",
+                "extras": ["Dark chocolate bar for shaving", "Flaky salt"],
+                "steps": [
+                    "Use a vegetable peeler to shave curls from a bar of dark chocolate.",
+                    "Arrange curls over the cocoa-dusted cake. Add a pinch of flaky salt.",
+                ],
+                "tip": "Room-temperature chocolate shaves more cleanly, cold chocolate just breaks.",
+            },
+            {
+                "name": "Tiramisu Cake Cups",
+                "subtitle": "deconstructed into individual glasses for easy serving",
+                "extras": ["Small glasses or jars", "Extra cocoa powder"],
+                "steps": [
+                    "Crumble leftover cake into glasses in alternating layers with any remaining cream.",
+                    "Dust tops with cocoa and refrigerate until serving.",
+                ],
+                "tip": "Individual cups portion perfectly and look more elegant than cutting a cake.",
+            },
+        ],
+    },
+    {
+        "_id": "roasted-strawberries",
+        "_keywords": ["strawberry", "roasted", "italian", "dessert", "balsamic", "summer"],
+        "image": "/static/images/roastedstrawberries.jpg",
+        "intro": "Oven-roasted strawberries with balsamic and honey, they collapse into jammy, intensely flavored fruit in 20 minutes and make every single thing you spoon them over taste extraordinary.",
+        "base": {
+            "title": "Roasted Balsamic Strawberries",
+            "ingredients": [
+                "2 lbs fresh strawberries, hulled and halved",
+                "3 tbsp honey or maple syrup",
+                "2 tbsp balsamic vinegar",
+                "1 tsp vanilla extract",
+                "Pinch of black pepper",
+            ],
+            "steps": [
+                "Preheat oven to 400°F.",
+                "Toss strawberries with honey, balsamic, vanilla, and black pepper in a 9×13 baking dish.",
+                "Roast 20–25 minutes until strawberries are collapsed and jammy, stirring once halfway through.",
+                "The juices will reduce and thicken as they cool. Let stand 10 minutes before using.",
+                "Store in the fridge up to 1 week. The flavor deepens overnight.",
+            ],
+            "tip": "Don't crowd the pan, strawberries need space to roast, not steam. Use a large dish.",
+        },
+        "uses": [
+            {
+                "name": "Roasted Strawberries over Ice Cream",
+                "subtitle": "warm over vanilla gelato with a drizzle of the pan juices",
+                "extras": ["Vanilla gelato or ice cream", "Fresh basil leaves (optional)"],
+                "steps": [
+                    "Scoop gelato into bowls.",
+                    "Spoon warm or room-temperature strawberries generously over the top with their syrupy juices.",
+                    "Garnish with a torn basil leaf for an Italian touch.",
+                ],
+                "tip": "A torn basil leaf on top sounds odd but is genuinely delicious with roasted strawberries.",
+            },
+            {
+                "name": "Roasted Strawberries on Yogurt",
+                "subtitle": "spooned over thick Greek yogurt with granola",
+                "extras": ["Greek yogurt (full-fat)", "Granola", "Honey"],
+                "steps": [
+                    "Spoon thick yogurt into bowls.",
+                    "Top with roasted strawberries and their syrup, then scatter granola over.",
+                    "Drizzle extra honey if desired.",
+                ],
+                "tip": "This is better than most breakfast parfaits you'll ever buy.",
+            },
+            {
+                "name": "Roasted Strawberry Crostini",
+                "subtitle": "on toasted bread with ricotta and black pepper",
+                "extras": ["Sourdough or baguette slices", "Whole-milk ricotta", "Flaky salt", "Extra black pepper"],
+                "steps": [
+                    "Toast bread slices until golden.",
+                    "Spread ricotta generously over each slice.",
+                    "Spoon roasted strawberries on top; season with flaky salt and cracked pepper.",
+                ],
+                "tip": "This is one of the best things you can put on toast, sweet, tart, creamy, and savory all at once.",
+            },
+        ],
+    },
+    {
+        "_id": "lemon-poppy-seed-loaf",
+        "_keywords": ["lemon", "poppy seed", "loaf", "cake", "american", "dessert", "breakfast"],
+        "image": "/static/images/lemonpoppyseedloaf.jpg",
+        "servings": 8,
+        "calories_per_serving": 290,
+        "intro": "A bright, tender lemon poppy seed loaf with a sharp citrus glaze, easy to make, keeps beautifully, and makes the kitchen smell incredible.",
+        "base": {
+            "title": "Meyer Lemon Poppy Seed Loaf",
+            "ingredients": [
+                "1½ cups (190g) all-purpose flour",
+                "1 tsp baking powder",
+                "¼ tsp baking soda",
+                "½ tsp salt",
+                "2 tbsp poppy seeds",
+                "3 large eggs",
+                "1 cup (200g) sugar",
+                "½ cup (120ml) sour cream or Greek yogurt",
+                "½ cup (115g) unsalted butter, melted",
+                "2 tbsp lemon zest (from 2 lemons)",
+                "3 tbsp fresh lemon juice",
+                "Glaze: 1 cup powdered sugar + 3 tbsp lemon juice",
+            ],
+            "steps": [
+                "Preheat oven to 350°F. Grease and flour a 9×5 loaf pan.",
+                "Whisk flour, baking powder, baking soda, salt, and poppy seeds together.",
+                "In another bowl, whisk eggs and sugar until pale, about 2 minutes. Whisk in sour cream, melted butter, lemon zest, and lemon juice.",
+                "Fold dry ingredients into wet until just combined.",
+                "Pour into loaf pan; bake 50–60 minutes until a toothpick comes out clean.",
+                "Cool in pan 10 minutes, then unmold onto a rack.",
+                "Whisk glaze until smooth. Pour over warm loaf; let drip down the sides.",
+            ],
+            "tip": "Meyer lemons are sweeter and more fragrant than regular, use them if you can. Regular lemons work fine.",
+        },
+        "uses": [
+            {
+                "name": "Glazed Lemon Loaf Slice",
+                "subtitle": "a thick slice with the crackly lemon glaze and a cup of tea",
+                "extras": ["Hot tea or coffee"],
+                "steps": ["Slice loaf and serve at room temperature with a warm drink."],
+                "tip": "The loaf slices more cleanly after it has fully cooled and the glaze has set.",
+            },
+            {
+                "name": "Lemon Loaf with Berries",
+                "subtitle": "a slice alongside fresh berries and whipped cream",
+                "extras": ["Fresh strawberries or blueberries", "Whipped cream"],
+                "steps": [
+                    "Hull and halve berries; toss with a pinch of sugar and lemon juice.",
+                    "Serve loaf slices with macerated berries and a dollop of whipped cream.",
+                ],
+                "tip": "Macerated berries take 10 minutes but make the dessert feel intentional.",
+            },
+            {
+                "name": "Lemon Loaf French Toast",
+                "subtitle": "thick slices pan-fried in butter like french toast",
+                "extras": ["2 eggs", "¼ cup milk", "Butter", "Maple syrup"],
+                "steps": [
+                    "Whisk eggs and milk together. Dip thick loaf slices and coat both sides.",
+                    "Pan-fry in butter over medium heat 2–3 minutes per side until golden.",
+                    "Serve with maple syrup and extra lemon zest.",
+                ],
+                "tip": "Lemon poppy seed loaf makes extraordinary french toast, the glaze caramelizes in the pan.",
+            },
+        ],
+    },
+    {
+        "_id": "pumpkin-spice-muffins",
+        "_keywords": ["pumpkin", "muffin", "breakfast", "american", "spice", "fall"],
+        "image": "/static/images/pumpkinmuffins.jpg",
+        "servings": 12,
+        "calories_per_serving": 121,
+        "intro": "Moist, warmly spiced pumpkin muffins with a tender crumb and a cinnamon-sugar top, make a batch Sunday and breakfast is handled for the whole week.",
+        "base": {
+            "title": "Pumpkin Spice Muffins",
+            "ingredients": [
+                "1¾ cups (220g) all-purpose flour",
+                "1½ tsp pumpkin pie spice",
+                "1 tsp cinnamon",
+                "1 tsp baking soda",
+                "½ tsp baking powder",
+                "½ tsp salt",
+                "2 large eggs",
+                "1 cup (225g) pure pumpkin purée",
+                "¾ cup (150g) brown sugar, packed",
+                "½ cup (120ml) vegetable oil",
+                "⅓ cup (80ml) milk",
+                "1 tsp vanilla extract",
+                "Topping: 2 tbsp sugar + ½ tsp cinnamon",
+            ],
+            "steps": [
+                "Preheat oven to 375°F. Line a 12-cup muffin tin with paper liners.",
+                "Whisk flour, pumpkin pie spice, cinnamon, baking soda, baking powder, and salt together.",
+                "In another bowl, whisk eggs, pumpkin, brown sugar, oil, milk, and vanilla until smooth.",
+                "Fold wet ingredients into dry until just combined, don't overmix.",
+                "Divide batter evenly among cups (about ¾ full). Mix cinnamon-sugar topping and sprinkle over each.",
+                "Bake 18–22 minutes until a toothpick comes out clean. Cool 5 minutes in pan, then transfer to a rack.",
+            ],
+            "tip": "Overmixing develops gluten and makes muffins tough. Stop folding the moment the flour disappears.",
+        },
+        "uses": [
+            {
+                "name": "Pumpkin Spice Muffins",
+                "subtitle": "warm with butter and a hot coffee, ready to go",
+                "extras": ["Butter or cream cheese", "Coffee"],
+                "steps": ["Warm muffins 15 seconds in the microwave. Serve with butter or cream cheese."],
+                "tip": "Muffins freeze perfectly, wrap individually and thaw overnight or microwave 30 seconds from frozen.",
+            },
+        ],
+    },
+    {
+        "_id": "banana-nut-muffins",
+        "_keywords": ["banana", "muffin", "walnut", "breakfast", "american", "healthy"],
+        "image": "/static/images/bananamuffins.jpg",
+        "servings": 12,
+        "calories_per_serving": 218,
+        "intro": "Wholesome banana nut muffins made lighter with Greek yogurt and whole wheat flour, naturally sweetened from ripe bananas, with toasted walnuts for crunch.",
+        "base": {
+            "title": "Healthier Banana Nut Muffins",
+            "ingredients": [
+                "1 cup (125g) whole wheat flour",
+                "½ cup (65g) all-purpose flour",
+                "1 tsp baking soda",
+                "½ tsp cinnamon",
+                "¼ tsp salt",
+                "3 very ripe bananas, mashed (about 1 cup)",
+                "⅓ cup (75g) honey or maple syrup",
+                "1 egg",
+                "⅓ cup (80g) Greek yogurt",
+                "3 tbsp coconut oil or butter, melted",
+                "1 tsp vanilla extract",
+                "½ cup (60g) walnuts, roughly chopped",
+            ],
+            "steps": [
+                "Preheat oven to 350°F. Line a 12-cup muffin tin with liners.",
+                "Whisk flours, baking soda, cinnamon, and salt together.",
+                "Mash bananas well. Mix in honey, egg, Greek yogurt, oil, and vanilla.",
+                "Fold wet into dry until just combined. Fold in walnuts.",
+                "Fill cups ¾ full. Bake 20–24 minutes until a toothpick comes out clean.",
+                "Cool 5 minutes in pan before transferring.",
+            ],
+            "tip": "The riper and blacker the bananas, the sweeter the muffins, don't use fresh bananas here.",
+        },
+        "uses": [
+            {
+                "name": "Banana Nut Muffins",
+                "subtitle": "warm with almond butter for a satisfying breakfast",
+                "extras": ["Almond butter or peanut butter", "Coffee or tea"],
+                "steps": ["Warm muffin 15 seconds. Split and spread with nut butter."],
+                "tip": "These freeze beautifully for up to 3 months, make a double batch.",
+            },
+        ],
+    },
+    {
+        "_id": "raspberry-choc-muffins",
+        "_keywords": ["raspberry", "chocolate", "muffin", "breakfast", "american", "dark chocolate"],
+        "image": "/static/images/raspmuffins.jpg",
+        "intro": "Tender, bakery-style muffins packed with fresh raspberries and dark chocolate chunks, a weekend treat that doubles as a weekday breakfast all week from the freezer.",
+        "base": {
+            "title": "Raspberry Dark Chocolate Chunk Muffins",
+            "ingredients": [
+                "2 cups (250g) all-purpose flour",
+                "¾ cup (150g) sugar",
+                "2 tsp baking powder",
+                "½ tsp baking soda",
+                "½ tsp salt",
+                "2 large eggs",
+                "1 cup (240ml) buttermilk (or milk + 1 tbsp vinegar)",
+                "½ cup (115g) unsalted butter, melted",
+                "1 tsp vanilla extract",
+                "1½ cups fresh or frozen raspberries",
+                "4 oz (115g) dark chocolate, roughly chopped",
+                "2 tbsp turbinado sugar for topping",
+            ],
+            "steps": [
+                "Preheat oven to 400°F. Line a 12-cup muffin tin with liners.",
+                "Whisk flour, sugar, baking powder, baking soda, and salt together.",
+                "Whisk eggs, buttermilk, melted butter, and vanilla in another bowl.",
+                "Fold wet into dry until almost combined; fold in raspberries and chocolate chunks.",
+                "Fill cups to the brim (these muffins have a high crown). Sprinkle turbinado sugar on each.",
+                "Bake 18–22 minutes until tops are domed and a toothpick comes out mostly clean.",
+                "Cool 10 minutes before eating, chocolate chunks stay molten hot.",
+            ],
+            "tip": "Fill the cups all the way, that's what creates the bakery-style domed top.",
+        },
+        "uses": [
+            {
+                "name": "Raspberry Dark Chocolate Muffins",
+                "subtitle": "warm with a cup of coffee, the chocolate chunks are still soft",
+                "extras": ["Coffee or tea"],
+                "steps": ["Best eaten slightly warm (15 seconds in the microwave). The chocolate stays gooey for up to a day."],
+                "tip": "Freeze individually wrapped, microwave 30 seconds from frozen for a fresh-bakery effect.",
+            },
+        ],
+    },
+    {
+        "_id": "fruit-pizza-cookies",
+        "_keywords": ["cookies", "fruit", "cream cheese", "american", "dessert", "healthy", "sugar cookie"],
+        "image": "/static/images/fruit-pizza-cookies.jpg",
+        "intro": "Soft sugar cookie bases topped with a creamy Greek yogurt-cream cheese frosting and a rainbow of fresh fruit, a lighter, wholesome take on the classic fruit pizza in individual cookie form.",
+        "base": {
+            "title": "Healthy Fruit Pizza Cookies",
+            "ingredients": [
+                "[ Sugar Cookie Base ]",
+                "1 cup whole wheat flour",
+                "1/2 tsp baking powder",
+                "1/4 tsp salt",
+                "1/3 cup coconut oil, melted",
+                "1/3 cup maple syrup or honey",
+                "1 egg",
+                "1 tsp vanilla extract",
+                "[ Cream Cheese Frosting ]",
+                "4 oz cream cheese, softened",
+                "1/2 cup Greek yogurt",
+                "2 tbsp honey or maple syrup",
+                "1 tsp vanilla extract",
+                "[ Toppings ]",
+                "Assorted fresh fruit (strawberries, blueberries, kiwi, raspberries, mango)",
+            ],
+            "steps": [
+                "Preheat oven to 350°F. Line a baking sheet with parchment.",
+                "Whisk flour, baking powder, and salt. In a separate bowl, mix coconut oil, maple syrup, egg, and vanilla.",
+                "Stir wet ingredients into dry until a dough forms. Scoop into 12 rounds on the baking sheet. Flatten slightly.",
+                "Bake 10–12 minutes until edges are set but centers are still soft. Cool completely.",
+                "Beat cream cheese, yogurt, honey, and vanilla until smooth. Spread over cooled cookies.",
+                "Top each cookie with sliced fresh fruit. Serve immediately or refrigerate up to 2 days.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Fruit Pizza Cookies",
+                "subtitle": "individual cookie pizzas with cream cheese frosting and rainbow fruit",
+                "extras": ["Extra fresh fruit", "Honey drizzle", "Shredded coconut"],
+                "steps": [
+                    "Top frosted cookies with a colorful arrangement of sliced fruit.",
+                    "Drizzle with honey and scatter coconut if using. Serve chilled.",
+                ],
+                "tip": "Assemble just before serving, the cookies stay crispier if you frost and top them within 30 minutes of eating.",
+            },
+            {
+                "name": "One Big Fruit Pizza",
+                "subtitle": "press the dough into one large round for a shareable dessert",
+                "extras": ["Extra fruit", "Mint leaves for garnish"],
+                "steps": [
+                    "Press dough into a 10-inch round on parchment. Bake 15–18 minutes until golden at the edges.",
+                    "Cool, then spread frosting over the whole surface.",
+                    "Arrange fruit in concentric circles or a fun pattern. Slice into wedges.",
+                ],
+                "tip": "Great for parties, decorate the big pizza before guests arrive and slice at the table.",
+            },
+            {
+                "name": "Cookie Dessert Board",
+                "subtitle": "fruit pizza cookies arranged on a board with extra dips and toppings",
+                "extras": ["Extra cream cheese dip on the side", "Chocolate chips", "Granola", "Berry jam"],
+                "steps": [
+                    "Arrange frosted cookies on a wooden board.",
+                    "Place a small bowl of extra cream cheese dip in the center.",
+                    "Scatter extra fruit, chocolate chips, and granola around the cookies for dipping and topping.",
+                ],
+                "tip": "Set out toothpicks so guests can customize their own cookies with extra toppings.",
+            },
+        ],
+    },
+    {
+        "_id": "oatmeal-choc-chip-cookies",
+        "_keywords": ["oatmeal", "chocolate chip", "cookies", "bars", "american", "dessert", "whole wheat", "healthy"],
+        "image": "/static/images/oatmeal-chocolate-chip-cookies.jpg",
+        "intro": "Chewy whole-wheat oatmeal chocolate chip cookie bars with rolled oats, brown sugar, and melty chocolate chips, baked in one pan and sliced into bars for easy sharing and meal prep.",
+        "base": {
+            "title": "Whole Wheat Oatmeal Chocolate Chip Cookie Bars",
+            "ingredients": [
+                "1 cup whole wheat flour",
+                "1.5 cups rolled oats",
+                "1/2 tsp baking soda",
+                "1/2 tsp cinnamon",
+                "1/4 tsp salt",
+                "1/2 cup coconut oil, melted (or unsalted butter)",
+                "1/2 cup brown sugar, packed",
+                "1/4 cup maple syrup",
+                "2 eggs",
+                "2 tsp vanilla extract",
+                "1 cup chocolate chips",
+            ],
+            "steps": [
+                "Preheat oven to 350°F. Line a 9×13-inch baking pan with parchment.",
+                "Whisk flour, oats, baking soda, cinnamon, and salt in a large bowl.",
+                "In another bowl, whisk melted coconut oil, brown sugar, maple syrup, eggs, and vanilla until smooth.",
+                "Stir wet ingredients into dry until combined. Fold in chocolate chips.",
+                "Press evenly into the prepared pan. Bake 18–22 minutes until golden at the edges and set in the center.",
+                "Cool completely before cutting into bars. Store in an airtight container for up to 5 days.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Cookie Bars",
+                "subtitle": "sliced into squares for a portable, shareable dessert",
+                "extras": ["Flaky sea salt", "Extra chocolate chips on top before baking"],
+                "steps": [
+                    "Let bars cool in the pan 20 minutes before lifting out using the parchment.",
+                    "Slice into squares or rectangles. Sprinkle with flaky sea salt for a sweet-salty finish.",
+                ],
+                "tip": "Chill the pan before slicing for cleaner cuts, the bars hold together better cold.",
+            },
+            {
+                "name": "Warm Cookie Dessert",
+                "subtitle": "served warm from the oven with a scoop of vanilla ice cream",
+                "extras": ["Vanilla ice cream", "Caramel drizzle"],
+                "steps": [
+                    "Serve bars warm, straight from the pan (or reheat a slice 15 seconds in the microwave).",
+                    "Top with a scoop of vanilla ice cream and a drizzle of caramel.",
+                ],
+                "tip": "Don't wait for them to cool all the way if you want that fudgy, gooey center  10 minutes rest is enough.",
+            },
+            {
+                "name": "Crumble Parfait",
+                "subtitle": "crumbled cookie bar layered with yogurt and berries",
+                "extras": ["Greek yogurt", "Fresh berries", "Honey"],
+                "steps": [
+                    "Crumble one or two cookie bars into chunks.",
+                    "Layer in a glass: yogurt, crumbled cookie, berries, repeat.",
+                    "Drizzle honey over the top and serve immediately.",
+                ],
+                "tip": "This works great as a breakfast treat, the oats make it hearty enough for mornings.",
+            },
+        ],
+    },
+    {
+        "_id": "vegan-banana-brownies",
+        "_keywords": ["banana", "brownies", "vegan", "chocolate", "american", "dessert", "fudgy", "healthy"],
+        "image": "/static/images/vegan-banana-brownies.jpg",
+        "intro": "Rich, fudgy chocolate brownies made with ripe banana instead of eggs, deeply chocolatey, naturally sweetened, and completely plant-based. Ready in under 30 minutes.",
+        "base": {
+            "title": "Fudgy Vegan Banana Brownies",
+            "ingredients": [
+                "2 very ripe bananas, mashed",
+                "1/3 cup coconut oil, melted",
+                "1/2 cup maple syrup or agave",
+                "2 tsp vanilla extract",
+                "3/4 cup unsweetened cocoa powder",
+                "1 cup whole wheat flour (or all-purpose)",
+                "1/2 tsp baking soda",
+                "1/4 tsp salt",
+                "3/4 cup dairy-free chocolate chips",
+            ],
+            "steps": [
+                "Preheat oven to 350°F. Line an 8×8-inch pan with parchment.",
+                "Mash bananas in a large bowl until very smooth. Stir in melted coconut oil, maple syrup, and vanilla.",
+                "Sift in cocoa powder, flour, baking soda, and salt. Stir until just combined, don't overmix.",
+                "Fold in chocolate chips. Pour batter into the pan and spread evenly.",
+                "Bake 20–24 minutes until the center is set. Cool completely before cutting.",
+                "Brownies will be fudgier after chilling in the fridge for 30 minutes.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Brownies",
+                "subtitle": "sliced into squares with a dusting of cocoa powder",
+                "extras": ["Flaky sea salt", "Cocoa powder dusting", "Extra chocolate chips on top before baking"],
+                "steps": [
+                    "Scatter extra chocolate chips on top of the batter before baking for a glossy top.",
+                    "Cool completely, then cut into squares. Dust with cocoa powder or sprinkle flaky salt.",
+                ],
+                "tip": "Refrigerate brownies overnight for the fudgiest possible texture, they firm up beautifully cold.",
+            },
+            {
+                "name": "Brownie Sundae",
+                "subtitle": "warm brownie topped with dairy-free ice cream and chocolate sauce",
+                "extras": ["Dairy-free vanilla or chocolate ice cream", "Chocolate or caramel sauce", "Chopped pecans"],
+                "steps": [
+                    "Warm a brownie square 20 seconds in the microwave.",
+                    "Top with a scoop of dairy-free ice cream. Drizzle with chocolate sauce.",
+                    "Scatter chopped pecans for crunch.",
+                ],
+                "tip": "Swap in a scoop of peanut butter for a banana-chocolate-peanut butter trifecta.",
+            },
+            {
+                "name": "Brownie Energy Bites",
+                "subtitle": "leftover brownie crumbles rolled into balls with oats and nut butter",
+                "extras": ["2 tbsp almond butter or peanut butter", "1/4 cup rolled oats", "Extra chocolate chips"],
+                "steps": [
+                    "Crumble leftover brownies into a bowl. Mix in almond butter and oats until it holds together.",
+                    "Roll into 1-inch balls. Press a chocolate chip into each.",
+                    "Refrigerate 20 minutes before serving.",
+                ],
+                "tip": "These keep in the fridge for a week, a great way to repurpose brownies that got a little dry.",
+            },
+        ],
+    },
+    {
+        "_id": "date-peanut-butter-cups",
+        "_keywords": ["date", "peanut butter", "chocolate", "american", "dessert", "healthy", "no-bake", "vegan"],
+        "image": "/static/images/date-peanut-butter-cups.jpg",
+        "intro": "Medjool dates stuffed with creamy peanut butter and dipped in dark chocolate, a three-ingredient no-bake treat that tastes like a better Reese's, ready in 20 minutes.",
+        "base": {
+            "title": "Healthy Chocolate Date Peanut Butter Cups",
+            "ingredients": [
+                "12 large Medjool dates, pitted",
+                "1/3 cup natural peanut butter (or almond butter)",
+                "1.5 cups dark chocolate chips or chopped dark chocolate",
+                "1 tsp coconut oil",
+                "Flaky sea salt for topping",
+            ],
+            "steps": [
+                "Line a baking sheet or plate with parchment.",
+                "Slice each date open lengthwise and remove the pit if present.",
+                "Spoon about 1 tsp peanut butter into each date and press closed.",
+                "Melt chocolate chips with coconut oil in a microwave in 30-second bursts, stirring between each, until smooth.",
+                "Dip each stuffed date in chocolate, letting the excess drip off. Place on parchment.",
+                "Sprinkle immediately with flaky sea salt. Refrigerate 15–20 minutes until chocolate is set.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Date Cups",
+                "subtitle": "stuffed dates dipped in dark chocolate with flaky salt",
+                "extras": ["Extra flaky salt", "Crushed pistachios or almonds for rolling"],
+                "steps": [
+                    "After dipping in chocolate and before setting, roll in crushed nuts or top with extra salt.",
+                    "Refrigerate until firm. Store in an airtight container in the fridge for up to 2 weeks.",
+                ],
+                "tip": "The colder they are, the cleaner the bite, serve straight from the fridge for the best texture.",
+            },
+            {
+                "name": "Dessert Platter",
+                "subtitle": "arranged on a board with nuts, berries, and extra dark chocolate",
+                "extras": ["Mixed nuts", "Fresh raspberries", "Extra dark chocolate squares", "Dried cranberries"],
+                "steps": [
+                    "Arrange date cups on a board alongside clusters of nuts, fresh raspberries, and dark chocolate squares.",
+                    "Scatter dried cranberries for color.",
+                ],
+                "tip": "Great for entertaining, make the date cups a day ahead and they'll be perfectly set by party time.",
+            },
+            {
+                "name": "Almond Butter Variation",
+                "subtitle": "swap peanut butter for almond butter and top with coconut flakes",
+                "extras": ["Almond butter", "Toasted coconut flakes", "White chocolate drizzle"],
+                "steps": [
+                    "Fill dates with almond butter instead of peanut butter.",
+                    "Dip in dark chocolate and top with toasted coconut flakes before the chocolate sets.",
+                    "Drizzle with melted white chocolate for a decorative finish.",
+                ],
+                "tip": "The coconut-almond-dark chocolate combo tastes like an Almond Joy, a crowd-pleaser for nut butter skeptics.",
+            },
+        ],
+    },
+    # ── End dessert/breakfast recipes ─────────────────────────────────────────
+    {
+        "_id": "peanut-chicken-noodle-bowls",
+        "_keywords": ["chicken", "noodle", "sesame", "peanut", "vietnamese", "cabbage", "carrots"],
+        "image": "/static/images/sesame-chicken-noodle-bowls-9.jpg",
+        "intro": "Chicken tossed with noodles, shredded carrots, red cabbage, and a rich sesame peanut sauce. Keep extra sauce on the side so the noodles stay loose all week.",
+        "base": {
+            "title": "Sesame Chicken Noodle Bowls",
             "ingredients": [
                 "1.5 lbs boneless chicken thighs or breasts",
                 "8 oz rice noodles or spaghetti",
@@ -6430,7 +10974,9 @@ RECIPE_DB = [
     {
         "_id": "crispy-pork-banh-mi",
         "_keywords": ["pork", "banh mi", "vietnamese", "sandwich", "pork belly", "baguette"],
-        "image": "/static/images/crispy-pork-banh-mi.jpg",
+        "image": "/static/images/banhi-mi.png",
+        "servings": 4,
+        "calories_per_serving": 500,
         "intro": "Pork belly slow-roasted until the skin blisters into crackling, then piled into a crusty baguette with pickled daikon, carrots, cilantro, cucumber, and sriracha mayo.",
         "base": {
             "title": "Crispy Pork Belly Banh Mi",
@@ -6496,7 +11042,7 @@ RECIPE_DB = [
     {
         "_id": "lemongrass-chicken-rolls",
         "_keywords": ["chicken", "lemongrass", "rice paper", "rolls", "vietnamese", "spring rolls"],
-        "image": "/static/images/lemongrass-chicken-rolls.jpg",
+        "image": "/static/images/chicken-rice-paper-rolls.jpg",
         "intro": "Lemongrass-marinated chicken strips, rice vermicelli, and a bouquet of fresh herbs wrapped in translucent rice paper. One of the freshest lunches you can meal prep.",
         "base": {
             "title": "Lemongrass Chicken Rice Paper Rolls",
@@ -6948,20 +11494,4985 @@ RECIPE_DB = [
             },
         ],
     },
+    # ── Thai ──────────────────────────────────────────────────────────────────
+    {
+        "_id": "thai-chicken-bowls",
+        "_keywords": ["chicken", "thai", "peanut", "bowl", "meal prep", "rice"],
+        "image": "/static/images/thai-chicken-bowls.jpg",
+        "servings": 6,
+        "prep_tasks": ["Rice", "Chicken", "Peanut sauce"],
+        "intro": "Sesame-sriracha marinated chicken over jasmine rice with shredded cabbage, carrots, cilantro, and a creamy peanut sauce. Built for meal prep, holds perfectly in the fridge all week.",
+        "base": {
+            "title": "Thai Chicken Meal Prep Bowls",
+            "ingredients": [
+                "[ Chicken marinade ]",
+                "1½ lbs boneless skinless chicken breasts",
+                "2 tbsp sesame oil",
+                "2 tbsp soy sauce",
+                "1 tbsp Sriracha sauce",
+                "[ Bowls ]",
+                "1½ cups jasmine rice",
+                "6–8 cups shredded cabbage",
+                "2 carrots, shredded or grated",
+                "¼ cup cilantro, chopped",
+                "2 tbsp roasted peanuts, chopped (optional)",
+                "[ Peanut sauce ]",
+                "⅓ cup peanut butter",
+                "2 tbsp honey",
+                "1 tbsp fresh lime juice",
+                "1 tbsp soy sauce",
+                "1 garlic clove, grated",
+                "1 tsp Sriracha sauce",
+                "1–2 tbsp hot water to thin",
+            ],
+            "steps": [
+                "Mix sesame oil, soy sauce, and Sriracha. Add chicken and marinate 30 min (or overnight).",
+                "Preheat oven to 425°F. Bake chicken on a parchment-lined sheet 20 min until 165°F. Cool then slice.",
+                "Cook rice per package directions; cool to room temperature.",
+                "Whisk peanut sauce ingredients, adding hot water until pourable.",
+                "Divide rice, chicken, cabbage, carrots, and cilantro into meal prep containers. Store sauce separately.",
+                "Refrigerate up to 4 days. Microwave 2 minutes then drizzle with peanut sauce.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Thai Chicken Bowl",
+                "subtitle": "the classic, rice base with a generous peanut sauce drizzle",
+                "extras": ["Jasmine rice", "Peanut sauce", "Lime wedge", "Extra cilantro"],
+                "steps": [
+                    "Microwave bowl 2 minutes.",
+                    "Drizzle generously with peanut sauce.",
+                    "Squeeze lime over the top.",
+                ],
+                "tip": "Make double the peanut sauce, it keeps a week in the fridge and is good on everything.",
+            },
+            {
+                "name": "Thai Chicken Lettuce Wraps",
+                "subtitle": "skip the rice, wrap everything in butter lettuce",
+                "extras": ["Butter lettuce leaves", "Peanut sauce", "Shredded carrots", "Mint leaves"],
+                "steps": [
+                    "Fill butter lettuce cups with chicken, cabbage, carrots, and herbs.",
+                    "Drizzle with peanut sauce and serve cold.",
+                ],
+            },
+            {
+                "name": "Cold Thai Chicken Salad",
+                "subtitle": "straight from the fridge, no reheating needed",
+                "extras": ["Extra lime juice", "Peanut sauce", "Crushed peanuts"],
+                "steps": [
+                    "Eat cold straight from the fridge.",
+                    "Toss with extra lime and peanut sauce.",
+                    "Top with crushed peanuts.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "khao-soi",
+        "_keywords": ["thai", "noodle", "soup", "coconut", "curry", "khao soi", "northern thai", "chicken"],
+        "image": "/static/images/khao-soi.jpg",
+        "intro": "A rich Northern Thai coconut curry noodle soup with egg noodles, shredded chicken, and warming spices. Ready in 35 minutes and even better the next day once the broth deepens.",
+        "base": {
+            "title": "Khao Soi (Thai Coconut Noodle Soup)",
+            "ingredients": [
+                "6–8 oz dry egg noodles or rice noodles",
+                "1 tbsp coconut oil",
+                "1 large shallot, finely diced",
+                "4 garlic cloves, roughly chopped",
+                "2 tbsp lemongrass, chopped",
+                "2 tbsp Thai red curry paste",
+                "½ tsp turmeric, ½ tsp yellow curry powder, ½ tsp cardamom",
+                "1 can (14 oz) full-fat coconut milk",
+                "1 cup chicken broth",
+                "2 tbsp fish sauce",
+                "2 tbsp soy sauce",
+                "2 tbsp brown sugar",
+                "1 tbsp chili garlic sauce",
+                "8–12 oz chicken breast",
+                "1 lime",
+                "Garnish: pickled mustard greens, cilantro, Thai basil, crispy noodles, lime wedges",
+            ],
+            "steps": [
+                "Cook noodles per package directions; drain and set aside.",
+                "Heat oil in a large pot over medium. Sauté shallot, garlic, and lemongrass 3–4 min until golden.",
+                "Add curry paste, turmeric, curry powder, and cardamom; stir 1 minute.",
+                "Pour in coconut milk and broth. Bring to a simmer, then add fish sauce, soy sauce, sugar, and chili garlic sauce.",
+                "Add chicken breasts; cover and simmer 10–12 min until cooked through. Shred with forks and return to broth.",
+                "Squeeze in lime juice, taste, and adjust seasoning.",
+                "Divide noodles into bowls and ladle hot broth over. Top with herbs, crispy noodles, and pickled greens.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Khao Soi",
+                "subtitle": "noodles in coconut broth with all the garnishes",
+                "extras": ["Crispy noodles", "Pickled mustard greens", "Lime wedge", "Thai basil", "Cilantro"],
+                "steps": [
+                    "Reheat broth and chicken in a pot over medium heat.",
+                    "Warm noodles briefly in hot water or microwave separately.",
+                    "Ladle broth over noodles and pile on garnishes.",
+                ],
+                "tip": "Store broth and noodles separately so noodles don't absorb all the liquid overnight.",
+            },
+            {
+                "name": "Khao Soi Curry Bowl",
+                "subtitle": "reduce the broth and serve over rice for a thicker curry",
+                "extras": ["Jasmine rice", "Lime wedge", "Cilantro"],
+                "steps": [
+                    "Simmer broth uncovered 5 min to reduce and thicken.",
+                    "Serve over jasmine rice instead of noodles.",
+                    "Finish with lime and fresh herbs.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "pad-thai",
+        "_keywords": ["thai", "noodle", "stir fry", "pad thai", "rice noodle", "peanut", "egg", "bean sprouts"],
+        "image": "/static/images/easy-pad-thai.jpg",
+        "intro": "A fast, balanced Pad Thai with rice noodles, egg, bean sprouts, and your protein of choice in a tangy fish sauce–brown sugar–vinegar sauce. On the table in 30 minutes.",
+        "base": {
+            "title": "Pad Thai",
+            "ingredients": [
+                "4–6 oz dry rice noodles",
+                "3 tbsp peanut oil, divided",
+                "8 oz chicken breast, tofu, or shrimp",
+                "Salt and pepper",
+                "1 large shallot, finely diced",
+                "4 garlic cloves, roughly chopped",
+                "2 eggs, whisked with a pinch of salt",
+                "1½ cups bean sprouts",
+                "1 lime",
+                "Sauce: 3 tbsp fish sauce, 3 tbsp brown sugar, 3 tbsp rice wine vinegar, 2 tsp soy sauce",
+                "Garnish: scallions, roasted peanuts, Thai chili flakes, lime wedges",
+            ],
+            "steps": [
+                "Pour boiling water over rice noodles; soak until al dente. Drain and rinse cold.",
+                "Whisk all sauce ingredients together and set aside.",
+                "Heat 1 tbsp oil in a wok over medium-high. Cook protein until done; set aside.",
+                "Add more oil; stir-fry shallot and garlic 2–3 min. Push to the side.",
+                "Add whisked eggs; scramble into small pieces. Move aside.",
+                "Add remaining oil and noodles; stir-fry 2–3 min until slightly crisp.",
+                "Pour in sauce; stir together and cook 1–2 min until caramelized. Return protein.",
+                "Squeeze lime over, toss, and top with bean sprouts, peanuts, scallions, and chili flakes.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Pad Thai",
+                "subtitle": "warm with bean sprouts, peanuts, and lime",
+                "extras": ["Bean sprouts", "Roasted peanuts", "Scallions", "Lime wedge", "Chili flakes"],
+                "steps": [
+                    "Reheat in a hot wok with a splash of water to loosen.",
+                    "Top with fresh bean sprouts and crushed peanuts.",
+                    "Serve with lime wedge.",
+                ],
+                "tip": "Pad Thai reheats best in a hot pan, the microwave makes the noodles soggy.",
+            },
+            {
+                "name": "Cold Pad Thai Noodle Salad",
+                "subtitle": "eat straight from the fridge, the flavors deepen overnight",
+                "extras": ["Extra lime juice", "Crushed peanuts", "Fresh cilantro"],
+                "steps": [
+                    "Pull straight from the fridge.",
+                    "Toss with a squeeze of lime and extra peanuts.",
+                    "Add cilantro or mint if you have it.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "drunken-noodles",
+        "_keywords": ["thai", "noodle", "stir fry", "pad kee mao", "drunken noodles", "basil", "wide rice noodle", "chicken"],
+        "image": "/static/images/drunken-noodles.jpg",
+        "intro": "Wide rice noodles stir-fried with chicken, Thai chilies, and a heap of fresh basil in a savory oyster sauce. A classic Bangkok street dish that's done in 30 minutes.",
+        "base": {
+            "title": "Thai Drunken Noodles (Pad Kee Mao)",
+            "ingredients": [
+                "8 oz dried wide rice noodles",
+                "8 oz chicken breast, thinly sliced (or shrimp or tofu)",
+                "2 tbsp peanut or coconut oil",
+                "4–6 garlic cloves, chopped",
+                "1–2 Thai chilies, minced (or ½ tsp red pepper flakes)",
+                "1 large shallot, thinly sliced",
+                "1 red bell pepper, thinly sliced",
+                "1 cup Chinese broccoli or broccolini",
+                "½–1 cup fresh Thai basil",
+                "Salt and pepper",
+                "Sauce: 2½ tbsp oyster sauce, 2 tbsp soy sauce, 2 tbsp dark soy sauce, 1 tbsp fish sauce, 2 tbsp brown sugar, 1½ tsp rice vinegar, ½ tsp white pepper",
+                "Lime wedges to serve",
+            ],
+            "steps": [
+                "Soak wide rice noodles in boiling water 15–20 min until just softened. Drain; toss lightly with oil.",
+                "Mix all sauce ingredients in a bowl and set aside.",
+                "Heat wok over medium-high. Add oil, garlic, and chilies; cook 20–30 sec until fragrant.",
+                "Add chicken with salt and pepper; cook 3–4 min until golden. Add shallot; cook 2 min.",
+                "Add vegetables and stir-fry 2 min until tender-crisp.",
+                "Add noodles and stir-fry 1–2 min. Pour in sauce; toss over high heat 1 min to caramelize.",
+                "Turn off heat, add Thai basil, and stir through. Serve with lime wedges.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Drunken Noodles",
+                "subtitle": "hot from the wok with extra chili and lime",
+                "extras": ["Thai chili paste", "Lime wedge", "Extra Thai basil"],
+                "steps": [
+                    "Reheat in a hot wok or pan with a splash of water to loosen.",
+                    "Serve with chili paste and lime wedge.",
+                ],
+                "tip": "Add a fried egg on top for a restaurant-style finish.",
+            },
+            {
+                "name": "Drunken Noodles with Fried Egg",
+                "subtitle": "top with a runny egg for extra richness",
+                "extras": ["2 eggs", "Splash of oil", "Chili flakes"],
+                "steps": [
+                    "Reheat noodles in a hot pan.",
+                    "Fry 1–2 eggs until edges are crispy but yolk is still runny.",
+                    "Slide eggs on top, break the yolk, and serve.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "pad-see-ew",
+        "_keywords": ["thai", "noodle", "stir fry", "pad see ew", "chinese broccoli", "wide rice noodle", "dark soy", "egg"],
+        "image": "/static/images/pad-see-ew.jpg",
+        "intro": "Smoky, caramelized wide rice noodles with Chinese broccoli, egg, and chicken in a rich dark soy sauce. Simpler and deeper than Pad Thai, and just as fast.",
+        "base": {
+            "title": "Pad See Ew",
+            "ingredients": [
+                "8 oz dried wide rice noodles (or 16 oz fresh)",
+                "8 oz chicken breast, shrimp, or tofu",
+                "12 oz Chinese broccoli or broccolini",
+                "2 eggs, whisked",
+                "2 tbsp peanut or coconut oil",
+                "4–6 garlic cloves, chopped",
+                "½ cup green onions, chopped",
+                "Salt to taste",
+                "Sauce: 2 tbsp soy sauce, 2 tbsp oyster sauce, 2 tbsp dark sweet soy sauce, 1 tbsp fish sauce, 1 tsp rice wine vinegar, ½ tsp white pepper, 1 tbsp sugar",
+                "Lime wedges and chili flakes to serve",
+            ],
+            "steps": [
+                "Soak dried noodles in boiling water 15–20 min until softened. Drain; toss with a little oil.",
+                "Whisk sauce ingredients together; set aside. Whisk eggs separately.",
+                "Heat oil in a wok over high heat. Season protein with salt and pepper; sear until cooked. Add garlic and broccoli stems; stir-fry until tender-crisp. Add broccoli leaves and wilt briefly. Transfer to a plate.",
+                "Push to the side; add eggs and scramble lightly 1–2 min. Combine with vegetables.",
+                "Add fresh oil and noodles; let edges caramelize, then stir throughout the pan.",
+                "Return protein. Pour in sauce; gently toss and cook 1–2 min. Stir in half the green onions.",
+                "Taste and adjust. Serve with remaining green onions, chili flakes, and lime.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Pad See Ew",
+                "subtitle": "smoky and slightly sweet, hot from the wok",
+                "extras": ["Lime wedge", "Thai chili flakes", "Extra green onions"],
+                "steps": [
+                    "Reheat in a hot wok with a tiny splash of water.",
+                    "Caramelize briefly over high heat.",
+                    "Top with remaining green onions and lime.",
+                ],
+                "tip": "Dark soy sauce is key for the color and depth, don't skip it.",
+            },
+            {
+                "name": "Cold Noodle Lunch Box",
+                "subtitle": "eat cold with chili oil, no reheating needed",
+                "extras": ["Chili oil", "Rice vinegar", "Sesame seeds"],
+                "steps": [
+                    "Pull cold from the fridge.",
+                    "Drizzle with chili oil and a splash of rice vinegar.",
+                    "Toss and eat.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "thai-noodle-salad",
+        "_keywords": ["thai", "noodle", "salad", "peanut sauce", "vegan", "cold", "meal prep", "rice noodle", "cabbage"],
+        "image": "/static/images/thai-noodle-salad.jpg",
+        "intro": "Cold rice noodles tossed with shredded cabbage, carrots, bell pepper, and a bright citrus peanut dressing. A no-cook meal prep lunch that keeps beautifully for 4 days.",
+        "base": {
+            "title": "Thai Noodle Salad with Peanut Sauce",
+            "ingredients": [
+                "6 oz dry rice noodles or soba noodles",
+                "4 cups shredded red cabbage and carrots",
+                "1 red bell pepper, thinly sliced",
+                "3 scallions, sliced",
+                "½ bunch cilantro, chopped",
+                "1 jalapeño, finely chopped",
+                "¼ cup roasted peanuts, crushed",
+                "Peanut sauce: ½ cup peanut butter, ½ cup fresh orange juice, ⅓ cup lime juice, ¼ cup soy sauce, ⅓ cup honey, ¼ cup sesame oil, 1 tsp cayenne, 2 garlic cloves, 5 slices fresh ginger, 1 tsp salt",
+            ],
+            "steps": [
+                "Pour boiling water over noodles; soak per package directions. Drain and rinse cold.",
+                "Blend all peanut sauce ingredients until smooth. Taste and adjust.",
+                "Shred and slice all vegetables.",
+                "Combine vegetables, noodles, cilantro, scallions, and jalapeño in a large bowl.",
+                "Pour enough sauce to coat generously; toss well.",
+                "Divide into meal prep containers. Store extra sauce separately.",
+                "Top with crushed peanuts just before eating.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Thai Noodle Salad",
+                "subtitle": "cold, straight from the fridge, no reheating",
+                "extras": ["Extra peanut sauce", "Crushed peanuts", "Lime wedge"],
+                "steps": [
+                    "Pull straight from the fridge.",
+                    "Toss with extra peanut sauce if it's absorbed overnight.",
+                    "Top with peanuts and a squeeze of lime.",
+                ],
+                "tip": "The peanut sauce thickens in the fridge, thin it with a splash of warm water before tossing.",
+            },
+            {
+                "name": "Noodle Salad with Added Protein",
+                "subtitle": "add grilled chicken, shrimp, or tofu to make it a full meal",
+                "extras": ["Grilled chicken or shrimp", "Extra peanut sauce"],
+                "steps": [
+                    "Grill or pan-sear protein of choice.",
+                    "Slice and lay over the noodle salad.",
+                    "Drizzle with extra peanut sauce.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "massaman-curry",
+        "_keywords": ["thai", "curry", "massaman", "coconut", "chicken", "potato", "warm spice", "tamarind"],
+        "image": "/static/images/massaman-curry.jpg",
+        "intro": "A mellow, warmly spiced Thai curry with chicken and potatoes in a rich coconut milk sauce with tamarind and peanut butter. Fragrant with cumin, cardamom, and cinnamon.",
+        "base": {
+            "title": "Thai Massaman Curry",
+            "ingredients": [
+                "1½ lbs Yukon gold or red potatoes, cut into 1½-inch chunks",
+                "1½ lbs chicken breast, thinly sliced",
+                "1–2 tsp coconut oil",
+                "1 shallot, thinly sliced",
+                "2 tsp fresh ginger, grated",
+                "1 tsp coriander seeds, 1 tsp cumin seeds",
+                "½ tsp cinnamon, ½ tsp cardamom, ⅛ tsp cloves, ⅛ tsp nutmeg",
+                "4 tbsp red curry paste",
+                "2 cans (27 oz total) full-fat coconut milk",
+                "2 tbsp fish sauce",
+                "1–2 tbsp brown sugar",
+                "1–2 tbsp tamarind paste",
+                "2 tbsp peanut butter",
+                "Garnish: roasted peanuts, cilantro, baby spinach, chili flakes",
+            ],
+            "steps": [
+                "Parboil potatoes in boiling water 5–7 min until just al dente. Drain and set aside.",
+                "Heat coconut oil in a large pot over medium. Toast coriander and cumin seeds 2 min.",
+                "Add shallot and ginger; stir 1–2 min. Add ground spices and curry paste; stir 1 minute.",
+                "Add coconut milk and potatoes; simmer 10 min until potatoes are fork-tender.",
+                "Stir in fish sauce, sugar, tamarind, and peanut butter.",
+                "Add sliced chicken; simmer 5 min until cooked through.",
+                "Balance flavors: more tamarind for acidity, sugar for sweetness, fish sauce for salt.",
+                "Serve over jasmine rice with peanuts, cilantro, and spinach.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Massaman Curry Bowl",
+                "subtitle": "over jasmine rice with peanuts and cilantro",
+                "extras": ["Jasmine rice", "Roasted peanuts", "Cilantro", "Baby spinach"],
+                "steps": [
+                    "Reheat curry in a pot over medium heat until hot.",
+                    "Serve over freshly cooked jasmine rice.",
+                    "Garnish with peanuts, spinach, and cilantro.",
+                ],
+                "tip": "Massaman gets better overnight, the potato soaks up the spices beautifully.",
+            },
+            {
+                "name": "Massaman Curry with Naan",
+                "subtitle": "skip the rice and scoop with warm naan",
+                "extras": ["Naan or roti", "Plain yogurt"],
+                "steps": [
+                    "Warm naan in a dry skillet or oven.",
+                    "Serve the curry in a bowl alongside naan for scooping.",
+                    "A dollop of yogurt cuts through the richness.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "panang-curry",
+        "_keywords": ["thai", "curry", "panang", "coconut", "chicken", "kaffir lime", "peanut", "bell pepper"],
+        "image": "/static/images/penang-curry.jpg",
+        "intro": "A creamy, nutty Panang curry with tender chicken and sweet bell peppers in a thick coconut sauce. Richer than red curry, fragrant with kaffir lime and fresh Thai basil.",
+        "base": {
+            "title": "Panang Curry",
+            "ingredients": [
+                "1 lb chicken breast or thighs, cubed",
+                "½ tsp salt",
+                "1 tbsp oil (avocado, coconut, or peanut)",
+                "1 large shallot, diced",
+                "2 tsp fresh ginger, minced",
+                "2 tbsp lemongrass, minced",
+                "2 garlic cloves, minced",
+                "2 tbsp panang curry paste",
+                "1 tbsp peanut butter",
+                "1 can (14 oz) coconut milk",
+                "½ cup chicken broth",
+                "1–2 tbsp fish sauce",
+                "10 kaffir lime leaves",
+                "2 tsp coconut sugar or brown sugar",
+                "2 bell peppers (red, orange, or yellow), sliced",
+                "Handful of Thai basil, torn",
+                "Lime juice to finish",
+            ],
+            "steps": [
+                "Season chicken with salt.",
+                "Heat oil in a large pot over medium. Sauté shallot, ginger, lemongrass, and garlic 2–3 min until fragrant.",
+                "Add panang curry paste; fry 1 minute.",
+                "Stir in peanut butter, coconut milk, broth, fish sauce, sugar, and kaffir lime leaves. Simmer 5 min.",
+                "Add chicken; simmer 3 min. Add bell peppers; simmer 2 more min until chicken is cooked through.",
+                "Remove from heat; stir in Thai basil.",
+                "Serve over jasmine rice with lime juice, crushed peanuts, and fresh basil.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Panang Curry Bowl",
+                "subtitle": "over jasmine rice with fresh basil and lime",
+                "extras": ["Jasmine rice", "Thai basil", "Lime wedge", "Crushed peanuts"],
+                "steps": [
+                    "Reheat curry gently over low heat until hot.",
+                    "Serve over jasmine rice.",
+                    "Finish with fresh basil, crushed peanuts, and lime.",
+                ],
+                "tip": "Kaffir lime leaves are there for aroma, remove before eating or just eat around them.",
+            },
+            {
+                "name": "Panang Curry Lettuce Cups",
+                "subtitle": "spoon the thick curry into butter lettuce for a lighter version",
+                "extras": ["Butter lettuce leaves", "Sliced scallions", "Lime wedge"],
+                "steps": [
+                    "Warm curry until hot.",
+                    "Spoon into chilled butter lettuce cups.",
+                    "Top with scallions and lime.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "green-curry",
+        "_keywords": ["thai", "curry", "green curry", "coconut", "eggplant", "tofu", "chicken", "kaffir lime", "basil"],
+        "image": "/static/images/green-curry.jpg",
+        "intro": "A vibrant Thai green curry with eggplant, bell pepper, and your choice of tofu or chicken in a fragrant coconut broth. Bright, herbal, and ready in 30 minutes.",
+        "base": {
+            "title": "Thai Green Curry",
+            "ingredients": [
+                "1 shallot, finely diced",
+                "2 tbsp olive or peanut oil",
+                "2–4 tbsp green curry paste",
+                "1 cup vegetable or chicken broth",
+                "1 can (14 oz) full-fat coconut milk",
+                "8 oz tofu (cubed), chicken breast (sliced), or shrimp",
+                "½ tsp salt, 1 tsp sugar",
+                "2 tsp fish sauce",
+                "1 Japanese eggplant, sliced into half-moons",
+                "1 red bell pepper, sliced",
+                "6–8 kaffir lime leaves",
+                "1 lime",
+                "¼ cup fresh Thai basil leaves, torn",
+            ],
+            "steps": [
+                "Heat oil in a pot over medium. Sauté shallot, then add curry paste and stir-fry 2–3 min to release flavor.",
+                "Add broth, scraping up any browned paste. Add kaffir lime leaves and vegetables.",
+                "Bring to a simmer, cover, and cook 3–5 min until vegetables are just tender. Add chicken if using.",
+                "Stir in coconut milk, salt, sugar, and fish sauce.",
+                "Add tofu or shrimp; simmer gently until warmed through or cooked. Do not boil.",
+                "Squeeze lime into the curry; stir in Thai basil.",
+                "Serve over jasmine rice with extra lime wedges.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Green Curry Rice Bowl",
+                "subtitle": "over jasmine rice with fresh basil and lime",
+                "extras": ["Jasmine rice", "Thai basil", "Lime wedge", "Chili flakes"],
+                "steps": [
+                    "Reheat curry gently over low-medium heat.",
+                    "Serve over jasmine rice with fresh basil and lime.",
+                    "A pinch of chili flakes takes it up a notch.",
+                ],
+                "tip": "Don't boil the coconut milk, keep it at a gentle simmer to preserve its sweetness.",
+            },
+            {
+                "name": "Green Curry Noodle Soup",
+                "subtitle": "ladle over rice noodles for a brothier variation",
+                "extras": ["4 oz rice noodles", "Lime wedge", "Bean sprouts"],
+                "steps": [
+                    "Cook rice noodles per package; drain.",
+                    "Ladle hot curry over noodles in a bowl.",
+                    "Top with bean sprouts and lime.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "thai-red-curry",
+        "_keywords": ["thai", "curry", "red curry", "coconut", "chicken", "lemongrass", "kaffir lime", "vegetables"],
+        "image": "/static/images/thai-red-curry.jpg",
+        "intro": "A bold Thai red curry with lemongrass, chicken, and vegetables in a creamy coconut broth. Fast enough for a weeknight and flavorful enough to eat three days running.",
+        "base": {
+            "title": "Thai Red Curry Chicken",
+            "ingredients": [
+                "1 tbsp coconut or olive oil",
+                "1 shallot, finely diced",
+                "4 garlic cloves, roughly chopped",
+                "3 tbsp lemongrass, finely chopped",
+                "2–4 tbsp red curry paste",
+                "1 lb chicken breast or thighs, sliced",
+                "2 cups vegetables (bell pepper, zucchini, snow peas, or green beans)",
+                "1 can (14 oz) full-fat coconut milk",
+                "1 bouillon cube (chicken or vegetable)",
+                "1–2 tbsp fish sauce",
+                "1 tbsp brown sugar",
+                "6–8 kaffir lime leaves",
+                "1–2 tbsp lime juice",
+                "Garnish: bean sprouts, Thai basil, chili flakes, lime wedge",
+            ],
+            "steps": [
+                "Heat oil in a Dutch oven over medium. Sauté shallot, garlic, and lemongrass 2–3 min until fragrant.",
+                "Add red curry paste; cook 1 minute to bloom flavors.",
+                "Pour in coconut milk, bouillon, fish sauce, sugar, and lime leaves. Bring to a gentle simmer.",
+                "Add sliced chicken and vegetables. Simmer on low 5 min until chicken is cooked through.",
+                "Season with lime juice and salt. Add more curry paste for extra heat.",
+                "Serve over jasmine rice with bean sprouts, Thai basil, and lime.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Red Curry Bowl",
+                "subtitle": "over jasmine rice with fresh toppings",
+                "extras": ["Jasmine rice", "Bean sprouts", "Thai basil", "Lime wedge"],
+                "steps": [
+                    "Reheat curry over medium heat until hot.",
+                    "Serve over jasmine rice.",
+                    "Top with bean sprouts, basil, and chili flakes.",
+                ],
+                "tip": "Start with 2 tbsp curry paste and taste, you can always add more heat.",
+            },
+            {
+                "name": "Red Curry Noodle Soup",
+                "subtitle": "thin the curry with extra broth and ladle over rice noodles",
+                "extras": ["6 oz rice noodles", "½ cup extra broth", "Lime wedge", "Cilantro"],
+                "steps": [
+                    "Add ½ cup extra broth to leftover curry to thin into a soup.",
+                    "Cook rice noodles and divide into bowls.",
+                    "Ladle hot curry broth over noodles; garnish with cilantro and lime.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "thai-fish-curry",
+        "_keywords": ["thai", "fish", "curry", "coconut", "lemongrass", "halibut", "cod", "sea bass"],
+        "image": "/static/images/thai-fish-curry.jpg",
+        "intro": "Tender white fish poached in a fragrant coconut curry broth with lemongrass, kaffir lime, and fresh vegetables. An elegant weeknight dinner that comes together in 30 minutes.",
+        "base": {
+            "title": "Thai Fish Curry",
+            "ingredients": [
+                "1–1½ lbs firm white fish (halibut, cod, or sea bass), cut into 2-inch chunks",
+                "½ tsp salt, zest and juice of 1 lime",
+                "2–3 tbsp coconut or olive oil",
+                "2 large shallots, finely diced",
+                "4–6 garlic cloves, chopped",
+                "1–2 fresh chilies, diced",
+                "3 tbsp lemongrass, finely chopped",
+                "2 tsp grated turmeric (or 1 tsp ground)",
+                "1 tsp fresh ginger, grated",
+                "1–3 tbsp Thai curry paste (red, green, or yellow)",
+                "2 cups chicken or fish stock",
+                "8 kaffir lime leaves",
+                "2 cups diced carrots",
+                "1 red bell pepper, diced",
+                "1 can (14 oz) coconut milk",
+                "1 tbsp fish sauce",
+                "2 cups green beans, snap peas, or asparagus",
+                "Fresh basil, cilantro, or scallions to garnish",
+            ],
+            "steps": [
+                "Pat fish dry; season with salt, lime zest, and lime juice.",
+                "Heat oil in a large sauté pan over medium. Cook shallots until golden, 4 min.",
+                "Add garlic, lemongrass, and chilies; cook 3–4 min. Add ginger, turmeric, and curry paste; stir 1 min.",
+                "Add stock, kaffir lime leaves, carrots, and bell pepper. Cover and simmer 5 min.",
+                "Stir in coconut milk, fish sauce, and lime juice. Taste and adjust seasoning.",
+                "Nestle fish and quick-cooking vegetables into the curry. Simmer gently 3–4 min until fish is opaque.",
+                "Garnish with fresh basil or cilantro. Serve over jasmine rice with lime wedges.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Thai Fish Curry Bowl",
+                "subtitle": "over jasmine rice with herbs and lime",
+                "extras": ["Jasmine rice", "Fresh cilantro", "Lime wedge"],
+                "steps": [
+                    "Reheat curry very gently over low heat, fish breaks apart if boiled.",
+                    "Serve over jasmine rice with fresh herbs and lime.",
+                ],
+                "tip": "For meal prep, keep the fish separate from the broth and combine just before eating.",
+            },
+            {
+                "name": "Fish Curry with Coconut Rice",
+                "subtitle": "simmer the rice in coconut milk for extra richness",
+                "extras": ["1 cup jasmine rice", "½ cup coconut milk + ¾ cup water"],
+                "steps": [
+                    "Cook jasmine rice with ½ cup coconut milk and ¾ cup water instead of plain water.",
+                    "Serve curry over the fragrant coconut rice.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "thai-pumpkin-curry",
+        "_keywords": ["thai", "curry", "pumpkin", "coconut", "red curry", "autumn", "fall", "squash"],
+        "image": "/static/images/thai-pumpkin-curry.jpg",
+        "intro": "Fresh pumpkin simmered in a fragrant red curry coconut sauce with lemongrass and Thai basil. Warmly spiced and deeply comforting, perfect for fall meal prep.",
+        "base": {
+            "title": "Thai Pumpkin Curry",
+            "ingredients": [
+                "1 lb protein (tofu, chicken breast, or shrimp)",
+                "1 tbsp coconut oil",
+                "1 shallot, finely diced",
+                "1 tbsp fresh ginger, minced",
+                "2 tbsp lemongrass, finely chopped",
+                "3–4 tbsp red curry paste",
+                "½ cup vegetable or chicken broth",
+                "1–2 tbsp fish sauce",
+                "1 tbsp coconut sugar or brown sugar",
+                "2 cups pumpkin, peeled and cubed (1-inch pieces)",
+                "8 kaffir lime leaves",
+                "1 can (14 oz) full-fat coconut milk",
+                "1 cup bell peppers, diced",
+                "1–2 tbsp fresh lime juice",
+                "1 cup Thai basil, chopped",
+            ],
+            "steps": [
+                "Prepare protein: crispy tofu, thinly sliced chicken, or raw shrimp.",
+                "Heat coconut oil over medium-high. Sauté shallot, ginger, and lemongrass 2 min; add curry paste 1 min more.",
+                "Reduce to medium. Add broth, fish sauce, sugar, pumpkin, and lime leaves. Simmer vented 5–8 min until pumpkin is fork-tender.",
+                "Stir in coconut milk, bell peppers, and protein. Simmer until heated through.",
+                "Add lime juice and basil. Taste and adjust.",
+                "Serve over jasmine rice with lime wedges.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Pumpkin Curry Bowl",
+                "subtitle": "over jasmine rice with fresh basil",
+                "extras": ["Jasmine rice", "Thai basil", "Lime wedge"],
+                "steps": [
+                    "Reheat curry gently over medium-low heat.",
+                    "Serve over jasmine rice with fresh basil and lime.",
+                ],
+                "tip": "Pumpkin gets even creamier the next day as it absorbs the curry sauce.",
+            },
+            {
+                "name": "Pumpkin Curry over Rice Noodles",
+                "subtitle": "swap rice for noodles for a different texture",
+                "extras": ["6 oz rice noodles", "Bean sprouts", "Cilantro"],
+                "steps": [
+                    "Cook rice noodles and divide into bowls.",
+                    "Ladle curry over and top with bean sprouts and cilantro.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "green-curry-noodle-soup",
+        "_keywords": ["thai", "green curry", "noodle", "soup", "coconut", "broccolini", "chicken", "quick"],
+        "image": "/static/images/green-curry-noodles.jpg",
+        "servings": 4,
+        "calories_per_serving": 490,
+        "intro": "A fast, vibrant green curry noodle soup with broccolini and your choice of protein in a fragrant coconut broth. Full of Thai flavor and ready in 25 minutes.",
+        "base": {
+            "title": "Thai Green Curry Noodle Soup",
+            "ingredients": [
+                "1 tbsp olive oil",
+                "1–2 shallots, finely diced",
+                "¼–½ cup green curry paste",
+                "4 cups chicken or vegetable broth",
+                "1 can (13.5 oz) coconut milk",
+                "8 oz chicken breast, shrimp, or crispy tofu",
+                "8 oz broccolini, halved lengthwise",
+                "2–4 tsp fish sauce",
+                "Juice of ½ lime",
+                "1 tsp brown sugar (optional)",
+                "¼–½ cup fresh basil leaves",
+                "6–8 oz cooked rice noodles",
+                "Garnish: bean sprouts, lime wedges, scallions, fresh basil",
+            ],
+            "steps": [
+                "Heat oil in a pot over medium; sauté shallots until golden.",
+                "Add curry paste; cook 1–2 min. Add broth and bring to a simmer.",
+                "Add broccolini and protein; simmer until vegetables are tender and protein cooks through.",
+                "Stir in coconut milk, fish sauce, and lime juice.",
+                "Optional: blend 1 cup broth with fresh basil until bright green; stir in just before serving.",
+                "Taste and adjust seasoning.",
+                "Divide noodles into bowls and ladle broth over; garnish generously.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Green Curry Noodle Soup",
+                "subtitle": "noodles in a fragrant green coconut broth",
+                "extras": ["Bean sprouts", "Lime wedge", "Scallions", "Fresh basil"],
+                "steps": [
+                    "Reheat broth separately; warm noodles briefly.",
+                    "Ladle hot broth over noodles and pile on garnishes.",
+                ],
+                "tip": "Store broth and noodles separately, noodles absorb the liquid overnight.",
+            },
+            {
+                "name": "Soft-Boiled Egg & Greens in Green Curry Broth",
+                "subtitle": "wilt greens in the broth and top with a jammy egg",
+                "extras": ["2 eggs", "2 cups baby bok choy or spinach", "Chili oil", "Lime wedge"],
+                "steps": [
+                    "Soft-boil eggs 6–7 min; peel and halve.",
+                    "Bring curry broth to a gentle simmer and drop in the greens until just wilted.",
+                    "Ladle into bowls, lay egg halves on top, finish with chili oil and lime.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "thai-pineapple-curry",
+        "_keywords": ["thai", "curry", "pineapple", "coconut", "red curry", "chicken", "sweet", "fruit"],
+        "image": "/static/images/pineapple-curry.jpg",
+        "servings": 4,
+        "calories_per_serving": 430,
+        "intro": "Fresh pineapple and cherry tomatoes in a fragrant red curry coconut sauce with chicken or tofu. Sweet, spicy, and creamy, done in 20 minutes.",
+        "base": {
+            "title": "Thai Pineapple Curry",
+            "ingredients": [
+                "¼ cup red curry paste",
+                "1 can (13.5 oz) full-fat coconut milk",
+                "1–2 tbsp brown sugar",
+                "1–2 tbsp fish sauce",
+                "1 lb chicken, thinly sliced (or crispy tofu or shrimp)",
+                "¼ cup water or broth",
+                "1 cup fresh pineapple, bite-sized pieces",
+                "1 cup tomatoes, bite-sized pieces",
+                "½ cup zucchini, bite-sized pieces",
+                "½ cup red bell peppers, diced",
+                "5–6 kaffir lime leaves (optional)",
+                "½ cup Thai basil",
+                "Lime juice to taste",
+            ],
+            "steps": [
+                "Combine curry paste and ¾ can coconut milk in a pot over high heat; stir until creamy, 1–2 min.",
+                "Add sugar and fish sauce; simmer 1 min.",
+                "Add chicken and water; simmer 4–5 min until cooked through.",
+                "Add pineapple, tomatoes, and remaining vegetables; cook 2–3 min until slightly softened.",
+                "Stir in remaining coconut milk. Adjust with fish sauce, sugar, or curry paste.",
+                "Remove from heat, add Thai basil, and serve over jasmine rice.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Pineapple Curry Bowl",
+                "subtitle": "over jasmine rice with fresh basil",
+                "extras": ["Jasmine rice", "Thai basil", "Lime wedge"],
+                "steps": [
+                    "Reheat curry gently over medium heat.",
+                    "Serve over jasmine rice with fresh basil and lime.",
+                ],
+                "tip": "Fresh pineapple is significantly better than canned here, the natural sweetness and texture hold up in the curry.",
+            },
+            {
+                "name": "Pineapple Curry Fried Rice",
+                "subtitle": "toss leftover curry with day-old rice for a quick fried rice",
+                "extras": ["1 cup day-old jasmine rice", "2 eggs", "Scallions"],
+                "steps": [
+                    "In a hot wok, scramble 2 eggs and add day-old rice.",
+                    "Add a spoonful of leftover curry and toss everything together.",
+                    "Top with scallions and serve.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "tom-kha-gai",
+        "_keywords": ["thai", "soup", "coconut", "chicken", "lemongrass", "galangal", "mushroom", "tom kha"],
+        "image": "/static/images/tom-kha-gai.jpg",
+        "intro": "The classic Thai coconut chicken soup, rich and creamy, tangy from lime, with lemongrass, galangal, kaffir lime leaves, and tender mushrooms. Pure comfort in a bowl.",
+        "base": {
+            "title": "Tom Kha Gai (Thai Coconut Chicken Soup)",
+            "ingredients": [
+                "1 lb boneless, skinless chicken, thinly sliced",
+                "1–2 shallots, diced",
+                "¼ cup ginger, sliced into ⅛-inch disks",
+                "¼ cup galangal root, sliced into ⅛-inch disks",
+                "3 tbsp lemongrass, chopped",
+                "8 kaffir lime leaves",
+                "2 cups chicken or vegetable broth",
+                "8 oz mushrooms (oyster, shiitake, or cremini)",
+                "2–4 fresh Thai chilies",
+                "3 tbsp fish sauce",
+                "1½ tsp salt",
+                "2 cans (28 oz total) full-fat coconut milk",
+                "3 tbsp lime juice",
+                "2 tsp palm, coconut, or brown sugar",
+            ],
+            "steps": [
+                "Slice chicken thinly across the grain; season with salt and pepper.",
+                "Sauté shallots in oil over medium. Add ginger, lemongrass, lime leaves, galangal, and broth; simmer 5 min to infuse.",
+                "Add chicken and mushrooms; poach gently 3–4 min until chicken cooks through.",
+                "Stir in coconut milk, fish sauce, chilies, and salt; bring to a gentle simmer. Turn off heat.",
+                "Add lime juice and sugar. Taste and adjust, it should be creamy, tangy, and mildly spicy.",
+                "Serve with lime wedges and fresh cilantro.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Tom Kha Gai",
+                "subtitle": "the soup as-is with lime and cilantro",
+                "extras": ["Lime wedge", "Fresh cilantro", "Thai chili flakes"],
+                "steps": [
+                    "Reheat gently over low heat, don't boil.",
+                    "Ladle into bowls with lime wedge and cilantro.",
+                ],
+                "tip": "Store broth and chicken together but don't reheat past a simmer or the coconut milk can break.",
+            },
+            {
+                "name": "Tom Kha Braised Greens & Mushrooms",
+                "subtitle": "turn the broth into a chunky veggie stew",
+                "extras": ["2 cups baby bok choy", "1 cup shiitake or oyster mushrooms", "1 block silken tofu", "Lime wedge"],
+                "steps": [
+                    "Bring Tom Kha broth to a gentle simmer.",
+                    "Add mushrooms and bok choy; cook 3–4 min until just tender.",
+                    "Add cubed silken tofu and warm through. Finish with lime.",
+                ],
+                "tip": "This works great with leftover chicken torn in, just add it at the end with the tofu.",
+            },
+        ],
+    },
+    {
+        "_id": "thai-sweet-potato-soup",
+        "_keywords": ["thai", "soup", "sweet potato", "coconut", "lemongrass", "blended", "vegan", "ginger"],
+        "image": "/static/images/thai-sweet-potato-soup.jpg",
+        "intro": "Silky blended sweet potato soup with lemongrass, ginger, and coconut milk. Warm, vibrant, and deeply soothing, naturally vegan and ready in 40 minutes.",
+        "base": {
+            "title": "Thai Sweet Potato Soup",
+            "ingredients": [
+                "2 large shallots, diced",
+                "2 tbsp coconut or olive oil",
+                "6 garlic cloves, chopped",
+                "¼ cup lemongrass, finely chopped",
+                "1 tbsp fresh ginger, chopped",
+                "1 small serrano chili, halved",
+                "1 tsp yellow curry powder",
+                "½ tsp turmeric",
+                "4 cups vegetable stock + 1 cup water",
+                "1 tsp salt",
+                "2 lbs sweet potatoes, peeled and cubed",
+                "½–1 cup coconut milk",
+                "2 tsp brown sugar",
+                "2 tsp soy sauce",
+                "1–2 tbsp lime juice",
+                "Garnish: cilantro, coconut milk swirl, scallions, sriracha, lime",
+            ],
+            "steps": [
+                "Heat oil in a large pot over medium. Sauté shallots 2 min; add garlic, ginger, lemongrass, and chili 3–5 min until fragrant.",
+                "Add curry powder and turmeric; stir 1–2 min.",
+                "Add stock, salt, and sweet potatoes. Bring to a simmer, cover, and cook 15–20 min until potatoes are fork-tender.",
+                "Remove chili. Blend until silky smooth using an immersion blender.",
+                "Stir in coconut milk, sugar, soy sauce, and lime juice. Warm gently.",
+                "Taste and balance: salt, sweetness, acidity. Ladle into bowls and garnish.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Sweet Potato Soup Bowl",
+                "subtitle": "garnished with coconut swirl, cilantro, and lime",
+                "extras": ["Coconut milk for swirling", "Cilantro", "Lime wedge", "Sriracha"],
+                "steps": [
+                    "Reheat gently, stirring occasionally.",
+                    "Ladle into bowls; swirl in a little coconut milk.",
+                    "Top with cilantro, lime, and a drizzle of sriracha.",
+                ],
+                "tip": "The soup thickens in the fridge, add a splash of water or broth when reheating.",
+            },
+            {
+                "name": "Sweet Potato Soup with Roasted Chickpeas & Kale",
+                "subtitle": "pour over wilted kale and crispy chickpeas for a full meal",
+                "extras": ["1 can chickpeas", "2 cups kale", "Olive oil", "Smoked paprika"],
+                "steps": [
+                    "Toss chickpeas in olive oil and smoked paprika; roast at 425°F for 20 min until crispy.",
+                    "Massage kale with a little olive oil and place in the bottom of a bowl.",
+                    "Ladle hot soup over the kale to wilt it, then pile crispy chickpeas on top.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "thai-broccoli-soup",
+        "_keywords": ["thai", "soup", "broccoli", "coconut", "lemongrass", "blended", "vegan", "ginger"],
+        "image": "/static/images/thai-broccoli-soup.jpg",
+        "intro": "A bright, vibrant blended broccoli soup with lemongrass, ginger, jalapeño, and coconut milk. Fresh and herbaceous with a beautiful green color, naturally vegan.",
+        "base": {
+            "title": "Thai Broccoli Soup with Coconut Milk",
+            "ingredients": [
+                "2 tbsp olive oil",
+                "2 shallots, chopped",
+                "4–5 garlic cloves, chopped",
+                "2 tsp fresh ginger, chopped",
+                "1 jalapeño, sliced (½ for mild heat)",
+                "¼ cup lemongrass, chopped",
+                "4 cups vegetable broth",
+                "¾ tsp salt",
+                "4 kaffir lime leaves (optional)",
+                "1 lb broccoli, chopped",
+                "1½ cups potato or sweet potato, diced (optional)",
+                "1 cup coconut milk",
+                "1 tsp sugar",
+                "Handful baby spinach",
+                "½ cup cilantro, chopped",
+                "2–3 tbsp lime juice",
+                "1–2 tsp fish sauce (optional)",
+                "Garnish: crispy shallots, peanuts, lime wedges, cilantro",
+            ],
+            "steps": [
+                "Heat oil in a pot over medium. Add shallots; cook 3 min. Add garlic, ginger, and jalapeño; sauté 3 min. Add lemongrass; cook 1–2 min.",
+                "Add broth, lime leaves, salt, broccoli, and potato. Bring to a boil; cover and simmer 10–12 min until broccoli is fork-tender.",
+                "Turn off heat. Stir in baby spinach and ¼ cup cilantro.",
+                "Blend until very smooth. Return to pot over low heat.",
+                "Stir in coconut milk, sugar, lime juice, and fish sauce to taste.",
+                "Ladle into bowls; garnish with crispy shallots, peanuts, remaining cilantro, and lime.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Thai Broccoli Soup",
+                "subtitle": "vibrant green with a coconut swirl and crunchy toppings",
+                "extras": ["Crispy shallots", "Roasted peanuts", "Lime wedge", "Coconut milk swirl"],
+                "steps": [
+                    "Reheat gently, don't boil or the green color fades.",
+                    "Ladle into bowls and garnish with shallots, peanuts, and lime.",
+                ],
+                "tip": "For the best color, don't reheat past a simmer and add any extra coconut milk off-heat.",
+            },
+            {
+                "name": "Green Broccoli Ramen Bowl",
+                "subtitle": "pour the soup over noodles with a soft-boiled egg",
+                "extras": ["2 nests ramen or soba noodles", "1 soft-boiled egg", "Nori sheets", "Chili oil"],
+                "steps": [
+                    "Cook noodles; divide into deep bowls.",
+                    "Ladle hot broccoli soup generously over the noodles.",
+                    "Lay halved soft-boiled egg on top; add a nori sheet and a drizzle of chili oil.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "green-bean-stirfry",
+        "_keywords": ["thai", "stir fry", "green beans", "tofu", "lemongrass", "red curry", "vegan", "quick"],
+        "image": "/static/images/green-bean-stirfry.jpg",
+        "intro": "Crispy blistered green beans and tofu tossed in a Thai red curry paste with lemongrass, ginger, and tomatoes. A fast, punchy stir-fry that's vegan and ready in 25 minutes.",
+        "base": {
+            "title": "Thai Green Bean Stir Fry",
+            "ingredients": [
+                "1 block (16 oz) firm tofu (or chicken breast or shrimp)",
+                "2–4 tbsp avocado oil",
+                "8 oz green beans, trimmed and halved",
+                "1 tbsp ginger, grated",
+                "2 garlic cloves, minced",
+                "1 tbsp lemongrass, minced",
+                "2 shallots, thinly sliced",
+                "1 tbsp Thai red curry paste",
+                "1 tbsp soy sauce",
+                "2 tbsp rice vinegar or lime juice",
+                "½ lb cherry tomatoes, halved",
+                "Salt to taste",
+                "Garnish: Thai basil, cilantro, crushed peanuts, lime",
+            ],
+            "steps": [
+                "Cut tofu into cubes; drain on paper towels 10 min. Sear in oiled skillet until crispy on both sides; set aside.",
+                "In the same skillet, dry-fry green beans without oil 6–8 min, stirring every 2 min, until blistered.",
+                "Push beans to edges; add oil to center with ginger, lemongrass, curry paste, and garlic. Stir 1 min until fragrant.",
+                "Add shallots; mix with beans and stir-fry until shallots soften.",
+                "Return tofu with soy sauce and rice vinegar; toss to coat.",
+                "Top with fresh tomatoes and garnishes. Serve over rice or as-is.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Green Bean Stir Fry Bowl",
+                "subtitle": "over jasmine rice with basil and peanuts",
+                "extras": ["Jasmine rice", "Thai basil", "Crushed peanuts", "Lime wedge"],
+                "steps": [
+                    "Reheat in a hot pan, it only takes 2 min.",
+                    "Serve over rice with basil, peanuts, and lime.",
+                ],
+                "tip": "The blistered green beans lose some crunch when reheated, a quick high-heat toss brings it back.",
+            },
+            {
+                "name": "Green Bean Stir Fry Wrap",
+                "subtitle": "stuffed into a warm flatbread or lettuce cup",
+                "extras": ["Butter lettuce or flatbread", "Peanut sauce", "Shredded carrots"],
+                "steps": [
+                    "Warm the stir fry.",
+                    "Fill lettuce cups or flatbread with the mixture.",
+                    "Drizzle with peanut sauce.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "thai-basil-chicken",
+        "_keywords": ["thai", "basil", "chicken", "ground chicken", "pad krapow", "stir fry", "chili", "quick"],
+        "image": "/static/images/thai-basil-chicken.jpg",
+        "intro": "Ground chicken stir-fried with Thai chilies, garlic, and a heap of fresh Thai basil in a savory fish sauce and soy glaze. The fastest 30-minute Thai dinner you'll make.",
+        "base": {
+            "title": "Thai Basil Chicken (Pad Krapow Gai)",
+            "ingredients": [
+                "1 lb ground chicken (or ground turkey or crumbled tofu)",
+                "3 shallots, thinly sliced",
+                "5 garlic cloves, roughly chopped",
+                "3–6 Fresno or Thai chilies, sliced into rings",
+                "2 tbsp avocado or peanut oil, divided",
+                "½ tsp black pepper, ½ tsp salt",
+                "2 tsp coconut sugar or honey",
+                "1 tbsp soy sauce",
+                "1 tbsp fish sauce",
+                "1 red bell pepper, sliced",
+                "1 cup Thai basil leaves",
+            ],
+            "steps": [
+                "Heat a large wok to medium-high. Add 1 tbsp oil with shallots; stir 2 min. Add garlic and chilies; stir 2 min until shallots brown slightly. Transfer to a bowl.",
+                "Add remaining oil, increase to high heat. Add ground chicken with pepper and salt; stir-fry until browned.",
+                "Add sugar, soy sauce, and fish sauce; stir to combine.",
+                "Add bell pepper and shallot mixture; cook 1 min until peppers are tender-crisp.",
+                "Stir in basil leaves and turn off heat.",
+                "Taste and adjust. Serve over jasmine rice.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Thai Basil Chicken Bowl",
+                "subtitle": "over jasmine rice with a fried egg on top",
+                "extras": ["Jasmine rice", "2 eggs", "Chili flakes"],
+                "steps": [
+                    "Reheat chicken in a hot pan 2–3 min.",
+                    "Fry an egg until edges are crispy.",
+                    "Serve chicken over rice with fried egg and chili flakes.",
+                ],
+                "tip": "A fried egg with a runny yolk is the classic Thai street-food finish, don't skip it.",
+            },
+            {
+                "name": "Thai Basil Chicken Lettuce Wraps",
+                "subtitle": "spoon into butter lettuce for a lighter meal",
+                "extras": ["Butter lettuce leaves", "Sliced cucumber", "Lime wedge"],
+                "steps": [
+                    "Warm the chicken filling.",
+                    "Fill butter lettuce cups with chicken, cucumber, and fresh herbs.",
+                    "Squeeze lime over and serve.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "thai-basil-eggplant",
+        "_keywords": ["thai", "eggplant", "stir fry", "basil", "chicken", "tofu", "oyster sauce"],
+        "image": "/static/images/thai-basil-eggplant.jpg",
+        "intro": "Succulent caramelized eggplant stir-fried with chicken, Thai basil, and a savory oyster-soy sauce. Rich, tender, and deeply flavored, serve over rice for a satisfying weeknight meal.",
+        "base": {
+            "title": "Thai Basil Eggplant Stir Fry",
+            "ingredients": [
+                "1 lb Japanese or Chinese eggplant, sliced long and thin",
+                "1 tsp salt (for soaking)",
+                "1 lb chicken, thinly sliced (or crispy tofu or shrimp)",
+                "3–4 tbsp coconut or peanut oil",
+                "1½ tbsp garlic, roughly chopped",
+                "1–4 Thai chilies, finely diced (optional)",
+                "½ cup onion, sliced",
+                "½ cup bell peppers, bite-sized pieces",
+                "½ cup snow peas",
+                "1 cup Thai basil",
+                "Sauce: 1 tbsp soybean or miso paste, 2½ tbsp oyster sauce, 1 tbsp soy sauce, 2 tsp sugar, 2 tsp rice wine vinegar",
+            ],
+            "steps": [
+                "Soak eggplant slices in salted water 15–20 min; drain and pat dry.",
+                "Mix all sauce ingredients together; set aside.",
+                "Heat 1 tbsp oil in a large skillet; cook chicken until lightly browned, 7–8 min. Remove.",
+                "Add 1–2 tbsp oil; cook eggplant until caramelized and tender, 4–7 min. Remove.",
+                "Wipe pan; add 1 tbsp oil, garlic, chilies, and onion; stir 2 min.",
+                "Add remaining vegetables; cook 3–4 min. Return chicken and eggplant.",
+                "Pour in sauce; stir 1–2 min. Stir in basil, turn off heat. Serve over rice.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Thai Basil Eggplant Bowl",
+                "subtitle": "over jasmine rice with extra basil",
+                "extras": ["Jasmine rice", "Extra Thai basil", "Chili flakes", "Lime wedge"],
+                "steps": [
+                    "Reheat in a hot pan with a splash of water to loosen.",
+                    "Serve over rice with fresh basil and lime.",
+                ],
+                "tip": "Soaking the eggplant in salted water removes bitterness and helps it hold its shape when stir-fried.",
+            },
+            {
+                "name": "Eggplant Stir Fry with Fried Egg",
+                "subtitle": "top with a runny fried egg for extra richness",
+                "extras": ["2 eggs", "Chili oil"],
+                "steps": [
+                    "Reheat eggplant stir fry.",
+                    "Fry 1–2 eggs until crispy-edged and runny-yolked.",
+                    "Serve eggplant topped with the egg and a drizzle of chili oil.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "thai-pineapple-fried-rice",
+        "_keywords": ["thai", "fried rice", "pineapple", "chicken", "cashew", "egg", "curry powder"],
+        "image": "/static/images/thai-pineapple-fried-rice.jpg",
+        "intro": "Fragrant fried rice with fresh pineapple, cashews, and chicken in a curry-spiced sauce. Spicy, sweet, and salty all at once, the kind of dish that disappears fast.",
+        "base": {
+            "title": "Thai Pineapple Fried Rice",
+            "ingredients": [
+                "2 cups cooked day-old jasmine rice",
+                "4 tbsp coconut or peanut oil, divided",
+                "8–10 oz chicken breast, thinly sliced (or shrimp or tofu)",
+                "2 garlic cloves, roughly chopped",
+                "⅓ cup onion, diced",
+                "1 cup fresh pineapple, bite-sized pieces",
+                "⅓ cup red bell peppers, diced",
+                "⅓ cup carrots, diced",
+                "½ cup green onions, sliced",
+                "2 eggs, whisked",
+                "⅓ cup cashews",
+                "Sauce: 1½ tsp yellow curry powder, 1½ tbsp sugar, ½ tsp white pepper, 1 tbsp fish sauce, 2 tbsp soy sauce, 1 tbsp lime juice",
+            ],
+            "steps": [
+                "Whisk all sauce ingredients together; set aside.",
+                "Heat oil in a large skillet; cook garlic 15 sec, then cook chicken 4–5 min until lightly browned. Set aside.",
+                "Add oil; cook onions 2 min, then pineapple until lightly browned. Add bell peppers, carrots, and green onions; cook 3–4 min.",
+                "Set vegetable mixture aside. Add oil and spread rice evenly; cook 3–4 min until dry and golden.",
+                "Make a crater, add eggs, scramble gently, then fold into rice; cook 2 more min.",
+                "Return chicken and vegetables; add sauce. Cook on high 1–2 min to reduce moisture.",
+                "Stir in cashews, taste, and adjust. Serve with lime wedges and cilantro.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Thai Pineapple Fried Rice Bowl",
+                "subtitle": "eat warm with lime and fresh cilantro",
+                "extras": ["Lime wedge", "Fresh cilantro", "Sriracha"],
+                "steps": [
+                    "Reheat in a hot wok or skillet with a splash of water.",
+                    "Serve with lime wedge and cilantro.",
+                ],
+                "tip": "Day-old rice is essential, fresh rice is too moist and turns mushy when stir-fried.",
+            },
+            {
+                "name": "Pineapple Fried Rice in a Pineapple Shell",
+                "subtitle": "serve in a halved pineapple for a fun presentation",
+                "extras": ["1 fresh pineapple, halved and hollowed"],
+                "steps": [
+                    "Hollow out a pineapple half.",
+                    "Fill with hot fried rice and serve directly from the shell.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "larb",
+        "_keywords": ["thai", "larb", "salad", "ground chicken", "mint", "cilantro", "lime", "fish sauce", "lemongrass"],
+        "image": "/static/images/larb.jpg",
+        "intro": "A bright, herby Thai minced meat salad with cucumber, radish, fresh mint, cilantro, and a tangy lime-fish sauce dressing. Serve with sticky rice and lettuce wraps.",
+        "base": {
+            "title": "Thai Larb Salad",
+            "ingredients": [
+                "16 oz ground chicken, turkey, beef, or lamb",
+                "3 garlic cloves, chopped",
+                "4 tbsp lemongrass, finely minced",
+                "1 tsp chili flakes",
+                "½ tsp salt, ½ tsp pepper",
+                "1 tbsp toasted rice powder (optional)",
+                "½ red onion, diced + ¼ red onion, thinly sliced (for quick pickle)",
+                "2 tbsp rice wine vinegar + ½ cup hot water (for quick pickle)",
+                "2 cups cucumber, sliced",
+                "2–3 radishes, sliced",
+                "3 scallions, thinly sliced",
+                "1 tbsp fresh chili, minced (optional)",
+                "½ cup cilantro, ½ cup mint, ½ cup Thai basil, all chopped",
+                "2 tbsp fish sauce",
+                "4–5 tbsp lime juice",
+                "1 tsp brown sugar",
+            ],
+            "steps": [
+                "Quick-pickle sliced red onion in hot water and vinegar; refrigerate.",
+                "Heat oil in a skillet over medium. Sauté diced onion 3–4 min. Add garlic, lemongrass, and chili flakes; cook until fragrant.",
+                "Add ground meat; cook until liquid releases and evaporates, about 10 min. Season with salt and pepper. Drain fat.",
+                "Combine cucumber, radishes, scallions, mint, basil, cilantro, and chili in a bowl.",
+                "Add drained meat and pickled onions. Season with fish sauce, lime juice, and sugar.",
+                "Taste and adjust heat and acidity. Serve with sticky rice or lettuce wraps.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Larb Lettuce Cups",
+                "subtitle": "crisp butter lettuce cups with cucumber and mint",
+                "extras": ["Butter lettuce leaves", "Sliced cucumber", "Fresh mint", "Lime wedge"],
+                "steps": [
+                    "Serve the larb at room temperature or slightly chilled.",
+                    "Spoon into butter lettuce cups; add cucumber slices, mint, and a squeeze of lime.",
+                ],
+                "tip": "Larb tastes best at room temperature, the herbs wilt if it's too hot.",
+            },
+            {
+                "name": "Larb Rice Bowl",
+                "subtitle": "spooned over steamed jasmine rice with pickled shallots",
+                "extras": ["Steamed jasmine or sticky rice", "Pickled shallots", "Extra toasted rice powder", "Lime wedge"],
+                "steps": [
+                    "Spoon warm rice into a bowl.",
+                    "Pile larb over the rice and top with pickled shallots and a dusting of toasted rice powder.",
+                ],
+            },
+            {
+                "name": "Larb Naan Wrap",
+                "subtitle": "stuffed into warm naan with herb salad and lime",
+                "extras": ["Naan or flatbread", "Mixed herb salad (mint, cilantro, basil)", "Lime wedge", "Sriracha"],
+                "steps": [
+                    "Warm naan in a dry pan or directly over a flame.",
+                    "Pile larb down the center with a handful of fresh herbs.",
+                    "Squeeze lime over everything, add sriracha, and fold.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "green-papaya-salad",
+        "_keywords": ["thai", "salad", "papaya", "som tam", "green papaya", "lime", "fish sauce", "peanut"],
+        "image": "/static/images/green-papaya-salad.jpg",
+        "intro": "The iconic Thai green papaya salad, crunchy shredded papaya with green beans, cherry tomatoes, and a bright lime, fish sauce, and chili dressing. Fresh, spicy, and cooling.",
+        "base": {
+            "title": "Thai Green Papaya Salad (Som Tam)",
+            "ingredients": [
+                "½ large green papaya, shredded (6–7 cups)",
+                "2 garlic cloves",
+                "1–2 red Thai chilies",
+                "1 cup fresh long beans or green beans, cut into 1-inch pieces",
+                "1 cup cherry tomatoes, halved",
+                "3 tbsp brown sugar or palm sugar",
+                "3 tbsp fish sauce",
+                "3 tbsp lime juice",
+                "3 tbsp water",
+                "¼ cup roasted peanuts",
+            ],
+            "steps": [
+                "Halve the papaya; scoop out seeds, peel, and grate into matchstick-sized pieces.",
+                "Mash garlic and chilies in a large bowl with a mortar and pestle. Muddle green beans lightly to tenderize.",
+                "Add shredded papaya and cherry tomatoes.",
+                "Whisk sugar, fish sauce, lime juice, and water into a dressing.",
+                "Pour dressing over salad; muddle and stir 1 min to combine.",
+                "Top with roasted peanuts. Serve with sticky rice and cabbage leaves.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Som Tam",
+                "subtitle": "serve with sticky rice and raw cabbage for wrapping",
+                "extras": ["Sticky rice", "Cabbage leaves", "Extra lime"],
+                "steps": [
+                    "Serve the salad chilled or at room temperature.",
+                    "Scoop with sticky rice or wrap in cabbage leaves.",
+                ],
+                "tip": "Best eaten fresh, the papaya softens after a few hours. Make the dressing ahead and dress just before eating.",
+            },
+            {
+                "name": "Som Tam with Grilled Protein",
+                "subtitle": "top with grilled chicken or shrimp for a full meal",
+                "extras": ["Grilled chicken or shrimp", "Extra peanuts"],
+                "steps": [
+                    "Grill or pan-sear protein of choice.",
+                    "Serve alongside or over the papaya salad.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "thai-grilled-eggplant-salad",
+        "_keywords": ["thai", "eggplant", "salad", "grilled", "herbs", "fish sauce", "lime", "peanut", "fresh"],
+        "image": "/static/images/thai-grilled-eggplant-salad.jpg",
+        "intro": "Tender grilled Japanese eggplant tossed with red onion, cilantro, mint, and roasted peanuts in a tangy lime and fish sauce dressing. Light, smoky, and deeply refreshing.",
+        "base": {
+            "title": "Thai Grilled Eggplant Salad",
+            "ingredients": [
+                "1 lb Japanese eggplant (2–3 long), halved lengthwise",
+                "Oil for brushing",
+                "½ cup red onion, finely sliced",
+                "½ cup red bell pepper, cut into strips",
+                "1 tbsp jalapeño, finely diced",
+                "⅓ cup cilantro, chopped",
+                "⅓ cup green onion, sliced",
+                "¼ cup fresh mint leaves, torn",
+                "¼ cup roasted peanuts, lightly crushed",
+                "1–2 tbsp fish sauce",
+                "1–2 tbsp fresh lime juice",
+                "Salt and white pepper to taste",
+                "Optional: 2 boiled eggs, halved",
+            ],
+            "steps": [
+                "Brush eggplant halves with oil. Grill on high heat 3–4 min per side until tender.",
+                "Combine red onion, bell pepper, jalapeño, cilantro, green onion, mint, peanuts, fish sauce, and lime juice in a large bowl.",
+                "Cool grilled eggplant, then slice into 3–4 inch strips.",
+                "Add eggplant to bowl and toss. Adjust seasoning with lime, fish sauce, or jalapeño.",
+                "Garnish with boiled eggs if using. Serve alongside jasmine rice.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Eggplant Salad Bruschetta",
+                "subtitle": "piled over garlic-rubbed grilled sourdough with chili oil",
+                "extras": ["2 thick slices sourdough", "1 garlic clove", "Chili oil", "Flaky salt"],
+                "steps": [
+                    "Grill or toast sourdough until charred at the edges; rub with a raw garlic clove while hot.",
+                    "Drizzle with chili oil, then spoon the eggplant salad generously over each slice.",
+                    "Finish with flaky salt and a squeeze of lime.",
+                ],
+                "tip": "The eggplant can be grilled ahead and kept in the fridge, just dress the salad before eating.",
+            },
+            {
+                "name": "Eggplant Salad Rice Paper Rolls",
+                "subtitle": "rolled into rice paper with vermicelli, cucumber, and mint",
+                "extras": ["Rice paper wrappers", "2 oz vermicelli noodles", "Sliced cucumber", "Fresh mint"],
+                "steps": [
+                    "Soak rice paper in warm water until pliable; lay flat.",
+                    "Layer vermicelli, cucumber, a spoonful of eggplant salad, and mint down the center.",
+                    "Roll tightly; serve with the remaining dressing as a dipping sauce.",
+                ],
+            },
+            {
+                "name": "Eggplant Banh Mi",
+                "subtitle": "packed into a crusty baguette with sriracha mayo and pickled vegetables",
+                "extras": ["French baguette or hoagie roll", "Sriracha mayo", "Pickled daikon and carrots (store-bought)", "Sliced jalapeño", "Fresh cilantro"],
+                "steps": [
+                    "Split baguette and toast until crisp on the outside.",
+                    "Spread sriracha mayo generously on both sides.",
+                    "Layer the eggplant salad down the center, pack it in.",
+                    "Add pickled vegetables, jalapeño, and a handful of fresh cilantro.",
+                    "Press together and eat immediately so the bread stays crispy.",
+                ],
+                "tip": "The fish sauce and lime in the eggplant dressing already tastes like banh mi, it was born for this.",
+            },
+        ],
+    },
+    {
+        "_id": "thai-chicken-salad",
+        "_keywords": ["thai", "salad", "chicken", "coconut poached", "spinach", "herbs", "lime", "peanut"],
+        "image": "/static/images/thai-chicken-salad.jpg",
+        "intro": "Tender coconut-poached chicken shredded over baby spinach with cucumber, fresh herbs, and a coconut-lime dressing. Elegant, light, and perfect for meal prep.",
+        "base": {
+            "title": "Coconut Poached Thai Chicken Salad",
+            "ingredients": [
+                "1–1½ lbs boneless, skinless chicken breasts",
+                "1 can (14 oz) coconut milk",
+                "2 tbsp red curry paste",
+                "1 tsp fish sauce, 1 tsp sugar, ½ tsp salt",
+                "3 kaffir lime leaves (optional)",
+                "4–5 oz fresh baby spinach",
+                "2 cups English cucumber, thinly sliced",
+                "2 green onions, sliced diagonally",
+                "½–¾ cup fresh herbs (cilantro, Thai basil, mint)",
+                "1 lime",
+                "Optional toppings: roasted peanuts, crispy shallots, avocado, toasted coconut",
+            ],
+            "steps": [
+                "Heat coconut milk in a saucepan with curry paste, fish sauce, sugar, salt, and lime leaves. Bring to a simmer.",
+                "Add chicken; bring to a boil, cover, reduce heat, and simmer 10 min. Flip and cook 10–15 min more to 165°F.",
+                "Transfer chicken to a bowl; shred with two forks. Stir in a few tbsp of poaching liquid. Cool.",
+                "Reserve poaching liquid to use as dressing.",
+                "Combine spinach, cucumber, green onions, herbs, and shredded chicken.",
+                "Toss with cooled poaching liquid and lime juice. Season to taste.",
+                "Garnish with peanuts, crispy shallots, or toasted coconut.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Thai Chicken Salad Bowl",
+                "subtitle": "dressed with the coconut poaching liquid",
+                "extras": ["Roasted peanuts", "Crispy shallots", "Lime wedge", "Fresh herbs"],
+                "steps": [
+                    "Toss salad with a few spoons of the reserved coconut poaching liquid.",
+                    "Top with peanuts, crispy shallots, and fresh herbs.",
+                    "Squeeze lime over everything.",
+                ],
+                "tip": "The poaching liquid is your dressing, save it in the fridge for up to 4 days.",
+            },
+            {
+                "name": "Thai Chicken Salad Wrap",
+                "subtitle": "roll the salad into a rice paper or flatbread wrap",
+                "extras": ["Rice paper wrappers or flatbread", "Extra peanut sauce"],
+                "steps": [
+                    "Lay filling on rice paper or flatbread.",
+                    "Roll tightly and serve with peanut sauce for dipping.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "chicken-satay",
+        "_keywords": ["thai", "satay", "chicken", "skewer", "peanut sauce", "grilled", "coconut milk", "curry powder"],
+        "image": "/static/images/chicken-satay.jpg",
+        "intro": "Tender coconut-milk marinated chicken thighs grilled on skewers and served with a rich, spicy peanut dipping sauce. The essential Thai street food, great for meal prep or entertaining.",
+        "base": {
+            "title": "Thai Chicken Satay with Peanut Sauce",
+            "ingredients": [
+                "1 lb chicken thighs, sliced ¼ inch thick",
+                "8 bamboo skewers, soaked 30–60 min",
+                "Marinade: ½ cup coconut milk, 1 tbsp yellow curry powder, 1 tbsp minced garlic, 2 tbsp brown sugar, 1 tsp salt, 1 tsp soy sauce, 1 tbsp olive oil",
+                "Peanut sauce: ⅓ cup peanut butter, 1–2 tbsp red curry paste, ⅓ cup full-fat coconut milk, 1½ tbsp brown sugar, ½ tsp white vinegar, 1 tsp fish sauce, 2–3 tbsp water",
+                "Garnish: lime wedges, crushed peanuts, cilantro",
+            ],
+            "steps": [
+                "Whisk all marinade ingredients. Add chicken; coat well and refrigerate at least 30 min (overnight is best).",
+                "Make peanut sauce: heat all sauce ingredients in a small saucepan over medium, whisking until thickened. Taste and adjust. Transfer to a bowl.",
+                "Thread marinated chicken onto soaked skewers.",
+                "Preheat grill to medium-high; oil grates. Cook skewers 3–4 min per side, brushing with cooked leftover marinade.",
+                "Garnish with crushed peanuts and cilantro. Serve with peanut sauce and lime wedges.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Chicken Satay Plate",
+                "subtitle": "skewers with peanut dipping sauce and cucumber relish",
+                "extras": ["Peanut sauce", "Sliced cucumber", "Lime wedge", "Crushed peanuts"],
+                "steps": [
+                    "Reheat skewers on a grill pan or in the oven at 375°F for 8–10 min.",
+                    "Serve with peanut sauce, cucumber slices, and lime.",
+                ],
+                "tip": "The peanut sauce thickens in the fridge, thin with a splash of water before serving.",
+            },
+            {
+                "name": "Satay Rice Bowl",
+                "subtitle": "slide the chicken off the skewer over jasmine rice",
+                "extras": ["Jasmine rice", "Peanut sauce", "Sliced scallions", "Cucumber"],
+                "steps": [
+                    "Slide cooked chicken off skewers.",
+                    "Serve over jasmine rice with peanut sauce drizzled over.",
+                    "Top with scallions and cucumber.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "fresh-spring-rolls",
+        "_keywords": ["thai", "spring rolls", "rice paper", "tofu", "fresh", "vegan", "peanut sauce", "herbs"],
+        "image": "/static/images/fresh-spring-rolls.jpg",
+        "intro": "Fresh rice paper rolls packed with crispy baked tofu, shredded cabbage, bell pepper, cucumber, and herbs, served with a creamy Thai peanut sauce. Light, healthy, and perfect for meal prep.",
+        "base": {
+            "title": "Fresh Thai Spring Rolls with Peanut Sauce",
+            "ingredients": [
+                "8–10 rice paper wrappers (10-inch diameter)",
+                "1 block firm tofu, baked until crispy and sliced into strips",
+                "1 head green leaf lettuce",
+                "1 red or yellow bell pepper, thinly sliced",
+                "1½ cups purple cabbage, finely shredded",
+                "1½ cups carrots, shredded",
+                "½ English cucumber, thinly sliced",
+                "¼ cup fresh Thai basil, torn",
+                "¼ cup fresh mint, torn",
+                "Peanut sauce: ½ cup peanut butter, ¼ cup orange juice, 3 tbsp lime juice, 3 tbsp soy sauce, 3 tbsp honey, 3 tbsp sesame oil, 1 tsp cayenne, 2 garlic cloves, salt to taste, blended smooth",
+            ],
+            "steps": [
+                "Bake tofu at 400°F until crispy; cool and slice into strips. Make peanut sauce.",
+                "Slice all vegetables and gather herbs near your rolling station.",
+                "Fill a shallow bowl with lukewarm water.",
+                "Dip one rice paper wrapper 5–15 sec until just softened; lay flat on a wet surface.",
+                "Place a lettuce leaf in the center; layer vegetables, tofu, and herbs on top.",
+                "Fold bottom firmly over filling, fold in sides, and roll tightly.",
+                "Place seam-side down on a wet cutting board; cover with a damp paper towel.",
+                "Serve with peanut sauce on the side.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Fresh Spring Roll Plate",
+                "subtitle": "served with Thai peanut dipping sauce",
+                "extras": ["Peanut sauce", "Lime wedge", "Extra herbs"],
+                "steps": [
+                    "Serve the rolls whole or sliced in half at room temperature.",
+                    "Serve peanut sauce separately for dipping.",
+                ],
+                "tip": "Layer uncut rolls between damp paper towels in a lidded container, they keep 3–4 days in the fridge.",
+            },
+            {
+                "name": "Spring Roll Bowl",
+                "subtitle": "deconstruct everything into a bowl over rice noodles",
+                "extras": ["4 oz rice noodles", "Peanut sauce", "Sesame seeds"],
+                "steps": [
+                    "Cook rice noodles; divide into bowls.",
+                    "Arrange the same fillings over the noodles.",
+                    "Drizzle generously with peanut sauce.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "thai-mango-sticky-rice",
+        "_keywords": ["mango", "sticky rice", "thai", "dessert", "coconut", "glutinous rice", "sweet"],
+        "image": "/static/images/thai-mango-sticky-rice.jpg",
+        "intro": "Sweet glutinous rice cooked in rich coconut milk, topped with ripe mango slices and a drizzle of salted coconut cream, the iconic Thai street dessert that's simpler to make at home than it looks.",
+        "base": {
+            "title": "Thai Coconut Mango Sticky Rice",
+            "ingredients": [
+                "1.5 cups glutinous (sweet) rice",
+                "[ Coconut Rice ]",
+                "1 can (13.5 oz) full-fat coconut milk",
+                "3 tbsp sugar",
+                "1/2 tsp salt",
+                "[ Coconut Sauce ]",
+                "1/2 can (about 6 oz) coconut milk",
+                "1 tbsp sugar",
+                "1/4 tsp salt",
+                "1 tsp cornstarch dissolved in 1 tbsp water",
+                "[ To Serve ]",
+                "2 ripe mangoes, peeled and sliced",
+                "Toasted sesame seeds or mung beans",
+            ],
+            "steps": [
+                "Soak glutinous rice in cold water for at least 4 hours (or overnight). Drain.",
+                "Steam rice over boiling water 20–25 minutes until tender and translucent.",
+                "While rice steams, heat coconut milk, sugar, and salt in a small saucepan until sugar dissolves. Don't boil.",
+                "Transfer hot rice to a bowl. Pour warm coconut milk mixture over and stir gently. Cover and rest 20 minutes until absorbed.",
+                "Make the sauce: heat remaining coconut milk with sugar and salt. Stir in cornstarch slurry and cook 1–2 minutes until slightly thickened.",
+                "Serve rice in mounds with mango slices alongside. Drizzle coconut sauce over everything. Scatter sesame seeds.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Plated Dessert",
+                "subtitle": "rice mound with mango slices and coconut sauce drizzle",
+                "extras": ["Extra coconut sauce", "Toasted sesame seeds", "Fresh mint"],
+                "steps": [
+                    "Use a small bowl or cup to mold the sticky rice into a dome on the plate.",
+                    "Fan mango slices alongside. Pour coconut sauce generously over the rice.",
+                    "Scatter sesame seeds and add a mint sprig.",
+                ],
+                "tip": "The rice is best served slightly warm, reheat briefly in the microwave with a splash of coconut milk if making ahead.",
+            },
+            {
+                "name": "Sticky Rice Cups",
+                "subtitle": "individual portions in small cups for easy serving",
+                "extras": ["Small dessert cups or ramekins", "Mango cubes", "Extra coconut sauce"],
+                "steps": [
+                    "Press warm sticky rice into small cups lined with plastic wrap.",
+                    "Unmold onto plates. Top with diced mango and a drizzle of coconut sauce.",
+                ],
+                "tip": "Great for dinner parties, assemble individual cups ahead of time and unmold right before serving.",
+            },
+            {
+                "name": "Sticky Rice with Tropical Fruit",
+                "subtitle": "served with a mix of mango, pineapple, and papaya",
+                "extras": ["Fresh pineapple chunks", "Ripe papaya", "Kaffir lime zest"],
+                "steps": [
+                    "Combine diced mango, pineapple, and papaya in a bowl.",
+                    "Serve sticky rice alongside the tropical fruit medley.",
+                    "Drizzle coconut sauce over both. Finish with a grating of kaffir lime zest.",
+                ],
+                "tip": "Kaffir lime zest adds a floral note that makes the dish taste restaurant-quality.",
+            },
+        ],
+    },
+    # ── Japanese (new) ────────────────────────────────────────────────────────
+    {
+        "_id": "edamame-onigiri",
+        "_keywords": ["japanese", "onigiri", "rice ball", "edamame", "katsuobushi", "bonito", "lunch", "portable"],
+        "image": "/static/images/edamame.jpg",
+        "intro": "Light, portable, and surprisingly satisfying, these onigiri pack steamed short-grain rice with edamame, bonito flakes, and cheese into a perfect handheld lunch that holds together beautifully.",
+        "base": {
+            "title": "Edamame & Katsuobushi Onigiri",
+            "ingredients": [
+                "3 cups cooked Japanese short-grain rice, warm",
+                "1 cup shelled edamame, defrosted",
+                "½ cup bonito flakes (katsuobushi)",
+                "2 oz mild cheese (cream cheese or mozzarella), broken into small pieces",
+                "1–2 tbsp soy sauce",
+                "Salt to taste",
+                "Plastic wrap for shaping",
+            ],
+            "steps": [
+                "Defrost edamame if frozen; pat dry.",
+                "Break cheese into small pieces.",
+                "In a large bowl, mix warm rice with edamame, bonito flakes, cheese, and soy sauce. Taste and adjust salt.",
+                "Place a square of plastic wrap on your palm. Scoop about ½ cup of the mixture onto the center.",
+                "Gather the plastic wrap and twist firmly to shape into a tight triangle or ball.",
+                "Unwrap; repeat with remaining rice. For meal prep, keep wrapped until ready to eat.",
+            ],
+            "tip": "Always use Japanese short-grain rice, other varieties won't stick together. If reheating, sprinkle a few drops of water before microwaving to keep them soft and fluffy.",
+        },
+        "uses": [
+            {
+                "name": "Edamame Onigiri Bento",
+                "subtitle": "paired with tamagoyaki and cherry tomatoes",
+                "extras": ["2 eggs", "1 tsp mirin", "1 tsp soy sauce", "Cherry tomatoes"],
+                "steps": [
+                    "Make tamagoyaki: whisk eggs with mirin and soy sauce; cook in a small pan rolling into a log. Cool and slice.",
+                    "Pack 2–3 onigiri alongside tamagoyaki slices and a handful of cherry tomatoes.",
+                ],
+                "tip": "A little color from cherry tomatoes makes the whole lunch feel more enjoyable.",
+            },
+            {
+                "name": "Onigiri Bowl",
+                "subtitle": "deconstructed into a rice bowl with the same flavors",
+                "extras": ["Nori strips", "Sesame seeds", "Extra soy sauce"],
+                "steps": [
+                    "Serve the rice mixture in a bowl rather than shaping into balls.",
+                    "Top with extra bonito flakes, nori strips, and sesame seeds; drizzle with soy sauce.",
+                ],
+                "tip": "The bowl version is faster when you need to prep quickly, all the flavor, none of the shaping.",
+            },
+        ],
+    },
+    {
+        "_id": "poached-chicken-sandwich",
+        "_keywords": ["japanese", "chicken", "poached", "sandwich", "lunch", "meal prep", "simple", "juicy"],
+        "image": "/static/images/poached-chicken.jpg",
+        "intro": "A Japanese-style gentle poaching method yields impossibly juicy chicken with a mild, clean flavor that absorbs sauces beautifully, prep it Sunday and build sandwiches all week.",
+        "base": {
+            "title": "Gently Poached Chicken",
+            "ingredients": [
+                "2 large chicken breasts",
+                "Water to cover (about 4 cups)",
+                "1 tsp salt",
+                "1 tsp sugar",
+            ],
+            "steps": [
+                "Bring water to a boil in a pot large enough to hold the chicken in one layer.",
+                "Add salt and sugar; stir to dissolve.",
+                "Add chicken breasts. Once the water returns to a boil, immediately turn off the heat.",
+                "Cover tightly with a lid and leave undisturbed at room temperature for 3 hours.",
+                "Remove chicken; slice or shred. Refrigerate until ready to use (up to 4 days).",
+            ],
+            "tip": "Do not lift the lid during the 3 hours, the residual heat cooks the chicken gently without drying it out.",
+        },
+        "uses": [
+            {
+                "name": "Poached Chicken Sandwich",
+                "subtitle": "layered with fresh vegetables and your choice of condiment",
+                "extras": ["4 slices sandwich bread or brioche", "Lettuce", "Sliced cucumber or tomato", "Mayonnaise, mustard, or ketchup"],
+                "steps": [
+                    "Slice the poached chicken thinly.",
+                    "Toast bread if desired; spread generously with mayo, mustard, or ketchup.",
+                    "Layer chicken, lettuce, and cucumber or tomato. Close and serve.",
+                ],
+                "tip": "Poached chicken's mild flavor absorbs sauces easily, add your condiment generously.",
+            },
+            {
+                "name": "Poached Chicken Salad Bowl",
+                "subtitle": "shredded over greens with a quick sesame dressing",
+                "extras": ["Mixed greens", "Shredded cabbage", "2 tbsp sesame oil", "1 tbsp rice vinegar", "1 tbsp soy sauce", "1 tsp sesame seeds"],
+                "steps": [
+                    "Shred the poached chicken into bite-sized pieces.",
+                    "Whisk sesame oil, rice vinegar, and soy sauce into a quick dressing.",
+                    "Toss greens and cabbage with dressing; top with chicken and sesame seeds.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "tonkotsu-ramen",
+        "_keywords": ["japanese", "ramen", "tonkotsu", "pork", "broth", "noodles", "dinner", "soup"],
+        "image": "/static/images/tonk-ramen.jpg",
+        "intro": "A rich, milky pork bone broth simmered low and slow, ladled over fresh ramen noodles and topped with chashu pork, soft-boiled eggs, and bamboo shoots, the real thing, made at home.",
+        "base": {
+            "title": "Tonkotsu Ramen",
+            "ingredients": [
+                "2 lbs pork neck bones",
+                "4 cloves garlic, smashed",
+                "1-inch piece fresh ginger, sliced",
+                "4 green onions",
+                "8 cups water",
+                "2 tbsp soy sauce",
+                "1 tbsp mirin",
+                "Salt to taste",
+                "4 portions fresh or dried ramen noodles",
+                "Toppings: chashu pork, soft-boiled ramen eggs, bamboo shoots (menma), nori, sesame seeds, sliced green onions",
+            ],
+            "steps": [
+                "Blanch pork bones in boiling water 5 minutes; drain and rinse thoroughly.",
+                "Combine cleaned bones, garlic, ginger, green onions, and water in a large pot.",
+                "Bring to a hard boil, then maintain a vigorous simmer. Cook uncovered 3–4 hours, adding water as needed.",
+                "Strain broth through a fine sieve; season with soy sauce, mirin, and salt.",
+                "Cook noodles per package; divide into bowls.",
+                "Ladle hot broth over noodles; arrange toppings and serve immediately.",
+            ],
+            "tip": "A vigorous boil, not just a simmer, is what creates the creamy white tonkotsu broth. Don't reduce the heat too much.",
+        },
+        "uses": [
+            {
+                "name": "Classic Tonkotsu Ramen",
+                "subtitle": "with chashu pork, soft egg, bamboo shoots, and nori",
+                "extras": ["Chashu pork belly", "Soft-boiled ramen eggs", "Bamboo shoots", "Nori", "Sesame seeds", "Green onions"],
+                "steps": [
+                    "Heat broth to a rolling boil; season to taste.",
+                    "Cook noodles; place in warmed bowls. Ladle broth over and arrange all toppings.",
+                ],
+                "tip": "Warm your bowls first, hot broth in a cold bowl loses temperature fast.",
+            },
+            {
+                "name": "Spicy Miso Tonkotsu",
+                "subtitle": "the same broth fired up with red miso and chili oil",
+                "extras": ["2 tbsp red miso", "2 tbsp chili oil", "Corn kernels", "Bean sprouts"],
+                "steps": [
+                    "Whisk red miso and chili oil into the hot broth until smooth.",
+                    "Cook noodles; assemble bowls with corn, bean sprouts, and standard toppings.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "yakisoba",
+        "_keywords": ["japanese", "noodles", "yakisoba", "pork", "stir-fry", "dinner", "lunch", "cabbage"],
+        "image": "/static/images/yakisoba.jpg",
+        "servings": 4,
+        "calories_per_serving": 400,
+        "intro": "Japanese stir-fried noodles with pork, cabbage, carrots, and a sweet-savory sauce, ready in 20 minutes and even better the next day.",
+        "base": {
+            "title": "Yakisoba",
+            "ingredients": [
+                "12 oz yakisoba noodles (fresh or pre-steamed; dried ramen works too)",
+                "½ lb pork belly or shoulder, thinly sliced",
+                "2 cups green cabbage, roughly chopped",
+                "1 medium carrot, julienned",
+                "1 medium onion, sliced",
+                "2 tbsp neutral oil",
+                "Yakisoba sauce: 3 tbsp Worcestershire sauce, 2 tbsp oyster sauce, 1 tbsp ketchup, 1 tbsp soy sauce, 1 tsp sugar, whisked together",
+                "To serve: pickled ginger (beni shoga), aonori, Japanese mayo",
+            ],
+            "steps": [
+                "If using fresh noodles, loosen in a colander with boiling water; drain.",
+                "Heat oil in a wok or large skillet over high heat. Add pork and cook until browned, 3 minutes.",
+                "Add onion, carrot, and cabbage; stir-fry 3–4 minutes until slightly wilted.",
+                "Add noodles and pour yakisoba sauce over everything. Toss vigorously to coat.",
+                "Cook 2–3 minutes until noodles are heated through and sauce has caramelized slightly.",
+                "Plate and top with pickled ginger, aonori, and a drizzle of Japanese mayo.",
+            ],
+            "tip": "High heat and constant tossing are the secrets, don't let the noodles sit and steam in the pan.",
+        },
+        "uses": [
+            {
+                "name": "Classic Pork Yakisoba",
+                "subtitle": "with pickled ginger, aonori, and Japanese mayo",
+                "extras": ["Beni shoga (pickled ginger)", "Aonori", "Japanese mayo (Kewpie)"],
+                "steps": [
+                    "Top finished yakisoba with pickled ginger, a sprinkle of aonori, and a zig-zag of Japanese mayo.",
+                ],
+                "tip": "Beni shoga is the defining garnish, don't skip it.",
+            },
+            {
+                "name": "Seafood Yakisoba",
+                "subtitle": "with shrimp and squid instead of pork",
+                "extras": ["½ lb shrimp, peeled", "½ lb squid rings", "Extra green onions"],
+                "steps": [
+                    "Replace pork with shrimp and squid; cook shrimp 2 minutes per side and squid 1 minute.",
+                    "Proceed with the same stir-fry method; finish with extra sliced green onions.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "tsukune-meatballs",
+        "_keywords": ["japanese", "tsukune", "meatballs", "chicken", "yakitori", "skewers", "lunch", "grilled"],
+        "image": "/static/images/tsukume.jpg",
+        "servings": 4,
+        "calories_per_serving": 169,
+        "intro": "Juicy Japanese chicken meatballs grilled on skewers and glazed with a sticky tare sauce, serve over rice, in a bento, or straight off the skewer.",
+        "base": {
+            "title": "Tsukune (Japanese Chicken Meatballs)",
+            "ingredients": [
+                "1 lb ground chicken",
+                "2 green onions, finely minced",
+                "1 tbsp fresh ginger, grated",
+                "2 cloves garlic, grated",
+                "1 tbsp soy sauce",
+                "1 tbsp sake or dry sherry",
+                "1 tbsp potato starch or cornstarch",
+                "½ tsp sesame oil",
+                "Salt and white pepper",
+                "Tare sauce: 3 tbsp soy sauce, 2 tbsp mirin, 1 tbsp sake, 1 tsp sugar, simmered until slightly thickened",
+            ],
+            "steps": [
+                "Mix ground chicken with green onion, ginger, garlic, soy sauce, sake, starch, sesame oil, salt, and pepper.",
+                "Refrigerate mixture 15 minutes; it will be sticky, that's correct.",
+                "Wet your hands; shape into 1.5-inch oval patties or thread onto soaked bamboo skewers.",
+                "Grill or pan-fry over medium-high heat 3–4 minutes per side until cooked through.",
+                "Brush generously with tare sauce in the last minute of cooking.",
+            ],
+            "tip": "The mixture is intentionally sticky, don't add breadcrumbs. The starch binds without toughening.",
+        },
+        "uses": [
+            {
+                "name": "Tsukune Skewer Plate",
+                "subtitle": "with tare, egg yolk dip, and steamed rice",
+                "extras": ["Extra tare sauce", "1 raw egg yolk per person", "Steamed rice", "Shichimi togarashi"],
+                "steps": [
+                    "Serve hot skewers with a small bowl of tare for dipping.",
+                    "Serve with a raw egg yolk alongside for dipping, the richness cuts the savory-sweet glaze.",
+                    "Add a bowl of steamed rice and a shake of shichimi.",
+                ],
+                "tip": "Raw egg yolk dipping is the classic izakaya way to eat tsukune, try it at least once.",
+            },
+            {
+                "name": "Tsukune Rice Bowl",
+                "subtitle": "sliced over steamed rice with extra tare and sesame",
+                "extras": ["Steamed rice", "Extra tare sauce", "Sesame seeds", "Sliced green onion"],
+                "steps": [
+                    "Remove meatballs from skewers; slice in half on the bias.",
+                    "Arrange over steamed rice; drizzle with extra tare.",
+                    "Top with sesame seeds and green onion.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "okonomiyaki",
+        "_keywords": ["japanese", "okonomiyaki", "savory pancake", "cabbage", "breakfast", "brunch", "bacon"],
+        "image": "/static/images/oko.jpg",
+        "intro": "Japan's beloved savory pancake, a thick, golden cake of cabbage, green onion, and egg batter, finished with a sweet-savory sauce, Japanese mayo, and dancing bonito flakes.",
+        "base": {
+            "title": "Okonomiyaki",
+            "ingredients": [
+                "2 cups green cabbage, very finely shredded",
+                "4 large eggs",
+                "⅔ cup all-purpose flour",
+                "¼ cup dashi stock (or water)",
+                "2 green onions, thinly sliced",
+                "4 slices bacon, cut into thirds",
+                "Neutral oil for frying",
+                "Okonomiyaki sauce: 3 tbsp Worcestershire, 1½ tbsp ketchup, 1 tbsp oyster sauce, 1 tsp soy sauce, 1 tsp sugar, whisked together",
+                "Japanese mayo (Kewpie), aonori, bonito flakes to serve",
+            ],
+            "steps": [
+                "Whisk eggs, flour, dashi, and a pinch of salt into a smooth batter.",
+                "Fold in shredded cabbage and green onion.",
+                "Heat oil in a large skillet over medium heat. Pour in batter to form a thick round pancake.",
+                "Lay bacon strips across the top; cover and cook 5 minutes until underside is golden.",
+                "Flip carefully with a wide spatula; cook uncovered 5 minutes until cooked through.",
+                "Mix okonomiyaki sauce; brush liberally over the top. Drizzle with Japanese mayo.",
+                "Sprinkle with aonori and bonito flakes, the flakes will wave from the heat.",
+            ],
+            "tip": "Keep the batter thick and mound it high, a thin okonomiyaki won't have the right fluffy-crispy texture.",
+        },
+        "uses": [
+            {
+                "name": "Classic Bacon Okonomiyaki",
+                "subtitle": "with sweet sauce, Japanese mayo, aonori, and bonito flakes",
+                "extras": ["Okonomiyaki sauce", "Japanese mayo", "Aonori", "Bonito flakes"],
+                "steps": [
+                    "Finish with a generous brush of sauce, a zig-zag of mayo, and a shower of aonori and bonito flakes.",
+                    "Serve hot, straight from the pan.",
+                ],
+            },
+            {
+                "name": "Shrimp & Cheese Okonomiyaki",
+                "subtitle": "with shrimp instead of bacon and melted cheese folded in",
+                "extras": ["½ cup small shrimp, peeled", "½ cup shredded mozzarella"],
+                "steps": [
+                    "Mix shrimp into the batter instead of laying bacon on top.",
+                    "After flipping, scatter mozzarella over the pancake; let it melt before removing.",
+                    "Finish with standard toppings.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "japanese-souffle-pancakes",
+        "_keywords": ["japanese", "souffle", "pancakes", "fluffy", "breakfast", "brunch", "jiggly"],
+        "image": "/static/images/japan-pan.jpg",
+        "servings": 4,
+        "calories_per_serving": 336,
+        "intro": "Impossibly tall, jiggly soufflé-style pancakes that wobble on the plate, their cloud-like texture comes from whipped egg whites folded into the batter.",
+        "base": {
+            "title": "Japanese Soufflé Pancakes",
+            "ingredients": [
+                "2 large eggs, separated",
+                "2 tbsp whole milk",
+                "1 tsp vanilla extract",
+                "¼ cup (30g) all-purpose flour, sifted",
+                "½ tsp baking powder",
+                "2 tbsp sugar",
+                "Pinch of cream of tartar or a drop of white vinegar",
+                "Neutral oil and a few drops of water for steaming",
+            ],
+            "steps": [
+                "Whisk egg yolks, milk, and vanilla. Fold in sifted flour and baking powder until smooth.",
+                "In a clean bowl, beat egg whites with cream of tartar until foamy. Add sugar gradually; beat to stiff, glossy peaks.",
+                "Gently fold egg whites into yolk mixture in 3 additions, keep it airy.",
+                "Heat a non-stick pan over the lowest heat setting; lightly oil and add a few drops of water.",
+                "Scoop batter into tall mounds (or ring molds) about 2 inches high.",
+                "Cover with a lid; cook 4–5 minutes until set on the bottom. Carefully flip; cover and cook 3–4 more minutes.",
+                "Serve immediately, soufflé pancakes deflate within minutes.",
+            ],
+            "tip": "The lowest heat possible is the key, these cook by steam more than direct heat. If they brown too fast, your heat is too high.",
+        },
+        "uses": [
+            {
+                "name": "Classic Soufflé Pancakes",
+                "subtitle": "with butter, maple syrup, and powdered sugar",
+                "extras": ["Butter", "Maple syrup", "Powdered sugar", "Fresh berries"],
+                "steps": [
+                    "Stack 2–3 pancakes; top with a pat of cold butter.",
+                    "Dust with powdered sugar; drizzle maple syrup at the table.",
+                ],
+                "tip": "Cold butter on hot pancakes, the slow melt is the whole experience.",
+            },
+            {
+                "name": "Strawberry Cream Soufflé Pancakes",
+                "subtitle": "with whipped cream and macerated strawberries",
+                "extras": ["1 cup strawberries, sliced", "1 tbsp sugar", "½ cup heavy cream, whipped"],
+                "steps": [
+                    "Toss strawberries with sugar; let macerate 15 minutes.",
+                    "Whip cream to soft peaks.",
+                    "Stack pancakes; spoon cream and strawberries generously over the top. Serve immediately.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "korokke",
+        "_keywords": ["japanese", "korokke", "croquette", "potato", "ground beef", "fried", "lunch", "panko"],
+        "image": "/static/images/korok.jpg",
+        "servings": 5,
+        "calories_per_serving": 360,
+        "intro": "Japanese potato croquettes, creamy spiced mashed potato and ground beef patties coated in panko and fried until deeply golden. Comfort food in its purest form.",
+        "base": {
+            "title": "Korokke (Japanese Potato Croquettes)",
+            "ingredients": [
+                "2 lbs russet potatoes, peeled and cubed",
+                "½ lb ground beef (or beef and pork mix)",
+                "1 medium onion, finely diced",
+                "2 tbsp butter",
+                "2 tbsp soy sauce",
+                "1 tbsp Worcestershire sauce",
+                "Salt, pepper, and a pinch of nutmeg",
+                "Breading: ½ cup flour, 2 eggs beaten, 1½ cups panko breadcrumbs",
+                "Neutral oil for deep frying",
+                "Tonkatsu sauce and shredded cabbage to serve",
+            ],
+            "steps": [
+                "Boil potatoes until tender; drain and mash until smooth. Season with salt, pepper, and nutmeg.",
+                "Sauté onion in butter until soft. Add ground meat; cook through. Season with soy sauce and Worcestershire. Cool.",
+                "Combine potato and meat mixture. Shape into oval patties about ¾ inch thick.",
+                "Coat each patty: flour → beaten egg → panko. Press panko firmly.",
+                "Heat 2 inches of oil to 350°F. Fry korokke in batches 3–4 minutes, turning once, until deep golden brown.",
+                "Drain on a rack. Serve with tonkatsu sauce and shredded cabbage.",
+            ],
+            "tip": "Chill the shaped patties 30 minutes before frying, they hold their shape much better.",
+        },
+        "uses": [
+            {
+                "name": "Classic Korokke Plate",
+                "subtitle": "with tonkatsu sauce, Japanese mustard, and fresh cabbage",
+                "extras": ["Tonkatsu sauce", "Karashi (Japanese mustard)", "Shredded cabbage", "Steamed rice"],
+                "steps": [
+                    "Serve 2–3 korokke with shredded cabbage, a bowl of rice, and tonkatsu sauce drizzled over.",
+                    "Add a dab of karashi on the side.",
+                ],
+                "tip": "Tonkatsu sauce and Japanese mustard together is the classic, both are essential.",
+            },
+            {
+                "name": "Korokke Sandwich",
+                "subtitle": "in a soft bun with cabbage, mayo, and tonkatsu sauce",
+                "extras": ["2 soft sandwich rolls or milk bread slices", "Japanese mayo", "Tonkatsu sauce", "Shredded cabbage"],
+                "steps": [
+                    "Split buns; spread both sides with Japanese mayo.",
+                    "Layer shredded cabbage, a korokke, and a drizzle of tonkatsu sauce.",
+                ],
+                "tip": "A korokke sando on milk bread is a Japanese convenience-store classic, the soft bread against the crunchy panko crust is the point.",
+            },
+        ],
+    },
+    {
+        "_id": "tamagoyaki",
+        "_keywords": ["japanese", "tamagoyaki", "rolled omelette", "egg", "breakfast", "bento", "dashi"],
+        "image": "/static/images/rolled-om.jpg",
+        "servings": 2,
+        "calories_per_serving": 155,
+        "intro": "Japan's iconic sweet rolled omelette, thin layers of seasoned egg rolled into a compact golden log, sliced to reveal beautiful spirals. A breakfast and bento staple.",
+        "base": {
+            "title": "Tamagoyaki",
+            "ingredients": [
+                "4 large eggs",
+                "2 tbsp dashi stock (or water)",
+                "1 tbsp soy sauce",
+                "1 tbsp mirin",
+                "1 tsp sugar",
+                "Neutral oil for the pan",
+            ],
+            "steps": [
+                "Whisk eggs, dashi, soy sauce, mirin, and sugar until the sugar dissolves. Strain through a fine sieve for a silkier texture.",
+                "Heat a tamagoyaki pan (or small non-stick skillet) over medium heat; brush lightly with oil.",
+                "Pour in ⅓ of the egg mixture; swirl to coat the pan thinly. When just set but still slightly wet, roll toward you from the far end.",
+                "Push the roll to the far end; oil the empty pan. Pour in another ⅓ of the mixture, lifting the roll so egg flows underneath.",
+                "When just set, roll back toward you again over the first roll.",
+                "Repeat with remaining egg. Cool before slicing into ¾-inch rounds.",
+            ],
+            "tip": "Roll when the egg is just barely set, wet enough to seal the layers together. High heat makes it set too fast.",
+        },
+        "uses": [
+            {
+                "name": "Sweet Tamagoyaki",
+                "subtitle": "sliced for bento or breakfast with soy sauce and daikon",
+                "extras": ["Soy sauce for dipping", "Grated daikon radish"],
+                "steps": [
+                    "Cool the tamagoyaki completely; slice into ¾-inch rounds.",
+                    "Serve with a small dish of soy sauce and grated daikon on the side.",
+                ],
+                "tip": "Tamagoyaki keeps refrigerated for 3 days, make it the night before for easy bento packing.",
+            },
+            {
+                "name": "Savory Dashi Tamagoyaki",
+                "subtitle": "less sweet, more umami, the sushi restaurant style",
+                "extras": ["Extra 1 tbsp dashi", "Reduce sugar to ¼ tsp"],
+                "steps": [
+                    "Make the same base but increase dashi and reduce sugar to ¼ tsp.",
+                    "The result is more delicate and savory, serve alongside plain rice with pickles.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "japanese-milk-bread",
+        "_keywords": ["japanese", "milk bread", "shokupan", "bread", "breakfast", "baking", "soft", "tangzhong"],
+        "image": "/static/images/milk-bread.jpg",
+        "intro": "The softest, most pillowy bread you will ever make. Japanese milk bread (shokupan) gets its extraordinary texture from the tangzhong technique, a cooked flour paste that keeps it cloud-soft for days.",
+        "base": {
+            "title": "Japanese Milk Bread (Shokupan)",
+            "ingredients": [
+                "Tangzhong: 3 tbsp bread flour + ½ cup whole milk, whisked and cooked over medium heat until thick like loose pudding",
+                "2½ cups (320g) bread flour",
+                "2¼ tsp instant yeast",
+                "3 tbsp sugar",
+                "1 tsp salt",
+                "1 egg",
+                "½ cup whole milk, warm",
+                "3 tbsp unsalted butter, softened",
+                "Egg wash: 1 egg yolk + 1 tbsp milk",
+            ],
+            "steps": [
+                "Make tangzhong: whisk flour and milk in a small pan; cook over medium heat, stirring constantly, until thick like loose pudding. Cool to room temperature.",
+                "Combine bread flour, yeast, sugar, and salt. Add egg, warm milk, and cooled tangzhong; mix until a shaggy dough forms.",
+                "Knead 10 minutes until smooth; add butter and knead 8 more minutes until elastic and the windowpane test passes.",
+                "Cover and let rise 1–1.5 hours until doubled.",
+                "Punch down; divide into 4 equal portions. Shape each into a log; place side by side in a buttered 9×5 loaf pan.",
+                "Cover and proof 45 minutes until domed above the rim.",
+                "Brush with egg wash. Bake at 350°F for 30–35 minutes until deep golden brown. Cool on a rack before slicing.",
+            ],
+            "tip": "The windowpane test: stretch a small piece of dough, it should stretch thin and translucent without tearing. Stop kneading when it passes.",
+        },
+        "uses": [
+            {
+                "name": "Milk Bread Toast with Butter",
+                "subtitle": "thick-sliced toast with cultured butter and jam",
+                "extras": ["Cultured or salted butter", "Your favorite jam or honey"],
+                "steps": [
+                    "Slice the bread about 1 inch thick.",
+                    "Toast until just golden. Spread generously with cold butter while hot.",
+                    "Serve with jam or honey on the side.",
+                ],
+                "tip": "Thick-sliced shokupan is meant to be eaten this way, the soft crumb against cold butter is the whole experience.",
+            },
+            {
+                "name": "Milk Bread French Toast",
+                "subtitle": "custard-soaked thick slices pan-fried golden",
+                "extras": ["2 eggs", "¼ cup milk", "1 tbsp sugar", "1 tsp vanilla", "Butter", "Maple syrup"],
+                "steps": [
+                    "Whisk eggs, milk, sugar, and vanilla. Soak 1-inch slices 30 seconds per side.",
+                    "Fry in butter over medium heat 3–4 minutes per side until deeply golden.",
+                    "Serve with maple syrup and a dusting of powdered sugar.",
+                ],
+                "tip": "Day-old shokupan absorbs the custard even better, slightly stale bread makes better French toast.",
+            },
+        ],
+    },
+    {
+        "_id": "chili-crisp-mazemen",
+        "_keywords": ["japanese", "ramen", "mazemen", "brothless", "chili crisp", "noodles", "dinner", "spicy"],
+        "image": "/static/images/chili-crisp.jpg",
+        "intro": "Mazemen, brothless ramen, tossed in a punchy chili crisp sauce with a soft-boiled egg, scallions, and sesame. Intense, deeply savory, and ready in 15 minutes.",
+        "base": {
+            "title": "Chili Crisp Mazemen",
+            "ingredients": [
+                "4 portions ramen noodles (fresh, frozen, or dried)",
+                "Sauce: 3 tbsp chili crisp, 2 tbsp soy sauce, 1 tbsp sesame oil, 1 tbsp rice vinegar, 1 tbsp tahini or peanut butter, 1 tsp sugar",
+                "4 soft-boiled ramen eggs, halved",
+                "4 green onions, thinly sliced",
+                "2 tbsp toasted sesame seeds",
+                "Nori strips and extra chili crisp to serve",
+            ],
+            "steps": [
+                "Whisk together chili crisp, soy sauce, sesame oil, rice vinegar, tahini, and sugar.",
+                "Cook ramen noodles per package; drain very well (reserve 2 tbsp noodle water).",
+                "Toss hot noodles with sauce and a splash of noodle water until the sauce coats every strand.",
+                "Divide into bowls; top with soft-boiled egg, green onion, sesame seeds, and nori.",
+                "Finish with extra chili crisp to taste.",
+            ],
+            "tip": "Drain the noodles very well, excess water dilutes the sauce. Toss immediately while hot so the sauce emulsifies.",
+        },
+        "uses": [
+            {
+                "name": "Classic Chili Crisp Mazemen",
+                "subtitle": "with soft-boiled egg, nori, and extra chili crisp",
+                "extras": ["Extra chili crisp", "Nori strips", "Sesame seeds", "Sliced cucumber"],
+                "steps": [
+                    "Serve in deep bowls; add extra chili crisp at the table for heat control.",
+                    "Sliced cucumber alongside cuts through the richness.",
+                ],
+                "tip": "Different chili crisp brands have different heat levels, taste before adding more.",
+            },
+            {
+                "name": "Mazemen with Crispy Ground Pork",
+                "subtitle": "with crispy seasoned ground pork for extra depth",
+                "extras": ["½ lb ground pork", "1 tbsp soy sauce", "1 tsp five-spice powder"],
+                "steps": [
+                    "Brown ground pork with soy sauce and five-spice until crispy; drain excess fat.",
+                    "Toss noodles with sauce; top with crispy pork, egg, and garnishes.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "mochi-ice-cream",
+        "_keywords": ["japanese", "mochi", "ice cream", "dessert", "sweet rice", "confection", "sweet"],
+        "image": "/static/images/mochi.jpg",
+        "intro": "Creamy ice cream wrapped in a chewy, sweet mochi shell, the Japanese confection that's taken over dessert menus everywhere. Surprisingly achievable at home.",
+        "base": {
+            "title": "Mochi Ice Cream",
+            "ingredients": [
+                "1 cup (160g) shiratamako (sweet rice flour) or mochiko",
+                "¾ cup water",
+                "¼ cup sugar",
+                "Cornstarch for dusting",
+                "1 pint ice cream (vanilla, strawberry, or matcha), scooped into balls and frozen solid",
+            ],
+            "steps": [
+                "Scoop ice cream into 1.5-inch balls; place on parchment. Freeze at least 1 hour until rock solid.",
+                "Whisk shiratamako, sugar, and water until smooth.",
+                "Microwave in 1-minute intervals, stirring between, for 3–4 minutes until translucent and sticky.",
+                "Dust a surface generously with cornstarch; turn out the hot mochi and dust the top. Roll to about ¼ inch thick.",
+                "Cut into 3.5-inch circles; cool 5 minutes until pliable.",
+                "Working quickly, place a frozen ice cream ball in the center; gather the dough up and pinch firmly to seal.",
+                "Place seam-side down; freeze immediately for at least 30 minutes.",
+            ],
+            "tip": "Speed is the entire game, work in a cold kitchen and have everything set up before you start wrapping.",
+        },
+        "uses": [
+            {
+                "name": "Classic Mochi Ice Cream",
+                "subtitle": "vanilla, strawberry, or matcha, your choice",
+                "extras": ["Matcha powder or powdered sugar for dusting"],
+                "steps": [
+                    "Serve direct from freezer; let sit 2 minutes so the mochi softens slightly before eating.",
+                    "Dust with matcha powder for a traditional Japanese presentation.",
+                ],
+                "tip": "Mochi ice cream keeps up to 2 weeks frozen, make a full batch on the weekend.",
+            },
+            {
+                "name": "Matcha Mochi with Black Sesame Ice Cream",
+                "subtitle": "matcha-tinted mochi around nutty black sesame ice cream",
+                "extras": ["2 tsp matcha powder mixed into the mochi dough", "Black sesame ice cream"],
+                "steps": [
+                    "Add matcha to the mochi dough before microwaving for a green tint and earthy flavor.",
+                    "Fill with black sesame ice cream, a classic Japanese flavor pairing.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "tamago-kake-gohan",
+        "_keywords": ["japanese", "rice", "egg", "tamago kake gohan", "TKG", "dinner", "simple", "comfort"],
+        "image": "/static/images/egg-rice.jpg",
+        "intro": "Japan's beloved raw egg over rice, the ultimate comfort meal that requires almost no cooking. The egg turns silky and rich when folded into hot steamed rice with a splash of soy sauce.",
+        "base": {
+            "title": "Tamago Kake Gohan (TKG)",
+            "ingredients": [
+                "2 cups hot, freshly cooked Japanese short-grain rice",
+                "2 very fresh eggs",
+                "1–2 tbsp soy sauce",
+                "1 tsp mirin (optional)",
+                "Toppings: green onion, sesame seeds, nori strips, a drop of sesame oil",
+            ],
+            "steps": [
+                "Cook rice in a rice cooker or pot; serve immediately while piping hot.",
+                "Create a small well in the center of the rice. Crack an egg into it.",
+                "Drizzle soy sauce and mirin over the egg.",
+                "Mix vigorously with chopsticks, the egg will turn pale yellow and foamy, coating every grain.",
+                "Top with green onion, sesame seeds, nori strips, and a drop of sesame oil.",
+            ],
+            "tip": "The rice must be piping hot right out of the cooker. Use the freshest eggs possible. TKG is meant to be eaten with a raw egg.",
+        },
+        "uses": [
+            {
+                "name": "Classic TKG",
+                "subtitle": "egg, soy sauce, green onion, nori",
+                "extras": ["Green onion", "Nori strips", "Sesame seeds", "Sesame oil"],
+                "steps": [
+                    "Mix egg thoroughly into hot rice with soy sauce until creamy and pale.",
+                    "Top with green onion, nori, sesame seeds, and a drop of sesame oil.",
+                ],
+                "tip": "Vigorous, thorough mixing is the key, you want the egg fully incorporated into every grain.",
+            },
+            {
+                "name": "TKG with Mentaiko",
+                "subtitle": "elevated with spicy cod roe and avocado",
+                "extras": ["Mentaiko (spicy cod roe) or salmon roe", "½ avocado, sliced", "Japanese pickles (tsukemono)"],
+                "steps": [
+                    "Make the base TKG as usual.",
+                    "Top with a spoonful of mentaiko, avocado slices, and serve pickles on the side.",
+                ],
+                "tip": "Mentaiko over TKG is a restaurant-level upgrade, the briny heat against the creamy egg rice is excellent.",
+            },
+        ],
+    },
+    # ── Chinese (new) ────────────────────────────────────────────────────────
+    {
+        "_id": "black-pepper-beef",
+        "_keywords": ["chinese", "beef", "black pepper", "stir fry", "bell pepper", "dinner"],
+        "image": "/static/images/photo-black-pepper-beef.jpg",
+        "intro": "A bold, peppery stir-fry of thin-sliced beef with bell peppers and onions in a glossy black pepper sauce, fast, satisfying, and great for meal prep over rice.",
+        "base": {
+            "title": "Black Pepper Beef Stir Fry",
+            "ingredients": [
+                "1 lb flank steak or sirloin, thinly sliced against the grain",
+                "1 red bell pepper, sliced",
+                "1 green bell pepper, sliced",
+                "1 onion, sliced",
+                "3 cloves garlic, minced",
+                "1 tbsp fresh ginger, grated",
+                "Marinade: 2 tbsp soy sauce, 1 tbsp oyster sauce, 1 tsp cornstarch, 1 tsp sesame oil",
+                "Sauce: 2 tbsp oyster sauce, 1 tbsp soy sauce, 1 tbsp Shaoxing wine, 1 tsp sugar, 1–2 tsp freshly cracked black pepper, ½ cup beef broth",
+                "2 tbsp neutral oil",
+                "Steamed rice to serve",
+            ],
+            "steps": [
+                "Toss sliced beef with marinade; let sit 15 minutes.",
+                "Whisk sauce ingredients together; set aside.",
+                "Heat wok or skillet over high heat; add oil. Sear beef in a single layer 1–2 minutes per side; remove.",
+                "Add garlic and ginger; stir 30 seconds. Add peppers and onion; stir-fry 3 minutes.",
+                "Return beef; pour sauce over everything. Toss over high heat 1–2 minutes until sauce thickens.",
+                "Serve over steamed rice.",
+            ],
+            "tip": "High heat and don't crowd the pan, sear in batches if needed so the beef browns instead of steams.",
+        },
+        "uses": [
+            {
+                "name": "Black Pepper Beef Bowl",
+                "subtitle": "over steamed jasmine rice with green onion and sesame",
+                "extras": ["Steamed jasmine rice", "Sliced green onion", "Sesame seeds"],
+                "steps": ["Serve stir-fry over rice; top with green onion and sesame seeds."],
+            },
+            {
+                "name": "Black Pepper Beef Fried Rice",
+                "subtitle": "tossed with day-old rice for a one-pan meal",
+                "extras": ["2 cups day-old cooked rice", "2 eggs", "Extra soy sauce"],
+                "steps": [
+                    "Push cooked stir-fry to the side; scramble eggs in the pan.",
+                    "Add day-old rice; toss everything together with a splash of soy sauce over high heat.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "cashew-chicken",
+        "_keywords": ["chinese", "chicken", "cashew", "stir fry", "dinner", "nuts"],
+        "image": "/static/images/cashew.jpg",
+        "servings": 6,
+        "calories_per_serving": 351,
+        "intro": "Tender chicken pieces and crunchy cashews tossed in a savory-sweet sauce with vegetables, a takeout classic that's even better made fresh at home.",
+        "base": {
+            "title": "Cashew Chicken",
+            "ingredients": [
+                "1.5 lbs boneless chicken thighs, cut into 1-inch pieces",
+                "1 cup roasted cashews",
+                "1 red bell pepper, diced",
+                "3 cloves garlic, minced",
+                "3 green onions, cut into 1-inch pieces",
+                "Marinade: 1 tbsp soy sauce, 1 tsp cornstarch",
+                "Sauce: 3 tbsp soy sauce, 1 tbsp hoisin sauce, 1 tbsp rice vinegar, 1 tbsp honey, 1 tsp sesame oil, 1 tsp cornstarch + 2 tbsp water",
+                "2 tbsp neutral oil",
+            ],
+            "steps": [
+                "Toss chicken with marinade; set aside 10 minutes.",
+                "Whisk sauce ingredients together.",
+                "Heat oil in a wok over high heat. Cook chicken until golden, 4–5 minutes; remove.",
+                "Add garlic and bell pepper; stir-fry 2 minutes.",
+                "Return chicken; add sauce and cashews. Toss 1–2 minutes until sauce thickens.",
+                "Add green onions; toss once and serve.",
+            ],
+            "tip": "Add cashews at the end, they stay crunchier and don't absorb excess sauce.",
+        },
+        "uses": [
+            {
+                "name": "Cashew Chicken Rice Bowl",
+                "subtitle": "over steamed rice with extra cashews and green onion",
+                "extras": ["Steamed rice", "Extra cashews", "Sliced green onion", "Sesame seeds"],
+                "steps": ["Serve over steamed rice; garnish with extra cashews and green onion."],
+            },
+            {
+                "name": "Cashew Chicken Lettuce Wraps",
+                "subtitle": "spooned into butter lettuce cups with hoisin",
+                "extras": ["Butter lettuce leaves", "Extra hoisin sauce", "Shredded carrots"],
+                "steps": [
+                    "Spoon cashew chicken into large butter lettuce leaves.",
+                    "Top with shredded carrots and a drizzle of hoisin.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "black-pepper-chicken",
+        "_keywords": ["chinese", "chicken", "black pepper", "onion", "bell pepper", "stir fry", "dinner"],
+        "image": "/static/images/black-pepper-chicken.jpg",
+        "servings": 4,
+        "calories_per_serving": 472,
+        "prep_tasks": ["Sauce", "Stir fry"],
+        "intro": "A punchy stir-fry of chicken breast, onions, and bell peppers coated in a bold black pepper sauce, served over rice. A weeknight dinner ready in under 25 minutes.",
+        "base": {
+            "title": "Black Pepper Chicken Stir Fry",
+            "ingredients": [
+                "[ Rice ]",
+                "1 cup long-grain rice (makes 3 cups cooked)",
+                "[ Sauce — prep ahead ]",
+                "3 tbsp soy sauce",
+                "2 tbsp oyster sauce",
+                "2 tbsp white wine vinegar",
+                "1 tbsp freshly cracked black pepper",
+                "1 tsp brown sugar",
+                "3 tbsp water",
+                "1 tsp cornstarch",
+                "[ Stir fry ]",
+                "700g (1½ lb) chicken breast, thinly sliced",
+                "2 tbsp cornstarch",
+                "1 tbsp freshly cracked black pepper",
+                "1 tbsp sesame oil",
+                "2 bell peppers, sliced (any colour)",
+                "2 brown onions, sliced",
+            ],
+            "steps": [
+                "Cook rice your preferred way and set aside.",
+                "Meal prep the sauce: whisk soy sauce, oyster sauce, vinegar, black pepper, brown sugar, water, and cornstarch together. Store in a jar in the fridge until needed.",
+                "Toss sliced chicken with cornstarch and black pepper.",
+                "Heat sesame oil in a wok or large pan over high heat until smoking.",
+                "Sear chicken in a single layer 3–4 minutes until golden; flip and cook 2 more minutes. Remove and set aside.",
+                "Add peppers and onions; stir-fry 3–4 minutes until slightly charred at the edges.",
+                "Return chicken to the pan. Pour sauce over and toss over high heat 1–2 minutes until the sauce coats everything and thickens.",
+                "Serve over rice.",
+            ],
+            "tip": "Freshly cracked black pepper is the whole point of this dish — don't use pre-ground.",
+        },
+        "uses": [
+            {
+                "name": "Black Pepper Chicken Bowl",
+                "subtitle": "over rice with sesame seeds and green onion",
+                "extras": ["Cooked long-grain rice", "Green onion, sliced", "Sesame seeds"],
+                "steps": [
+                    "Meal prep: cook the rice, prep the sauce in a jar, slice and season the chicken and veg.",
+                    "Cook the stir-fry and divide into 4 containers over rice.",
+                    "To serve: reheat covered with a damp paper towel for 1–2 min. Top with green onion and sesame seeds.",
+                ],
+                "tip": "The sauce keeps 5 days in the fridge — make a double batch and use it on noodles or tofu too.",
+            },
+            {
+                "name": "Black Pepper Chicken Noodles",
+                "subtitle": "tossed with lo mein noodles instead of rice",
+                "extras": ["8 oz lo mein or udon noodles, cooked", "Extra splash of soy sauce", "Bean sprouts"],
+                "steps": [
+                    "Meal prep: prep the sauce and chicken as above. Cook noodles instead of rice.",
+                    "Finish the stir-fry then toss hot noodles directly into the pan with everything.",
+                    "Add a splash of soy sauce, toss over high heat 1 minute. Top with bean sprouts.",
+                ],
+                "tip": "Noodles absorb the sauce faster than rice — serve immediately rather than meal prepping assembled.",
+            },
+            {
+                "name": "Black Pepper Chicken Lettuce Cups",
+                "subtitle": "skip the rice, serve the stir fry in butter lettuce leaves",
+                "extras": ["Butter lettuce leaves", "Shredded carrots", "Extra black pepper", "Lime wedges"],
+                "steps": [
+                    "Meal prep: prep the sauce and cook the stir-fry. Skip the rice.",
+                    "Spoon the chicken and veg mixture into butter lettuce cups.",
+                    "Top with shredded carrots and a squeeze of lime.",
+                ],
+                "tip": "Eat these at room temperature or cold straight from the fridge — great for a lighter lunch.",
+            },
+        ],
+    },
+    {
+        "_id": "black-pepper-tofu",
+        "_keywords": ["chinese", "tofu", "bok choy", "black pepper", "vegan", "stir fry", "dinner"],
+        "image": "/static/images/black-pepper-tofu.jpg",
+        "servings": 4,
+        "calories_per_serving": 240,
+        "intro": "Crispy baked tofu and tender bok choy tossed in a bold black pepper sauce, a satisfying plant-based stir-fry that's just as punchy as the meat versions.",
+        "base": {
+            "title": "Black Pepper Tofu & Bok Choy Stir Fry",
+            "ingredients": [
+                "1 block (14 oz) extra-firm tofu, pressed and cubed",
+                "4 baby bok choy, halved lengthwise",
+                "3 cloves garlic, minced",
+                "1 tsp fresh ginger, grated",
+                "Sauce: 2 tbsp soy sauce, 1 tbsp oyster sauce (or vegan oyster sauce), 1 tsp sesame oil, 1 tsp sugar, 1½ tsp cracked black pepper, ¼ cup vegetable broth, 1 tsp cornstarch",
+                "2 tbsp neutral oil",
+            ],
+            "steps": [
+                "Bake tofu at 400°F for 25 minutes until golden and crispy, flipping halfway.",
+                "Whisk sauce together.",
+                "Heat oil in a wok; sear bok choy cut-side down 2 minutes until golden. Remove.",
+                "Add garlic and ginger; stir 30 seconds. Add baked tofu; pour sauce over.",
+                "Toss 1 minute until sauce thickens. Return bok choy; toss once to coat.",
+                "Serve over steamed rice.",
+            ],
+            "tip": "Baking the tofu first is the key, it gets properly crispy and holds its shape through the stir-fry.",
+        },
+        "uses": [
+            {
+                "name": "Black Pepper Tofu Rice Bowl",
+                "subtitle": "over steamed rice with sesame and chili flakes",
+                "extras": ["Steamed rice", "Sesame seeds", "Red chili flakes"],
+                "steps": ["Serve over rice; top with sesame seeds and a pinch of chili flakes."],
+            },
+            {
+                "name": "Black Pepper Tofu Noodle Bowl",
+                "subtitle": "over soba or udon with extra sauce",
+                "extras": ["8 oz soba or udon noodles, cooked", "Extra soy sauce", "Sliced green onion"],
+                "steps": [
+                    "Toss cooked noodles with the finished stir-fry; add extra soy if needed.",
+                    "Top with green onion and serve.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "teriyaki-poke-bowl",
+        "_keywords": ["chinese", "chicken", "teriyaki", "poke bowl", "rice", "lunch", "meal prep"],
+        "image": "/static/images/poke-bowl-chicken.jpg",
+        "intro": "Juicy teriyaki-glazed chicken over sushi rice with all the poke bowl fixings, edamame, cucumber, avocado, and a drizzle of spicy mayo. A meal-prep lunch that actually excites you.",
+        "base": {
+            "title": "Teriyaki Chicken Poke Bowl",
+            "ingredients": [
+                "1.5 lbs boneless chicken thighs",
+                "Teriyaki marinade: 3 tbsp soy sauce, 2 tbsp mirin, 1 tbsp honey, 1 tsp sesame oil, 2 cloves garlic minced",
+                "2 cups sushi rice, cooked and seasoned with rice vinegar + sugar + salt",
+                "Toppings: edamame, sliced cucumber, shredded carrots, sliced avocado, pickled ginger",
+                "Spicy mayo: 3 tbsp Japanese mayo + 1 tbsp sriracha",
+                "Sesame seeds and sliced green onion to garnish",
+            ],
+            "steps": [
+                "Marinate chicken in teriyaki marinade for at least 30 minutes.",
+                "Cook chicken in a skillet over medium-high heat 5–6 minutes per side, basting with leftover marinade.",
+                "Rest 5 minutes; slice on the bias.",
+                "Cook rice; season with rice vinegar mixture while warm.",
+                "Divide rice into bowls; arrange chicken and toppings.",
+                "Drizzle with spicy mayo; top with sesame seeds and green onion.",
+            ],
+            "tip": "Season the sushi rice while it's still warm, it absorbs the vinegar dressing much better.",
+        },
+        "uses": [
+            {
+                "name": "Teriyaki Chicken Poke Bowl",
+                "subtitle": "over sushi rice with avocado, edamame, and spicy mayo",
+                "extras": ["Spicy mayo", "Pickled ginger", "Nori strips"],
+                "steps": ["Assemble bowl with rice, chicken, and all toppings; drizzle with spicy mayo and add nori strips."],
+            },
+            {
+                "name": "Teriyaki Chicken Salad Bowl",
+                "subtitle": "over mixed greens instead of rice for a lighter version",
+                "extras": ["Mixed greens", "Sesame dressing", "Wonton strips"],
+                "steps": [
+                    "Replace sushi rice with a bed of mixed greens.",
+                    "Use sesame dressing instead of spicy mayo; top with wonton strips for crunch.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "honey-soy-noodles",
+        "_keywords": ["chinese", "chicken", "noodles", "honey", "soy", "garlic", "meal prep", "lunch", "dinner"],
+        "image": "/static/images/meal-prep-honey-soy-noodles.jpg",
+        "intro": "Sweet-savory honey soy garlic chicken noodles that work two ways, served hot as a satisfying dinner or cold from the fridge as a packed lunch the next day.",
+        "base": {
+            "title": "Honey Soy Garlic Chicken Noodles",
+            "ingredients": [
+                "1.5 lbs boneless chicken thighs, sliced",
+                "12 oz lo mein, udon, or ramen noodles",
+                "4 cloves garlic, minced",
+                "1 tbsp fresh ginger, grated",
+                "2 cups broccoli florets",
+                "1 bell pepper, sliced",
+                "Sauce: 3 tbsp soy sauce, 2 tbsp honey, 1 tbsp sesame oil, 1 tbsp rice vinegar, 1 tsp chili garlic sauce",
+                "2 tbsp neutral oil",
+                "Sesame seeds and green onion to serve",
+            ],
+            "steps": [
+                "Cook noodles per package; toss with a little sesame oil to prevent sticking.",
+                "Whisk sauce together.",
+                "Heat oil in a wok over high heat. Cook chicken until golden, 4–5 minutes; remove.",
+                "Add garlic, ginger, broccoli, and pepper; stir-fry 3 minutes.",
+                "Return chicken and add noodles. Pour sauce over and toss over high heat 2 minutes.",
+                "Top with sesame seeds and green onion.",
+            ],
+            "tip": "These noodles are deliberately designed to taste great cold, the sauce firms up and clings to the noodles overnight.",
+        },
+        "uses": [
+            {
+                "name": "Hot Honey Soy Noodle Bowl",
+                "subtitle": "served warm straight from the wok",
+                "extras": ["Extra chili garlic sauce", "Sesame seeds", "Green onion"],
+                "steps": [
+                    "Serve hot with extra chili sauce on the side for heat.",
+                    "Top with sesame seeds and green onion.",
+                ],
+                "tip": "Best eaten immediately, the noodles are at peak texture right out of the wok.",
+            },
+            {
+                "name": "Cold Noodle Lunch Box",
+                "subtitle": "chilled noodles served cold from meal prep containers",
+                "extras": ["Sliced cucumber", "Edamame", "Extra sesame seeds"],
+                "steps": [
+                    "Pack noodles in airtight containers; refrigerate overnight.",
+                    "Serve cold topped with sliced cucumber and edamame, no reheating needed.",
+                ],
+                "tip": "Cold noodles are intentionally the lunch version, the flavors deepen and the sauce clings beautifully when chilled.",
+            },
+        ],
+    },
+    {
+        "_id": "honey-lemon-chicken",
+        "_keywords": ["chinese", "chicken", "honey", "lemon", "lunch", "bright", "simple"],
+        "image": "/static/images/honey-lemon.jpg",
+        "servings": 4,
+        "calories_per_serving": 321,
+        "intro": "Tender chicken in a bright, glossy honey lemon sauce, light enough for lunch but satisfying over rice. A refreshing break from heavier stir-fries.",
+        "base": {
+            "title": "Honey Lemon Chicken",
+            "ingredients": [
+                "1.5 lbs boneless chicken breast, sliced into strips",
+                "Marinade: 1 tbsp soy sauce, 1 tsp cornstarch",
+                "Sauce: 3 tbsp honey, 3 tbsp fresh lemon juice, 1 tbsp soy sauce, 1 tsp cornstarch + 2 tbsp water, zest of 1 lemon",
+                "3 cloves garlic, minced",
+                "2 tbsp neutral oil",
+                "Lemon slices, green onion, sesame seeds to garnish",
+                "Steamed rice or mixed greens to serve",
+            ],
+            "steps": [
+                "Toss chicken with marinade; rest 10 minutes.",
+                "Whisk sauce ingredients together.",
+                "Heat oil over medium-high; cook chicken until golden, 3–4 minutes per side. Remove.",
+                "Add garlic; cook 30 seconds. Pour sauce into the pan; stir until it bubbles and thickens.",
+                "Return chicken; toss to coat. Garnish with lemon slices, green onion, and sesame.",
+            ],
+            "tip": "Fresh lemon juice is non-negotiable, bottled lemon juice won't have the brightness this dish needs.",
+        },
+        "uses": [
+            {
+                "name": "Honey Lemon Chicken Bowl",
+                "subtitle": "over steamed rice with extra sauce",
+                "extras": ["Steamed jasmine rice", "Extra lemon wedges", "Green onion"],
+                "steps": ["Serve over rice; squeeze extra lemon over the top and garnish with green onion."],
+            },
+            {
+                "name": "Honey Lemon Chicken Salad",
+                "subtitle": "over mixed greens for a lighter lunch",
+                "extras": ["Mixed greens", "Sliced almonds", "Thinly sliced red onion"],
+                "steps": [
+                    "Serve warm chicken over a bed of mixed greens.",
+                    "Use leftover sauce as the dressing; top with sliced almonds and red onion.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "ginger-honey-salmon",
+        "_keywords": ["chinese", "salmon", "ginger", "honey", "dinner", "fish", "glazed"],
+        "image": "/static/images/ginger-salmon.jpg",
+        "intro": "Salmon fillets glazed with a fragrant ginger-honey sauce and pan-seared until caramelized, a weeknight dinner that looks and tastes far more impressive than the effort involved.",
+        "base": {
+            "title": "Ginger Honey Salmon",
+            "ingredients": [
+                "4 salmon fillets (6 oz each), skin-on",
+                "Glaze: 3 tbsp honey, 2 tbsp soy sauce, 1 tbsp fresh ginger grated, 2 cloves garlic minced, 1 tbsp rice vinegar, 1 tsp sesame oil",
+                "Salt and pepper",
+                "2 tbsp neutral oil",
+                "Sesame seeds and sliced green onion to serve",
+                "Steamed rice and stir-fried vegetables to serve",
+            ],
+            "steps": [
+                "Whisk glaze ingredients together.",
+                "Pat salmon dry; season with salt and pepper.",
+                "Heat oil in an oven-safe skillet over medium-high. Sear salmon skin-side up 3 minutes until golden.",
+                "Flip; brush glaze generously over the top. Transfer to 400°F oven 6–8 minutes until cooked through.",
+                "Broil the last 2 minutes to caramelize the glaze.",
+                "Serve with sesame seeds and green onion over rice.",
+            ],
+            "tip": "The broil at the end is what creates the sticky, caramelized glaze, don't skip it, and watch carefully.",
+        },
+        "uses": [
+            {
+                "name": "Ginger Honey Salmon Bowl",
+                "subtitle": "over steamed rice with stir-fried greens",
+                "extras": ["Steamed rice", "Bok choy or broccolini, stir-fried", "Sesame seeds"],
+                "steps": [
+                    "Serve glazed salmon over rice alongside stir-fried greens.",
+                    "Spoon any pan glaze over the rice.",
+                ],
+            },
+            {
+                "name": "Ginger Honey Salmon with Noodles",
+                "subtitle": "flaked over soba noodles with a sesame drizzle",
+                "extras": ["8 oz soba noodles, cooked", "2 tbsp sesame oil", "1 tbsp soy sauce", "Cucumber strips"],
+                "steps": [
+                    "Toss soba with sesame oil and soy sauce.",
+                    "Flake salmon over the noodles; add cucumber strips.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "orange-chicken",
+        "_keywords": ["chinese", "chicken", "orange", "crispy", "dinner", "sweet", "takeout"],
+        "image": "/static/images/orange.jpg",
+        "servings": 4,
+        "calories_per_serving": 288,
+        "intro": "Crispy chicken pieces tossed in a tangy, sweet-savory orange sauce, the takeout favorite made at home, with real orange zest and a sauce that actually tastes like citrus.",
+        "base": {
+            "title": "Orange Chicken",
+            "ingredients": [
+                "1.5 lbs boneless chicken thighs, cut into 1-inch pieces",
+                "Batter: ½ cup flour, ¼ cup cornstarch, 1 egg, ½ cup water, pinch of salt",
+                "Neutral oil for frying",
+                "Orange sauce: zest and juice of 2 oranges (about ½ cup juice), 3 tbsp soy sauce, 2 tbsp honey, 1 tbsp rice vinegar, 1 tsp sesame oil, 2 cloves garlic minced, 1 tsp ginger, 1 tbsp cornstarch + 2 tbsp water",
+                "Sesame seeds, green onion, orange slices to garnish",
+            ],
+            "steps": [
+                "Whisk batter ingredients until smooth. Coat chicken pieces in batter.",
+                "Heat 1 inch of oil to 350°F; fry chicken in batches 4–5 minutes until golden. Drain on a rack.",
+                "In a saucepan, combine orange sauce ingredients; cook over medium heat stirring until thickened.",
+                "Toss fried chicken in the sauce until fully coated.",
+                "Serve over steamed rice; garnish with sesame seeds, green onion, and orange slices.",
+            ],
+            "tip": "Fry the chicken in small batches, overcrowding drops the oil temperature and you get soggy rather than crispy.",
+        },
+        "uses": [
+            {
+                "name": "Classic Orange Chicken",
+                "subtitle": "over steamed rice with sesame and green onion",
+                "extras": ["Steamed white or fried rice", "Sesame seeds", "Green onion", "Orange slices"],
+                "steps": ["Serve orange chicken over rice; garnish with sesame, green onion, and orange slices."],
+            },
+            {
+                "name": "Orange Chicken Lettuce Wraps",
+                "subtitle": "in butter lettuce cups with shredded cabbage and hoisin",
+                "extras": ["Butter lettuce leaves", "Shredded red cabbage", "Hoisin sauce"],
+                "steps": [
+                    "Spoon orange chicken into lettuce cups.",
+                    "Top with shredded cabbage and a drizzle of hoisin.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "kung-pao-chicken",
+        "_keywords": ["chinese", "chicken", "kung pao", "peanuts", "spicy", "sichuan", "dinner"],
+        "image": "/static/images/kung-pao-chicken.jpg",
+        "intro": "The Sichuan classic, tender chicken with crunchy peanuts, dried chilies, and a bold tangy-sweet sauce. Properly spicy, properly addictive, and better than any takeout version.",
+        "base": {
+            "title": "Kung Pao Chicken",
+            "ingredients": [
+                "1.5 lbs boneless chicken thighs, cut into 1-inch cubes",
+                "½ cup roasted peanuts",
+                "8–10 dried red chilies, stems removed",
+                "3 cloves garlic, minced",
+                "1 tbsp fresh ginger, grated",
+                "3 green onions, cut into 1-inch pieces",
+                "Marinade: 1 tbsp soy sauce, 1 tsp cornstarch, 1 tsp sesame oil",
+                "Sauce: 2 tbsp soy sauce, 1 tbsp dark soy sauce, 1 tbsp rice vinegar, 1 tbsp Shaoxing wine, 1 tsp sugar, 1 tsp cornstarch + 2 tbsp water",
+                "2 tbsp neutral oil",
+            ],
+            "steps": [
+                "Toss chicken with marinade; rest 15 minutes. Whisk sauce ingredients.",
+                "Heat oil in a wok over high heat until smoking. Add dried chilies; stir 20 seconds until fragrant.",
+                "Add chicken; cook undisturbed 2 minutes, then stir-fry until golden.",
+                "Add garlic and ginger; cook 30 seconds.",
+                "Pour sauce over; toss to coat. Add peanuts and green onions; stir once.",
+                "Serve immediately over steamed rice.",
+            ],
+            "tip": "The dried chilies are for flavor and aroma, not to eat whole, pull them aside when eating or warn your guests.",
+        },
+        "uses": [
+            {
+                "name": "Classic Kung Pao Chicken",
+                "subtitle": "over steamed rice with extra peanuts",
+                "extras": ["Steamed rice", "Extra roasted peanuts", "Sliced green onion"],
+                "steps": ["Serve over rice; top with extra peanuts and green onion."],
+            },
+            {
+                "name": "Kung Pao Noodle Bowl",
+                "subtitle": "tossed with lo mein noodles",
+                "extras": ["8 oz lo mein noodles, cooked", "Extra sauce", "Bean sprouts"],
+                "steps": [
+                    "Toss kung pao chicken with cooked noodles over high heat.",
+                    "Add bean sprouts; serve with extra sauce on the side.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "sweet-sour-chicken",
+        "_keywords": ["chinese", "chicken", "sweet", "sour", "pineapple", "crispy", "dinner"],
+        "image": "/static/images/sweet-sour.jpg",
+        "intro": "Crispy battered chicken in a vibrant sweet-and-sour sauce with pineapple, bell peppers, and onion, a Chinese-American classic that's satisfying, colorful, and easy to meal prep.",
+        "base": {
+            "title": "Sweet and Sour Chicken",
+            "ingredients": [
+                "1.5 lbs boneless chicken breast, cut into chunks",
+                "Batter: ½ cup cornstarch, 2 eggs beaten, salt and pepper",
+                "Neutral oil for frying",
+                "Sweet & sour sauce: ½ cup ketchup, ¼ cup rice vinegar, 3 tbsp sugar, 2 tbsp soy sauce, 1 can (8 oz) pineapple chunks with juice",
+                "1 red bell pepper, chunked",
+                "1 green bell pepper, chunked",
+                "1 onion, chunked",
+                "2 cloves garlic, minced",
+                "1 tbsp neutral oil",
+            ],
+            "steps": [
+                "Dip chicken in egg, then coat in cornstarch; shake off excess.",
+                "Fry in 350°F oil in batches until golden and crispy, 4–5 minutes. Drain.",
+                "Sauté garlic, peppers, and onion in 1 tbsp oil 2–3 minutes.",
+                "Add sweet & sour sauce and pineapple; bring to a simmer until slightly thickened.",
+                "Toss fried chicken in the sauce; serve immediately over rice.",
+            ],
+            "tip": "Toss the chicken in sauce right before eating, if it sits, the batter softens. For meal prep, keep chicken and sauce separate.",
+        },
+        "uses": [
+            {
+                "name": "Classic Sweet and Sour Chicken",
+                "subtitle": "over steamed rice with extra sauce",
+                "extras": ["Steamed white rice", "Sesame seeds", "Green onion"],
+                "steps": ["Serve chicken over rice; ladle extra sauce over and garnish."],
+            },
+            {
+                "name": "Sweet and Sour Chicken Fried Rice",
+                "subtitle": "tossed with day-old rice for a complete one-pan meal",
+                "extras": ["2 cups day-old rice", "2 eggs", "Frozen peas"],
+                "steps": [
+                    "Scramble eggs in a hot wok; add rice and peas and stir-fry.",
+                    "Add chicken and a spoonful of sauce; toss together and serve.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "honey-soy-tofu",
+        "_keywords": ["chinese", "tofu", "honey", "soy", "vegan", "dinner", "crispy"],
+        "image": "/static/images/soy-tofu.jpg",
+        "servings": 3,
+        "calories_per_serving": 300,
+        "intro": "Crispy baked tofu glazed in a sticky honey soy sauce, a satisfying plant-based dinner that's as easy as it is addictive over rice or noodles.",
+        "base": {
+            "title": "Honey Soy Tofu",
+            "ingredients": [
+                "2 blocks (14 oz each) extra-firm tofu, pressed and cubed",
+                "Glaze: 3 tbsp soy sauce, 2 tbsp honey (or maple syrup for vegan), 1 tbsp rice vinegar, 1 tsp sesame oil, 2 cloves garlic minced, 1 tsp ginger",
+                "1 tbsp cornstarch",
+                "Sesame seeds and green onion to serve",
+                "Steamed rice or noodles to serve",
+            ],
+            "steps": [
+                "Toss tofu cubes in cornstarch; spread on a lined baking sheet.",
+                "Bake at 400°F for 25–30 minutes, flipping halfway, until golden and crispy.",
+                "Whisk glaze; pour into a skillet over medium heat until it bubbles and thickens slightly.",
+                "Add baked tofu; toss to coat.",
+                "Serve over rice with sesame seeds and green onion.",
+            ],
+            "tip": "Press the tofu well, at least 20 minutes under a heavy pan. Dry tofu crisps up; wet tofu steams.",
+        },
+        "uses": [
+            {
+                "name": "Honey Soy Tofu Rice Bowl",
+                "subtitle": "over steamed rice with vegetables and sesame",
+                "extras": ["Steamed rice", "Stir-fried bok choy or broccoli", "Sesame seeds"],
+                "steps": [
+                    "Serve glazed tofu over rice alongside stir-fried greens.",
+                    "Drizzle any remaining glaze over everything.",
+                ],
+            },
+            {
+                "name": "Honey Soy Tofu Noodle Bowl",
+                "subtitle": "over soba or udon with cucumber and avocado",
+                "extras": ["8 oz soba noodles, cooked", "Sliced cucumber", "½ avocado", "Extra soy sauce"],
+                "steps": [
+                    "Toss soba with a little sesame oil and soy sauce.",
+                    "Top with glazed tofu, cucumber, and avocado.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "sweet-sour-pork",
+        "_keywords": ["chinese", "pork", "sweet", "sour", "grilled", "dinner", "pineapple"],
+        "image": "/static/images/ss-pork.jpg",
+        "intro": "Grilled sweet and sour pork, marinated pork in a tangy pineapple-based sauce, grilled for a smoky char instead of the typical deep-fried version. Lighter and just as satisfying.",
+        "base": {
+            "title": "Grilled Sweet and Sour Pork",
+            "ingredients": [
+                "1.5 lbs pork tenderloin or pork shoulder, cut into 1-inch cubes",
+                "Marinade: 2 tbsp soy sauce, 1 tbsp rice vinegar, 1 tbsp honey, 2 cloves garlic minced",
+                "Sweet & sour sauce: ½ cup pineapple juice, 3 tbsp ketchup, 2 tbsp rice vinegar, 2 tbsp soy sauce, 2 tbsp sugar, 1 tbsp cornstarch + 2 tbsp water",
+                "1 cup pineapple chunks",
+                "1 red bell pepper, chunked",
+                "Neutral oil for grill or grill pan",
+                "Steamed rice to serve",
+            ],
+            "steps": [
+                "Marinate pork at least 30 minutes (up to overnight).",
+                "Thread pork and pineapple onto skewers alternately.",
+                "Grill on high heat 3–4 minutes per side until lightly charred and cooked through.",
+                "Make sauce: combine all ingredients except cornstarch in a saucepan; bring to a simmer. Add cornstarch slurry; stir until thickened.",
+                "Serve pork and pineapple skewers over rice with sweet and sour sauce spooned over.",
+            ],
+            "tip": "Don't skip the marinade time, even 30 minutes makes a significant difference in tenderness and flavor.",
+        },
+        "uses": [
+            {
+                "name": "Grilled Sweet and Sour Pork Skewers",
+                "subtitle": "over rice with extra sweet and sour sauce",
+                "extras": ["Steamed rice", "Extra sweet and sour sauce", "Sliced green onion"],
+                "steps": ["Serve skewers over rice; ladle sauce generously over everything."],
+            },
+            {
+                "name": "Sweet and Sour Pork Bowl",
+                "subtitle": "sliced off skewers into a rice bowl with pickled cucumber",
+                "extras": ["Steamed rice", "Quick-pickled cucumber", "Sesame seeds"],
+                "steps": [
+                    "Slide pork and pineapple off skewers; slice pork.",
+                    "Serve over rice with pickled cucumber and a sesame drizzle.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "hong-kong-egg-tarts",
+        "_keywords": ["egg tart", "hong kong", "chinese", "custard", "dim sum", "dessert", "pastry", "shortcrust"],
+        "image": "/static/images/hong-kong-egg-tarts.jpg",
+        "intro": "Flaky shortcrust pastry shells filled with a silky, lightly sweet egg custard, the beloved Hong Kong dim sum classic, baked at home in a muffin tin in under an hour.",
+        "base": {
+            "title": "Hong Kong Egg Tarts",
+            "ingredients": [
+                "[ Shortcrust Pastry ]",
+                "1 cup all-purpose flour",
+                "1/4 cup powdered sugar",
+                "1/2 cup (1 stick) cold unsalted butter, cubed",
+                "1 egg yolk",
+                "1–2 tbsp cold water",
+                "[ Custard Filling ]",
+                "3 large eggs",
+                "1/2 cup warm water",
+                "1/2 cup evaporated milk",
+                "1/3 cup sugar",
+                "1/2 tsp vanilla extract",
+            ],
+            "steps": [
+                "Make pastry: pulse flour, powdered sugar, and butter in a food processor until crumbly. Add egg yolk and water; pulse until dough just comes together.",
+                "Wrap in plastic and refrigerate 30 minutes.",
+                "Preheat oven to 375°F. Roll pastry to 1/8-inch thick. Cut into circles and press into a greased muffin tin.",
+                "Make custard: dissolve sugar in warm water. Whisk in eggs, evaporated milk, and vanilla. Strain through a fine sieve.",
+                "Pour custard into pastry shells, filling 3/4 full.",
+                "Bake 20–25 minutes until custard is just set (it will wobble slightly in the center). Cool 10 minutes before removing.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Egg Tarts",
+                "subtitle": "served warm from the oven, just like at dim sum",
+                "extras": ["Powdered sugar for dusting", "Fresh berries on the side"],
+                "steps": [
+                    "Let tarts cool in the tin 10 minutes, then carefully remove.",
+                    "Serve warm, the custard should be silky and just-set.",
+                    "Dust with a pinch of powdered sugar if desired.",
+                ],
+                "tip": "The custard continues setting as it cools, pull tarts out when the center still has a slight wobble.",
+            },
+            {
+                "name": "Chilled Egg Tarts",
+                "subtitle": "refrigerated and served cold for a firmer custard texture",
+                "extras": ["Whipped cream", "Lemon curd"],
+                "steps": [
+                    "Refrigerate baked tarts at least 1 hour until fully set and chilled.",
+                    "Serve cold with a small dollop of whipped cream or lemon curd.",
+                ],
+                "tip": "Cold egg tarts have a denser, creamier custard, both versions are equally valid, just different experiences.",
+            },
+            {
+                "name": "Matcha Egg Tarts",
+                "subtitle": "custard infused with matcha powder for a Japanese-inspired twist",
+                "extras": ["1 tsp matcha powder", "Extra matcha for dusting"],
+                "steps": [
+                    "Whisk 1 tsp matcha powder into the warm sugar-water before adding eggs.",
+                    "Proceed with the recipe as written, the custard will be a pale sage green.",
+                    "Dust finished tarts with a tiny pinch of matcha powder.",
+                ],
+                "tip": "Use ceremonial-grade matcha for the clearest flavor, culinary grade works but can taste slightly bitter.",
+            },
+        ],
+    },
+    # ── Vietnamese (new) ──────────────────────────────────────────────────────
+    {
+        "_id": "lemongrass-beef-vermicelli",
+        "_keywords": ["vietnamese", "beef", "lemongrass", "vermicelli", "salad", "lunch", "fresh", "nuoc cham"],
+        "image": "/static/images/lemongrass.jpg",
+        "intro": "Grilled lemongrass beef over cold rice vermicelli with fresh herbs, pickled vegetables, and a bright nuoc cham dressing, the Vietnamese lunch bowl that somehow gets better the longer it sits.",
+        "base": {
+            "title": "Lemongrass Beef Vermicelli Salad",
+            "ingredients": [
+                "1 lb beef sirloin or flank steak, thinly sliced",
+                "Lemongrass marinade: 2 stalks lemongrass (white part only, minced), 3 cloves garlic, 2 tbsp fish sauce, 1 tbsp sugar, 1 tbsp neutral oil, 1 tsp black pepper",
+                "8 oz dried rice vermicelli, cooked and rinsed in cold water",
+                "2 cups shredded lettuce or mixed greens",
+                "1 cup bean sprouts",
+                "1 cucumber, julienned",
+                "Fresh mint, Thai basil, and cilantro",
+                "Pickled daikon and carrot",
+                "Nuoc cham: 3 tbsp fish sauce, 3 tbsp lime juice, 2 tbsp sugar, 2 tbsp water, 1 garlic clove minced, 1 small chili sliced",
+                "Crushed roasted peanuts to garnish",
+            ],
+            "steps": [
+                "Marinate beef at least 30 minutes.",
+                "Make nuoc cham: stir sugar into fish sauce and lime juice until dissolved; add water, garlic, and chili.",
+                "Grill or pan-sear beef over high heat 1–2 minutes per side until charred. Rest and slice.",
+                "Cook vermicelli; rinse under cold water; drain.",
+                "Assemble bowls: vermicelli base, then greens, bean sprouts, cucumber, and herbs.",
+                "Top with beef and pickled vegetables. Drizzle nuoc cham over; garnish with peanuts.",
+            ],
+            "tip": "Rinse the vermicelli in cold water after cooking, it stops them cooking further and keeps them from clumping.",
+        },
+        "uses": [
+            {
+                "name": "Classic Lemongrass Beef Vermicelli Bowl",
+                "subtitle": "with fresh herbs, pickled veg, and nuoc cham",
+                "extras": ["Extra nuoc cham", "Crushed peanuts", "Extra lime wedges"],
+                "steps": [
+                    "Assemble as above; serve nuoc cham in a small bowl on the side for dipping.",
+                    "Squeeze extra lime and add crushed peanuts for crunch.",
+                ],
+                "tip": "Add the nuoc cham right before eating, the salad holds much better when dressed at the last minute.",
+            },
+            {
+                "name": "Lemongrass Beef Spring Roll Bowl",
+                "subtitle": "same flavors wrapped in rice paper rolls",
+                "extras": ["Rice paper wrappers", "Extra herbs", "Extra nuoc cham"],
+                "steps": [
+                    "Use the same beef, vermicelli, and herbs to fill rice paper rolls.",
+                    "Serve with nuoc cham for dipping.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "vietnamese-matcha-cookies",
+        "_keywords": ["matcha", "cookies", "white chocolate", "vietnamese", "dessert", "chewy", "green tea"],
+        "image": "/static/images/vietnamese-matcha-cookies.jpg",
+        "intro": "Chewy, slightly crisp-edged matcha cookies studded with white chocolate chips, the earthy bitterness of green tea perfectly balanced by melty sweet chocolate. A small-batch recipe done in 20 minutes.",
+        "base": {
+            "title": "Vietnamese-Inspired Matcha White Chocolate Cookies",
+            "ingredients": [
+                "1 cup + 2 tbsp all-purpose flour",
+                "1.5 tsp matcha powder (ceremonial or high-quality culinary grade)",
+                "1/2 tsp baking soda",
+                "1/4 tsp salt",
+                "6 tbsp unsalted butter, softened",
+                "1/2 cup granulated sugar",
+                "1/4 cup light brown sugar, packed",
+                "1 egg",
+                "1 tsp vanilla extract",
+                "3/4 cup white chocolate chips",
+            ],
+            "steps": [
+                "Preheat oven to 350°F. Line a baking sheet with parchment.",
+                "Whisk flour, matcha, baking soda, and salt together.",
+                "Beat butter with both sugars until light and fluffy, 2–3 minutes.",
+                "Beat in egg and vanilla.",
+                "Stir in flour mixture until just combined. Fold in white chocolate chips.",
+                "Scoop tablespoon-sized balls onto the prepared sheet, spacing 2 inches apart.",
+                "Bake 10–12 minutes until edges are set but centers look slightly underdone. Cool on pan 5 minutes before transferring.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Cookies",
+                "subtitle": "chewy matcha cookies with melty white chocolate",
+                "extras": ["Flaky sea salt", "Extra white chocolate chips pressed in after baking"],
+                "steps": [
+                    "Press a few extra white chocolate chips into the warm cookies right out of the oven.",
+                    "Sprinkle with a pinch of flaky sea salt while still warm.",
+                    "Cool completely or eat slightly warm, both are great.",
+                ],
+                "tip": "Don't overbake, the pale green color makes it hard to see browning. Pull them out while the centers still look wet.",
+            },
+            {
+                "name": "Ice Cream Sandwiches",
+                "subtitle": "two cookies sandwiched around vanilla or red bean ice cream",
+                "extras": ["Vanilla or red bean ice cream", "Sprinkles or chopped pistachios"],
+                "steps": [
+                    "Let cookies cool completely. Scoop a small ball of ice cream onto the flat side of one cookie.",
+                    "Press a second cookie gently on top. Roll the exposed ice cream edge in sprinkles or pistachios.",
+                    "Freeze on parchment 30 minutes until firm. Wrap individually and freeze up to 1 week.",
+                ],
+                "tip": "Red bean ice cream is the classic pairing, the earthiness complements matcha perfectly.",
+            },
+            {
+                "name": "Cookie Crumble Parfait",
+                "subtitle": "crumbled cookies layered with whipped cream and sliced strawberries",
+                "extras": ["Whipped cream", "Fresh strawberries", "Matcha powder for dusting"],
+                "steps": [
+                    "Crumble 2–3 cookies into chunks.",
+                    "Layer in a glass: whipped cream, cookie crumbles, sliced strawberries. Repeat.",
+                    "Dust lightly with matcha powder and serve immediately.",
+                ],
+                "tip": "The strawberry-matcha-white chocolate combination is one of those flavor combos that always works.",
+            },
+        ],
+    },
+    {
+        "_id": "vietnamese-coffee-brownies",
+        "_keywords": ["coffee", "brownies", "vietnamese", "condensed milk", "chocolate", "dessert", "fudgy", "ca phe"],
+        "image": "/static/images/vietnamese-coffee-brownies.jpg",
+        "intro": "Rich, fudgy brownies infused with the bold flavors of Vietnamese coffee, dark espresso and sweetened condensed milk baked into every bite, with a crackly top and a dense, caramel-sweet interior.",
+        "base": {
+            "title": "Vietnamese Coffee Sweetened Condensed Milk Brownies",
+            "ingredients": [
+                "1/2 cup (1 stick) unsalted butter",
+                "4 oz dark chocolate (70%), chopped",
+                "3/4 cup sweetened condensed milk",
+                "2 tbsp instant espresso powder (or very strong brewed coffee, reduced)",
+                "2 eggs",
+                "1 tsp vanilla extract",
+                "1/2 cup all-purpose flour",
+                "1/4 cup unsweetened cocoa powder",
+                "1/4 tsp salt",
+                "1/2 cup dark chocolate chips",
+            ],
+            "steps": [
+                "Preheat oven to 325°F. Line an 8×8 pan with parchment.",
+                "Melt butter and chopped chocolate together in a heatproof bowl over simmering water (or microwave in 30-second bursts). Stir smooth.",
+                "Whisk condensed milk and espresso powder into the chocolate mixture until combined.",
+                "Beat in eggs one at a time, then vanilla.",
+                "Fold in flour, cocoa powder, and salt until just combined. Fold in chocolate chips.",
+                "Pour into pan. Bake 28–32 minutes until edges are set and center has a slight wobble.",
+                "Cool completely before cutting, these are fudgier than standard brownies.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Brownies",
+                "subtitle": "sliced into squares with a dusting of cocoa powder",
+                "extras": ["Flaky sea salt", "Cocoa powder dusting", "Condensed milk drizzle"],
+                "steps": [
+                    "Chill the pan in the fridge 1 hour for the cleanest cuts.",
+                    "Slice with a sharp knife, wiping between cuts.",
+                    "Dust with cocoa powder or drizzle with a thin stream of condensed milk.",
+                ],
+                "tip": "These are better the next day once fully set, make them the night before for optimal fudginess.",
+            },
+            {
+                "name": "Vietnamese Coffee Brownie Sundae",
+                "subtitle": "warm brownie topped with vanilla ice cream and a condensed milk drizzle",
+                "extras": ["Vanilla ice cream", "Condensed milk", "Toasted coconut"],
+                "steps": [
+                    "Warm a brownie square 20–30 seconds in the microwave.",
+                    "Top with a generous scoop of vanilla ice cream.",
+                    "Drizzle with condensed milk and scatter toasted coconut.",
+                ],
+                "tip": "The condensed milk drizzle is the move here, it ties back to the Vietnamese coffee flavor that's baked into the brownie.",
+            },
+            {
+                "name": "Brownie Affogato",
+                "subtitle": "warm brownie crumbles with a shot of espresso poured over vanilla ice cream",
+                "extras": ["Vanilla ice cream", "1 shot espresso", "Brownie crumbles"],
+                "steps": [
+                    "Crumble a brownie into the bottom of a small glass.",
+                    "Add a scoop of vanilla ice cream on top.",
+                    "Pour a hot shot of espresso over the ice cream. Serve immediately.",
+                ],
+                "tip": "The brownie absorbs the espresso as it melts, it turns into a deeply chocolatey, caffeinated puddle at the bottom of the glass.",
+            },
+        ],
+    },
+    # ── French (new) ─────────────────────────────────────────────────────────
+    {
+        "_id": "french-cucumber-salad",
+        "_keywords": ["french", "cucumber", "creme fraiche", "salad", "lunch", "light", "herbs"],
+        "image": "/static/images/cucumber-salad.jpg",
+        "servings": 6,
+        "calories_per_serving": 63,
+        "intro": "A cool, creamy French cucumber salad dressed with crème fraîche, fresh dill, and a touch of Dijon, simple, elegant, and ready in 10 minutes.",
+        "base": {
+            "title": "Cucumber Salad with Crème Fraîche",
+            "ingredients": [
+                "2 large English cucumbers, thinly sliced",
+                "1 tsp salt (for drawing out moisture)",
+                "½ cup crème fraîche",
+                "1 tbsp Dijon mustard",
+                "2 tbsp fresh dill, chopped",
+                "1 tbsp fresh chives, chopped",
+                "1 tbsp white wine vinegar or lemon juice",
+                "1 tsp sugar",
+                "Salt and white pepper",
+                "Extra dill to garnish",
+            ],
+            "steps": [
+                "Toss cucumber slices with 1 tsp salt; let sit 15 minutes. Pat very dry with paper towels.",
+                "Whisk crème fraîche, Dijon, vinegar, sugar, dill, and chives together.",
+                "Fold cucumber into the dressing; toss gently.",
+                "Refrigerate at least 20 minutes before serving, it improves as it chills.",
+                "Taste and adjust salt; garnish with extra dill.",
+            ],
+            "tip": "Salting and drying the cucumber is the most important step, it prevents the dressing from becoming watery.",
+        },
+        "uses": [
+            {
+                "name": "Classic Cucumber Crème Fraîche Salad",
+                "subtitle": "with fresh dill and chives, served chilled",
+                "extras": ["Extra dill", "Thinly sliced radish", "Crusty bread alongside"],
+                "steps": [
+                    "Serve well chilled with a garnish of extra dill and a few radish slices for color.",
+                    "Great alongside smoked salmon or grilled fish.",
+                ],
+                "tip": "This salad is best made 1–2 hours ahead, the flavors meld beautifully.",
+            },
+            {
+                "name": "Cucumber Salad with Smoked Salmon",
+                "subtitle": "topped with smoked salmon for an elegant lunch",
+                "extras": ["4 oz smoked salmon", "Capers", "Thinly sliced red onion", "Rye bread or blinis"],
+                "steps": [
+                    "Arrange cucumber salad on a platter.",
+                    "Drape smoked salmon over the top; scatter capers and red onion.",
+                    "Serve with rye bread or blinis.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "french-potato-bean-salad",
+        "_keywords": ["french", "potato", "green beans", "salad", "dinner", "dijon", "vinaigrette", "side"],
+        "image": "/static/images/French-Style-Potato.jpg",
+        "intro": "A classic French potato and green bean salad, waxy potatoes and crisp-tender haricots verts in a sharp Dijon vinaigrette with shallots and fresh herbs. Better warm or at room temperature than cold.",
+        "base": {
+            "title": "French-Style Potato and Green Bean Salad",
+            "ingredients": [
+                "1.5 lbs small waxy potatoes (fingerling or new potatoes), halved",
+                "12 oz green beans (haricots verts), trimmed",
+                "2 shallots, finely minced",
+                "2 tbsp capers (optional)",
+                "Dijon vinaigrette: 2 tbsp Dijon mustard, 2 tbsp red wine vinegar, 1 tsp honey, 5 tbsp olive oil, salt and pepper, whisked together",
+                "2 tbsp fresh flat-leaf parsley, chopped",
+                "2 tbsp fresh tarragon or chives, chopped",
+            ],
+            "steps": [
+                "Boil potatoes in salted water 12–15 minutes until just tender; drain.",
+                "While potatoes cook, blanch green beans 3–4 minutes until bright and crisp-tender; shock in ice water.",
+                "Whisk vinaigrette until emulsified.",
+                "Toss warm potatoes with vinaigrette and shallots immediately, they absorb the dressing better warm.",
+                "Add green beans and capers; toss gently.",
+                "Finish with fresh herbs; taste and adjust seasoning.",
+            ],
+            "tip": "Dress the potatoes while they're still warm, they soak up the vinaigrette completely, which is the whole point.",
+        },
+        "uses": [
+            {
+                "name": "French Potato & Green Bean Salad",
+                "subtitle": "with Dijon vinaigrette and fresh tarragon",
+                "extras": ["Extra Dijon vinaigrette", "Hard-boiled eggs, quartered", "Extra herbs"],
+                "steps": [
+                    "Serve at room temperature alongside hard-boiled eggs.",
+                    "Drizzle extra vinaigrette just before serving.",
+                ],
+                "tip": "This is best at room temperature, not cold from the fridge.",
+            },
+            {
+                "name": "Potato & Bean Salad with Niçoise Toppings",
+                "subtitle": "expanded into a full niçoise-style composed salad",
+                "extras": ["Tuna (canned or seared)", "Olives", "Cherry tomatoes", "Anchovy fillets"],
+                "steps": [
+                    "Arrange potato-bean salad on a large platter.",
+                    "Top with tuna, olives, cherry tomatoes, and anchovy fillets.",
+                    "Drizzle extra vinaigrette over everything.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "quiche-lorraine",
+        "_keywords": ["french", "quiche", "lorraine", "bacon", "gruyere", "egg", "tart", "lunch", "breakfast", "brunch"],
+        "image": "/static/images/Classic-French-Quiche.jpg",
+        "intro": "The definitive Quiche Lorraine, a buttery shortcrust shell filled with a silky egg custard, smoky lardons, and nutty Gruyère. Equally good warm from the oven or cold from the fridge.",
+        "base": {
+            "title": "Quiche Lorraine",
+            "ingredients": [
+                "Shortcrust pastry: 1¼ cups (160g) flour, ½ cup (115g) cold butter, ¼ tsp salt, 3–4 tbsp ice water, worked into dough, chilled 30 min",
+                "200g smoked lardons or thick-cut bacon, chopped",
+                "1 cup (100g) Gruyère, grated",
+                "3 large eggs",
+                "1 cup (240ml) heavy cream",
+                "½ cup (120ml) whole milk",
+                "Pinch of nutmeg",
+                "Salt and white pepper",
+            ],
+            "steps": [
+                "Make pastry: pulse flour, salt, and butter until sandy; add ice water 1 tbsp at a time until dough holds. Flatten, wrap, chill 30 minutes.",
+                "Roll pastry into a 12-inch circle; press into a 9-inch tart pan. Prick base; freeze 15 minutes.",
+                "Blind bake at 375°F (190°C) with pie weights for 15 minutes; remove weights and bake 5 more minutes.",
+                "Cook lardons until lightly browned but not crispy; drain.",
+                "Whisk eggs, cream, milk, nutmeg, salt, and pepper together.",
+                "Scatter lardons and ¾ of the cheese in the tart shell. Pour custard over; top with remaining cheese.",
+                "Bake 30–35 minutes until just set with a slight wobble in the center. Cool 15 minutes before slicing.",
+            ],
+            "tip": "The quiche is done when the center wobbles like just-set jelly, it firms up as it cools. Overbaking gives you a rubbery custard.",
+        },
+        "uses": [
+            {
+                "name": "Classic Quiche Lorraine",
+                "subtitle": "warm with a simple green salad and Dijon vinaigrette",
+                "extras": ["Mixed greens", "Dijon vinaigrette", "Extra Gruyère"],
+                "steps": [
+                    "Serve a warm slice alongside a dressed green salad.",
+                    "Shave extra Gruyère over the top.",
+                ],
+                "tip": "Quiche keeps beautifully refrigerated for 4 days, reheat individual slices at 300°F for 10 minutes.",
+            },
+            {
+                "name": "Packed Lunch Quiche",
+                "subtitle": "served at room temperature with cornichons and mustard",
+                "extras": ["Cornichons", "Whole grain mustard", "Crusty baguette"],
+                "steps": [
+                    "Serve chilled or at room temperature.",
+                    "Pack with cornichons, a smear of whole grain mustard, and a slice of baguette.",
+                ],
+                "tip": "Cold quiche is a French picnic staple, it tastes just as good as warm.",
+            },
+        ],
+    },
+    {
+        "_id": "french-mac-and-cheese",
+        "_keywords": ["french", "macaroni", "cheese", "gratin", "bechamel", "gruyere", "dinner", "comfort"],
+        "image": "/static/images/French-Macaroni-Cheese.jpg",
+        "intro": "French macaroni au gratin, pasta baked in a silky béchamel with layers of Gruyère and Comté, finished under the broiler until deeply golden and bubbling. Richer and more refined than the American version.",
+        "base": {
+            "title": "French Macaroni au Gratin",
+            "ingredients": [
+                "12 oz macaroni or small rigatoni",
+                "Béchamel: 4 tbsp butter, ¼ cup (30g) flour, 2½ cups whole milk, ½ tsp nutmeg, salt and white pepper",
+                "1½ cups (150g) Gruyère, grated",
+                "½ cup (50g) Comté or Emmental, grated",
+                "¼ cup Parmesan, grated (for topping)",
+                "2 tbsp breadcrumbs (panko or fine)",
+                "1 tbsp butter, cut into small pieces",
+            ],
+            "steps": [
+                "Cook pasta 2 minutes less than package directions; drain and set aside.",
+                "Make béchamel: melt butter, whisk in flour, cook 1 minute. Gradually whisk in milk; simmer stirring until thick, 5 minutes. Season with nutmeg, salt, and pepper.",
+                "Remove from heat; stir in Gruyère and Comté until melted.",
+                "Fold pasta into cheese sauce; pour into a buttered baking dish.",
+                "Mix Parmesan and breadcrumbs; scatter over the top. Dot with butter.",
+                "Bake at 375°F for 20 minutes. Broil the last 3–4 minutes until deeply golden.",
+            ],
+            "tip": "Cook the pasta al dente, it continues cooking in the oven and will be perfectly tender in the finished gratin.",
+        },
+        "uses": [
+            {
+                "name": "Classic French Mac au Gratin",
+                "subtitle": "straight from the oven with a crispy golden top",
+                "extras": ["Extra Gruyère", "Simple green salad alongside"],
+                "steps": [
+                    "Serve straight from the baking dish; the crispy top is the best part.",
+                    "A simple butter-dressed green salad cuts through the richness.",
+                ],
+            },
+            {
+                "name": "Mac au Gratin with Lardons",
+                "subtitle": "with crispy bacon lardons folded into the sauce",
+                "extras": ["150g lardons or thick-cut bacon, cooked until crispy"],
+                "steps": [
+                    "Fold crispy lardons into the cheese sauce before adding pasta.",
+                    "Proceed with the gratin as normal.",
+                ],
+                "tip": "The smoky-salty lardons against the rich Gruyère béchamel is the classic Alsatian version.",
+            },
+        ],
+    },
+    {
+        "_id": "eggplant-tomato-gratin",
+        "_keywords": ["french", "eggplant", "tomato", "gratin", "provencal", "dinner", "vegetarian", "summer"],
+        "image": "/static/images/Eggplant-Gratin.jpg",
+        "intro": "A Provençal gratin of layered eggplant and tomatoes with herbes de Provence, olive oil, and Parmesan, baked until caramelized and tender. The south of France in one pan.",
+        "base": {
+            "title": "Provençal Eggplant & Tomato Gratin",
+            "ingredients": [
+                "2 medium eggplants, sliced into ¼-inch rounds",
+                "4 large ripe tomatoes, sliced into ¼-inch rounds",
+                "4 cloves garlic, thinly sliced",
+                "3 tbsp olive oil, plus more for drizzling",
+                "1½ tsp herbes de Provence",
+                "½ tsp dried thyme",
+                "Salt and pepper",
+                "½ cup Parmesan or Gruyère, grated",
+                "Fresh basil to finish",
+            ],
+            "steps": [
+                "Salt eggplant slices; rest 20 minutes. Pat dry.",
+                "Brush eggplant with olive oil; roast on a baking sheet at 400°F for 20 minutes, flipping halfway, until golden.",
+                "Oil a large baking dish. Layer alternating eggplant and tomato slices, overlapping slightly, with garlic slices tucked between.",
+                "Season with herbes de Provence, thyme, salt, pepper, and a generous drizzle of olive oil.",
+                "Scatter cheese over the top.",
+                "Bake at 375°F for 35–40 minutes until vegetables are tender and cheese is golden.",
+                "Finish with fresh basil.",
+            ],
+            "tip": "Roasting the eggplant first prevents a watery gratin, raw eggplant releases too much liquid in the oven.",
+        },
+        "uses": [
+            {
+                "name": "Provençal Eggplant Gratin",
+                "subtitle": "with fresh basil and crusty bread for a vegetarian dinner",
+                "extras": ["Fresh basil", "Crusty baguette", "Extra olive oil"],
+                "steps": [
+                    "Serve straight from the dish with fresh basil and baguette alongside.",
+                    "A drizzle of fruity olive oil over the top is worth it.",
+                ],
+            },
+            {
+                "name": "Gratin with Burrata",
+                "subtitle": "topped with fresh burrata for a luxurious finish",
+                "extras": ["2 balls fresh burrata", "Extra basil", "Flaky sea salt"],
+                "steps": [
+                    "Let the gratin cool 10 minutes out of the oven.",
+                    "Place burrata on top; tear it open. Scatter fresh basil and a pinch of flaky salt.",
+                ],
+                "tip": "Adding burrata at the end rather than baking it keeps it lush and creamy.",
+            },
+        ],
+    },
+    {
+        "_id": "french-apple-cake",
+        "_keywords": ["french", "apple", "cake", "dessert", "baked", "classic", "afternoon"],
+        "image": "/static/images/classic-french-apple-cake.jpg",
+        "servings": 8,
+        "calories_per_serving": 260,
+        "intro": "A classic French apple cake, dense with fruit, fragrant with rum and vanilla, and impossibly moist. More apple than cake, and all the better for it.",
+        "base": {
+            "title": "Classic French Apple Cake",
+            "ingredients": [
+                "4 large apples (about 1.5 lbs), peeled and cut into ¾-inch chunks",
+                "¾ cup (95g) all-purpose flour",
+                "¾ cup (150g) sugar, divided",
+                "1½ tsp baking powder",
+                "¼ tsp salt",
+                "2 large eggs",
+                "⅓ cup (75g) butter, melted and cooled",
+                "3 tbsp dark rum (or apple juice)",
+                "1 tsp vanilla extract",
+                "Powdered sugar for dusting",
+            ],
+            "steps": [
+                "Preheat oven to 350°F. Butter and flour a 9-inch cake pan.",
+                "Whisk flour, ½ cup sugar, baking powder, and salt together.",
+                "Whisk eggs, melted butter, rum, and vanilla. Fold into dry ingredients.",
+                "Fold in apple chunks, the batter will seem very apple-heavy; that's correct.",
+                "Spread into pan; sprinkle remaining ¼ cup sugar evenly over the top.",
+                "Bake 40–45 minutes until deep golden and a toothpick comes out clean.",
+                "Cool 15 minutes; dust with powdered sugar before serving.",
+            ],
+            "tip": "The ratio is intentionally more apple than batter, the apples are the star, not the cake. Don't be alarmed by how little batter there seems to be.",
+        },
+        "uses": [
+            {
+                "name": "Classic French Apple Cake",
+                "subtitle": "dusted with powdered sugar and served with crème fraîche",
+                "extras": ["Powdered sugar", "Crème fraîche or whipped cream"],
+                "steps": [
+                    "Dust with powdered sugar just before serving.",
+                    "Serve with a spoonful of crème fraîche on the side.",
+                ],
+                "tip": "This cake is best the day it's made, but holds well wrapped at room temperature for 2 days.",
+            },
+            {
+                "name": "Apple Cake with Calvados Cream",
+                "subtitle": "with whipped cream spiked with apple brandy",
+                "extras": ["½ cup heavy cream", "1 tbsp Calvados or apple brandy", "1 tsp sugar"],
+                "steps": [
+                    "Whip cream with Calvados and sugar to soft peaks.",
+                    "Serve a slice of warm cake with a generous dollop alongside.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "cherry-clafoutis",
+        "_keywords": ["french", "clafoutis", "cherry", "dessert", "baked", "custard", "summer", "classic"],
+        "image": "/static/images/Classic-French-Cherry-Clafoutis.jpg",
+        "intro": "Cherry clafoutis, the great French peasant dessert: fresh cherries baked in a silky, eggy batter somewhere between a flan and a thick crêpe. Effortless and stunning.",
+        "base": {
+            "title": "Classic French Cherry Clafoutis",
+            "ingredients": [
+                "1 lb (450g) fresh sweet cherries, pitted (or leave pits in, traditional style)",
+                "3 large eggs",
+                "½ cup (100g) sugar, divided",
+                "1 cup (240ml) whole milk",
+                "½ cup (120ml) heavy cream",
+                "½ cup (65g) all-purpose flour",
+                "1 tsp vanilla extract",
+                "1 tbsp kirsch or dark rum (optional)",
+                "Pinch of salt",
+                "Butter for the dish",
+                "Powdered sugar to finish",
+            ],
+            "steps": [
+                "Preheat oven to 375°F. Butter a 10-inch round baking dish or cast iron skillet generously.",
+                "Sprinkle 2 tbsp sugar over the buttered dish.",
+                "Blend or whisk eggs, remaining sugar, milk, cream, flour, vanilla, kirsch, and salt until smooth.",
+                "Arrange cherries in a single layer in the dish.",
+                "Pour batter over the cherries.",
+                "Bake 35–40 minutes until puffed, golden at the edges, and just set in the center with a slight wobble.",
+                "Cool 10 minutes, it will deflate slightly. Dust with powdered sugar and serve warm.",
+            ],
+            "tip": "Traditionally made with the pits in, they add an almond-like flavor to the batter. Warn your guests if you go traditional.",
+        },
+        "uses": [
+            {
+                "name": "Classic Cherry Clafoutis",
+                "subtitle": "dusted with powdered sugar, served warm",
+                "extras": ["Powdered sugar", "Crème fraîche or vanilla ice cream"],
+                "steps": [
+                    "Dust generously with powdered sugar right before serving.",
+                    "Serve warm with crème fraîche or a scoop of vanilla ice cream.",
+                ],
+                "tip": "Clafoutis is best served within an hour of baking, it loses its puff but the flavor stays wonderful.",
+            },
+            {
+                "name": "Stone Fruit Clafoutis",
+                "subtitle": "made with plums, apricots, or blackberries instead of cherries",
+                "extras": ["1 lb plums halved, or apricots, or 2 cups blackberries"],
+                "steps": [
+                    "Replace cherries with any stone fruit or berries, the batter and method are identical.",
+                    "Plums give the most flavor; apricots add a lovely tartness.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "french-chocolate-mousse",
+        "_keywords": ["french", "chocolate", "mousse", "dessert", "classic", "egg white", "rich", "airy"],
+        "image": "/static/images/Classic-French-Chocolate-Mousse.jpg",
+        "intro": "Classic French chocolate mousse, dark chocolate, egg yolks, whipped cream, and beaten egg whites folded together into something impossibly light yet deeply rich. No shortcuts, and worth every step.",
+        "base": {
+            "title": "Classic French Chocolate Mousse",
+            "ingredients": [
+                "200g (7 oz) dark chocolate (70%), chopped",
+                "4 large eggs, separated, at room temperature",
+                "2 tbsp sugar",
+                "1 tbsp unsalted butter",
+                "1 tbsp strong espresso or brewed coffee",
+                "Pinch of salt",
+                "½ cup (120ml) heavy cream, cold",
+                "Whipped cream and chocolate shavings to serve",
+            ],
+            "steps": [
+                "Melt chocolate with butter and espresso in a heatproof bowl over simmering water; stir until smooth. Cool to room temperature.",
+                "Whisk egg yolks one at a time into the cooled chocolate until combined.",
+                "Whip egg whites with a pinch of salt to soft peaks; add sugar and beat to stiff, glossy peaks.",
+                "In a separate bowl, whip heavy cream to soft peaks.",
+                "Fold whipped cream into chocolate mixture gently.",
+                "Fold egg whites into chocolate in 3 additions, keeping as much air as possible.",
+                "Divide into serving glasses or a large bowl. Refrigerate at least 2 hours.",
+            ],
+            "tip": "Use chocolate you'd happily eat on its own, the mousse is only as good as its chocolate. 70% gives the right intensity.",
+        },
+        "uses": [
+            {
+                "name": "Classic Chocolate Mousse",
+                "subtitle": "in individual glasses with whipped cream and chocolate shavings",
+                "extras": ["Extra whipped cream", "Chocolate shavings or cocoa powder", "Raspberries"],
+                "steps": [
+                    "Top each serving with a rosette of whipped cream and chocolate shavings.",
+                    "Add a few fresh raspberries for color and acidity.",
+                ],
+                "tip": "Make it a day ahead, the mousse sets more firmly overnight and the flavor deepens.",
+            },
+            {
+                "name": "Chocolate Mousse Tart",
+                "subtitle": "spooned into a pre-baked chocolate or butter tart shell",
+                "extras": ["1 pre-baked 9-inch tart shell (chocolate or plain shortcrust)", "Gold leaf or flaky sea salt"],
+                "steps": [
+                    "Pour the mousse into a fully cooled tart shell.",
+                    "Refrigerate 3 hours until set. Finish with a pinch of flaky salt or gold leaf.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "french-chocolate-moelleux",
+        "_keywords": ["french", "chocolate", "moelleux", "lava cake", "fondant", "dessert", "baked", "molten"],
+        "image": "/static/images/French-Chocolate-Moelleux.jpg",
+        "intro": "A classic French moelleux au chocolat, a dense, fudgy chocolate cake with a molten center that flows when you cut into it. The most dramatic dessert with only five ingredients.",
+        "base": {
+            "title": "French Chocolate Moelleux",
+            "ingredients": [
+                "200g (7 oz) dark chocolate (70%), chopped",
+                "150g (10 tbsp) unsalted butter",
+                "4 large eggs",
+                "4 large egg yolks",
+                "100g (½ cup) sugar",
+                "50g (⅓ cup) all-purpose flour",
+                "Pinch of salt",
+                "Butter and cocoa powder for the ramekins",
+                "Powdered sugar and vanilla ice cream to serve",
+            ],
+            "steps": [
+                "Melt chocolate and butter together until smooth; cool slightly.",
+                "Whisk eggs, egg yolks, and sugar vigorously until pale and slightly thickened, 3 minutes.",
+                "Fold chocolate mixture into the egg mixture.",
+                "Sift in flour and salt; fold until just combined.",
+                "Butter 6 ramekins and dust with cocoa powder; divide batter evenly.",
+                "Refrigerate at least 1 hour (up to 24 hours).",
+                "Bake at 425°F (220°C) for exactly 12 minutes, the edges are set but the center jiggles.",
+                "Rest 1 minute; run a knife around the edge and invert onto plates. Serve immediately.",
+            ],
+            "tip": "The timing is everything  12 minutes gives a flowing center. Your oven may need ±1 minute adjustment; do a test bake first.",
+        },
+        "uses": [
+            {
+                "name": "Classic Moelleux with Vanilla Ice Cream",
+                "subtitle": "turned out hot onto a plate with a scoop of ice cream",
+                "extras": ["Vanilla ice cream", "Powdered sugar", "Fresh raspberries"],
+                "steps": [
+                    "Invert ramekins onto warm plates immediately after resting.",
+                    "Dust with powdered sugar; add a scoop of ice cream alongside and a few raspberries.",
+                ],
+                "tip": "The contrast of hot molten cake and cold ice cream is the whole experience, don't let it sit.",
+            },
+            {
+                "name": "Moelleux with Salted Caramel",
+                "subtitle": "with a drizzle of warm salted caramel sauce",
+                "extras": ["½ cup sugar", "¼ cup heavy cream", "1 tbsp butter", "¼ tsp flaky sea salt, made into caramel"],
+                "steps": [
+                    "Make caramel: cook sugar until amber, add cream and butter off heat, stir in salt.",
+                    "Turn out the moelleux; drizzle warm caramel over and around it.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "apple-tarte-tatin",
+        "_keywords": ["apple", "tarte tatin", "french", "dessert", "caramel", "pastry", "upside-down", "puff pastry"],
+        "image": "/static/images/apple-tarte-tatin.jpg",
+        "intro": "A classic French upside-down caramelized apple tart, apples cooked in buttery caramel until jammy, then covered with pastry and baked until golden. Inverted at the table, served warm with crème fraîche or ice cream.",
+        "base": {
+            "title": "Classic French Apple Tarte Tatin",
+            "ingredients": [
+                "5–6 medium apples (Honeycrisp, Granny Smith, or Fuji), peeled, cored, halved",
+                "1/2 cup (1 stick) unsalted butter",
+                "3/4 cup granulated sugar",
+                "1 tsp vanilla extract",
+                "1/4 tsp cinnamon",
+                "Pinch of salt",
+                "1 sheet puff pastry, thawed (or homemade shortcrust)",
+                "Crème fraîche, whipped cream, or vanilla ice cream to serve",
+            ],
+            "steps": [
+                "Preheat oven to 400°F.",
+                "In a 10-inch oven-safe skillet, melt butter over medium heat. Add sugar and cook, without stirring, until it turns a deep amber caramel, 8–10 minutes.",
+                "Stir in vanilla, cinnamon, and salt.",
+                "Arrange apple halves cut-side up tightly in the caramel, packing them in, they shrink as they cook. Cook over medium heat 10–15 minutes until apples are softened and deeply golden underneath.",
+                "Roll puff pastry to just larger than the skillet. Drape over the apples, tucking the edges down around them.",
+                "Bake 20–25 minutes until pastry is deeply golden and puffed.",
+                "Cool in pan 10 minutes, then place a plate larger than the skillet on top and flip quickly. The apples will be on top. Serve warm.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Tarte Tatin",
+                "subtitle": "served warm with crème fraîche or vanilla ice cream",
+                "extras": ["Crème fraîche", "Vanilla ice cream", "Flaky sea salt"],
+                "steps": [
+                    "Invert the tart onto a plate while still warm.",
+                    "Serve immediately with a spoonful of cold crème fraîche or a scoop of vanilla ice cream.",
+                    "A pinch of flaky salt over the caramel apples is optional but excellent.",
+                ],
+                "tip": "Work quickly when inverting, caramel can seize and make the tart stick if it cools too much in the pan.",
+            },
+            {
+                "name": "Individual Tartlets",
+                "subtitle": "made in a muffin tin for single-serve portions",
+                "extras": ["Muffin tin", "Extra caramel sauce for serving"],
+                "steps": [
+                    "Make caramel directly in each muffin cup using a portable torch, or pour warm caramel into each cup.",
+                    "Add 2–3 apple wedges per cup. Cut pastry into circles to cover each.",
+                    "Bake at 400°F 18–20 minutes until golden. Invert onto a baking sheet while warm.",
+                ],
+                "tip": "Individual tartlets are easier to serve at a dinner party, no need to flip a large hot pan at the table.",
+            },
+            {
+                "name": "Tarte Tatin with Calvados",
+                "subtitle": "a splash of apple brandy adds depth to the caramel",
+                "extras": ["2 tbsp Calvados or apple brandy", "Whipped cream with a few drops of Calvados"],
+                "steps": [
+                    "Once the caramel has turned amber, carefully add 2 tbsp Calvados (it will bubble vigorously).",
+                    "Stir and proceed with the recipe as usual.",
+                    "Serve with whipped cream laced with a few drops of Calvados.",
+                ],
+                "tip": "Calvados is the traditional addition, it intensifies the apple flavor without making the tart taste boozy.",
+            },
+        ],
+    },
+    # ── Mexican (new) ────────────────────────────────────────────────────────
+    {
+        "_id": "mexican-taquitos",
+        "_keywords": ["mexican", "taquitos", "burritos", "quesadilla", "chicken", "air fryer", "lunch", "crispy"],
+        "image": "/static/images/taquitos.jpg",
+        "intro": "One spiced chicken-and-bean filling transforms into three crowd-pleasers, crispy rolled taquitos, stuffed burritos, or melty quesadillas. Prep the filling once and eat differently all week.",
+        "base": {
+            "title": "Spiced Chicken Filling",
+            "ingredients": [
+                "1.5 lbs cooked chicken, shredded (rotisserie works perfectly)",
+                "1 can (15 oz) black beans, drained",
+                "1 cup corn kernels",
+                "1 cup salsa",
+                "2 tsp cumin",
+                "1 tsp smoked paprika",
+                "1 tsp chili powder",
+                "Salt and pepper",
+                "1 cup shredded Mexican cheese blend",
+                "Small flour tortillas (for taquitos and quesadillas) and large flour tortillas (for burritos)",
+            ],
+            "steps": [
+                "Mix shredded chicken with beans, corn, salsa, cumin, paprika, chili powder, salt, and pepper.",
+                "Taste and adjust seasoning, it should be bold.",
+                "Use immediately for any of the three formats below, or refrigerate up to 4 days.",
+            ],
+            "tip": "Season the filling aggressively, it's the base for three different formats and needs to carry flavor in all of them.",
+        },
+        "uses": [
+            {
+                "name": "Crispy Air Fryer Taquitos",
+                "subtitle": "rolled and crisped in the air fryer with sour cream and guac",
+                "extras": ["Extra small flour or corn tortillas", "Sour cream", "Guacamole", "Hot sauce"],
+                "steps": [
+                    "Warm tortillas 20 seconds in microwave so they roll without cracking.",
+                    "Place 2 tbsp filling near one edge; roll tightly and secure with a toothpick.",
+                    "Air fry at 400°F for 8–10 minutes, turning halfway, until golden and crispy.",
+                    "Serve with sour cream, guacamole, and hot sauce.",
+                ],
+                "tip": "Spray taquitos lightly with cooking spray before air frying for an even crispier shell.",
+            },
+            {
+                "name": "Stuffed Burritos",
+                "subtitle": "filled, rolled, and toasted for a satisfying handheld meal",
+                "extras": ["Large flour tortillas", "Rice", "Shredded lettuce", "Sour cream", "Salsa"],
+                "steps": [
+                    "Layer rice, filling, lettuce, sour cream, and salsa in the center of a large tortilla.",
+                    "Fold sides in, then roll tightly from the bottom.",
+                    "Toast seam-side down in a dry skillet 2 minutes until golden.",
+                ],
+            },
+            {
+                "name": "Crispy Quesadillas",
+                "subtitle": "melted cheese and filling between toasted tortillas",
+                "extras": ["Extra cheese", "Sour cream", "Salsa", "Sliced avocado"],
+                "steps": [
+                    "Spread filling and extra cheese over half a large tortilla; fold closed.",
+                    "Cook in a dry skillet over medium heat 2–3 minutes per side until golden and cheese melts.",
+                    "Slice into wedges; serve with sour cream, salsa, and avocado.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "mexican-empanadas",
+        "_keywords": ["mexican", "empanada", "air fryer", "pastry", "lunch", "ground beef", "handheld"],
+        "image": "/static/images/empanada.jpg",
+        "intro": "Flaky golden empanadas filled with spiced beef, peppers, and cheese, air-fried for a crispy shell without the mess of deep frying. Great warm or at room temperature for packed lunches.",
+        "base": {
+            "title": "Air Fryer Mexican Empanadas",
+            "ingredients": [
+                "1 lb ground beef",
+                "1 small onion, finely diced",
+                "1 red bell pepper, finely diced",
+                "2 cloves garlic, minced",
+                "1 tsp cumin",
+                "1 tsp smoked paprika",
+                "½ tsp chili powder",
+                "2 tbsp tomato paste",
+                "Salt and pepper",
+                "½ cup shredded cheddar or Mexican blend",
+                "1 package (14 oz) refrigerated pie dough or empanada discs",
+                "1 egg, beaten (for egg wash)",
+            ],
+            "steps": [
+                "Brown ground beef with onion and garlic; drain excess fat.",
+                "Add bell pepper, cumin, paprika, chili powder, and tomato paste; cook 3 minutes. Cool.",
+                "Stir in cheese.",
+                "Place empanada discs on a clean surface; add 2 tbsp filling to the center of each.",
+                "Fold and crimp edges firmly with a fork to seal.",
+                "Brush with egg wash; air fry at 375°F for 12–14 minutes until deep golden.",
+            ],
+            "tip": "Don't overfill, a heaped tablespoon per disc is plenty. Overfilled empanadas burst at the seams.",
+        },
+        "uses": [
+            {
+                "name": "Classic Beef Empanadas",
+                "subtitle": "with chipotle sour cream and fresh salsa",
+                "extras": ["Sour cream + 1 tsp chipotle in adobo, blended", "Fresh tomato salsa", "Lime wedges"],
+                "steps": [
+                    "Mix sour cream with chipotle for a quick dipping sauce.",
+                    "Serve empanadas hot with chipotle sour cream and salsa.",
+                ],
+            },
+            {
+                "name": "Black Bean & Cheese Empanadas",
+                "subtitle": "vegetarian version with black beans and roasted corn",
+                "extras": ["1 can black beans, drained", "½ cup roasted corn", "1 cup Mexican cheese blend"],
+                "steps": [
+                    "Replace beef filling with mashed black beans, roasted corn, and cheese.",
+                    "Season well with cumin, paprika, and salt. Fill and cook as above.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "air-fryer-chicken-fajitas",
+        "_keywords": ["mexican", "chicken", "fajitas", "air fryer", "dinner", "peppers", "onions"],
+        "image": "/static/images/fajitas.jpg",
+        "intro": "Juicy fajita-spiced chicken strips with charred peppers and onions, all done in the air fryer in under 20 minutes. Serve in warm tortillas with all the fixings.",
+        "base": {
+            "title": "Air Fryer Chicken Fajitas",
+            "ingredients": [
+                "1.5 lbs boneless chicken breast or thighs, sliced into strips",
+                "2 bell peppers (mixed colors), sliced",
+                "1 large onion, sliced",
+                "Fajita seasoning: 2 tsp cumin, 1 tsp smoked paprika, 1 tsp chili powder, 1 tsp garlic powder, ½ tsp oregano, salt and pepper",
+                "2 tbsp olive oil",
+                "Warm flour or corn tortillas to serve",
+                "Toppings: sour cream, guacamole, salsa, shredded cheese, lime wedges",
+            ],
+            "steps": [
+                "Toss chicken, peppers, and onion with oil and fajita seasoning until evenly coated.",
+                "Air fry at 400°F for 15–18 minutes, shaking the basket halfway through.",
+                "Check chicken is cooked through; cook 2 more minutes if needed.",
+                "Serve in warm tortillas with all toppings.",
+            ],
+            "tip": "Don't overcrowd the air fryer basket, work in batches if needed so the chicken chars rather than steams.",
+        },
+        "uses": [
+            {
+                "name": "Chicken Fajita Wraps",
+                "subtitle": "in warm flour tortillas with guac, sour cream, and salsa",
+                "extras": ["Warm flour tortillas", "Guacamole", "Sour cream", "Salsa", "Shredded cheese"],
+                "steps": [
+                    "Warm tortillas in a dry pan or microwave.",
+                    "Layer chicken and vegetables; top with guacamole, sour cream, salsa, and cheese. Roll and serve.",
+                ],
+            },
+            {
+                "name": "Fajita Rice Bowl",
+                "subtitle": "over cilantro rice with black beans and pico de gallo",
+                "extras": ["Cilantro-lime rice", "Black beans", "Pico de gallo", "Lime wedges"],
+                "steps": [
+                    "Serve fajita chicken and vegetables over cilantro-lime rice.",
+                    "Add black beans and pico de gallo; squeeze lime over everything.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "mexican-salad",
+        "_keywords": ["mexican", "salad", "lunch", "fresh", "avocado", "corn", "black beans", "light"],
+        "image": "/static/images/Mexican-Salad.jpg",
+        "intro": "A bright, colorful Mexican salad with romaine, black beans, corn, avocado, and cherry tomatoes in a zesty lime-cilantro dressing, light, filling, and built for meal prep.",
+        "base": {
+            "title": "Mexican Salad",
+            "ingredients": [
+                "2 heads romaine lettuce, chopped",
+                "1 can (15 oz) black beans, drained and rinsed",
+                "1 cup corn kernels (grilled or from a can)",
+                "1 cup cherry tomatoes, halved",
+                "1 avocado, diced",
+                "½ red onion, thinly sliced",
+                "½ cup shredded cheddar or cotija",
+                "Handful of tortilla strips or crushed tortilla chips",
+                "Lime-cilantro dressing: 3 tbsp olive oil, juice of 2 limes, 1 tbsp honey, 1 tsp cumin, ¼ cup fresh cilantro, salt and pepper, blended",
+            ],
+            "steps": [
+                "Make dressing: blend all dressing ingredients until smooth.",
+                "In a large bowl combine lettuce, beans, corn, tomatoes, red onion, and cheese.",
+                "Add avocado just before serving to prevent browning.",
+                "Drizzle dressing over; toss gently.",
+                "Top with tortilla strips.",
+            ],
+            "tip": "Store dressing separately when meal prepping, dress only the portion you're eating that day.",
+        },
+        "uses": [
+            {
+                "name": "Classic Mexican Salad",
+                "subtitle": "tossed with lime-cilantro dressing and tortilla strips",
+                "extras": ["Extra lime wedges", "Hot sauce", "Extra cotija"],
+                "steps": [
+                    "Toss salad with dressing; top with tortilla strips, extra cotija, and a squeeze of lime.",
+                ],
+            },
+            {
+                "name": "Mexican Salad with Grilled Chicken",
+                "subtitle": "topped with fajita-spiced chicken for a complete meal",
+                "extras": ["1 lb chicken breast, seasoned with fajita spices and grilled", "Extra dressing"],
+                "steps": [
+                    "Grill or pan-cook seasoned chicken; slice on the bias.",
+                    "Serve over the Mexican salad; drizzle with extra dressing.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "mexican-molletes",
+        "_keywords": ["mexican", "molletes", "beans", "cheese", "toast", "bread", "dinner", "pico de gallo"],
+        "image": "/static/images/Mexican-Molletes.jpg",
+        "intro": "Mexican molletes, crusty bolillo rolls split and toasted, smothered in refried beans and melted cheese, then topped with fresh pico de gallo. Simple, satisfying, and deeply comforting.",
+        "base": {
+            "title": "Mexican Molletes",
+            "ingredients": [
+                "4 bolillo rolls (or ciabatta or French baguette), split lengthwise",
+                "1 can (16 oz) refried beans",
+                "2 cups shredded Oaxacan cheese, mozzarella, or Mexican blend",
+                "Pico de gallo: 3 ripe tomatoes diced, ½ white onion diced, 1 jalapeño minced, ¼ cup cilantro, juice of 1 lime, salt",
+                "Butter for the bread",
+                "Sliced jalapeño and hot sauce to serve",
+            ],
+            "steps": [
+                "Make pico de gallo: combine tomatoes, onion, jalapeño, cilantro, lime juice, and salt. Let sit 10 minutes.",
+                "Butter the cut sides of the rolls; toast in a skillet or oven until golden.",
+                "Spread a generous layer of refried beans over each toasted half.",
+                "Cover with shredded cheese.",
+                "Broil 3–4 minutes until cheese is bubbly and golden at the edges.",
+                "Top with a heaped spoonful of pico de gallo and serve immediately.",
+            ],
+            "tip": "The beans should be spread thick, they act as the sauce and keep the bread from getting dry under the broiler.",
+        },
+        "uses": [
+            {
+                "name": "Classic Molletes",
+                "subtitle": "beans, cheese, and fresh pico de gallo",
+                "extras": ["Extra pico de gallo", "Sliced jalapeño", "Hot sauce", "Sour cream"],
+                "steps": [
+                    "Serve hot from the broiler topped with a big scoop of fresh pico and hot sauce on the side.",
+                ],
+            },
+            {
+                "name": "Loaded Molletes",
+                "subtitle": "topped with guacamole, sour cream, and chorizo",
+                "extras": ["½ cup cooked chorizo crumbles", "Guacamole", "Sour cream", "Extra cilantro"],
+                "steps": [
+                    "Scatter cooked chorizo over the beans before adding cheese; broil as normal.",
+                    "Top with guacamole and sour cream alongside pico de gallo.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "taco-salad",
+        "_keywords": ["mexican", "taco salad", "ground beef", "lunch", "crispy shell", "cheese", "salsa"],
+        "image": "/static/images/Taco-Salad.jpg",
+        "intro": "A hearty taco salad with seasoned ground beef, romaine, cheese, black beans, and all the fixings over a bed of crushed tortilla chips, the best parts of a taco in salad form.",
+        "base": {
+            "title": "Taco Salad",
+            "ingredients": [
+                "1 lb ground beef (or turkey)",
+                "1 packet taco seasoning (or 2 tsp cumin, 1 tsp chili powder, 1 tsp garlic powder, 1 tsp paprika, salt)",
+                "1 can (15 oz) black beans, drained",
+                "2 heads romaine lettuce, chopped",
+                "1 cup cherry tomatoes, halved",
+                "1 cup corn kernels",
+                "1 avocado, diced",
+                "1 cup shredded cheddar",
+                "½ cup sour cream",
+                "½ cup salsa",
+                "2 cups tortilla chips, lightly crushed",
+                "Lime wedges to serve",
+            ],
+            "steps": [
+                "Brown ground beef; drain fat. Add taco seasoning and 2 tbsp water; cook 2 minutes.",
+                "In a large bowl, combine romaine, tomatoes, corn, beans, and cheese.",
+                "Add warm beef, diced avocado, and crushed chips.",
+                "Dollop sour cream and salsa over the top; squeeze lime. Toss gently and serve.",
+            ],
+            "tip": "Add chips right before serving, they soften quickly. For meal prep, keep them separate.",
+        },
+        "uses": [
+            {
+                "name": "Classic Taco Salad",
+                "subtitle": "with seasoned beef, cheddar, sour cream, and salsa",
+                "extras": ["Extra tortilla chips", "Jalapeño slices", "Hot sauce"],
+                "steps": [
+                    "Build the salad as above; serve with extra chips and hot sauce on the side.",
+                ],
+            },
+            {
+                "name": "Taco Salad Bowl with Cilantro-Lime Dressing",
+                "subtitle": "lighter, dressed version without sour cream",
+                "extras": ["3 tbsp olive oil", "Juice of 2 limes", "1 tbsp honey", "¼ cup cilantro, blended"],
+                "steps": [
+                    "Replace sour cream with the blended cilantro-lime dressing.",
+                    "Toss everything together and serve immediately.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "pulled-pork-sandwich-mx",
+        "_keywords": ["mexican", "pulled pork", "sandwich", "chipotle", "dinner", "slow cooker", "slaw"],
+        "image": "/static/images/Pulled-Pork-Sandwich.jpg",
+        "intro": "Chipotle-braised pulled pork piled high on a crusty roll with tangy slaw and pickled jalapeños, a Mexican-spiced twist on the classic pulled pork sandwich.",
+        "base": {
+            "title": "Mexican Pulled Pork",
+            "ingredients": [
+                "2.5 lbs pork shoulder (pork butt)",
+                "Spice rub: 2 tsp cumin, 2 tsp smoked paprika, 1 tsp chili powder, 1 tsp garlic powder, 1 tsp oregano, salt and pepper",
+                "2 chipotle peppers in adobo + 1 tbsp sauce",
+                "1 cup chicken broth",
+                "Juice of 1 orange",
+                "4 cloves garlic",
+                "Slaw: 2 cups shredded cabbage, juice of 1 lime, 1 tbsp mayo, salt",
+                "Crusty rolls or telera bread to serve",
+                "Pickled jalapeños and salsa to serve",
+            ],
+            "steps": [
+                "Rub pork all over with spice rub.",
+                "Place in slow cooker with chipotle peppers, adobo, broth, orange juice, and garlic.",
+                "Cook on low 8 hours or high 4–5 hours until fall-apart tender.",
+                "Shred pork and return to cooking juices.",
+                "Mix slaw: toss cabbage with lime juice, mayo, and salt.",
+                "Pile pulled pork onto toasted rolls; top with slaw and pickled jalapeños.",
+            ],
+            "tip": "Letting the shredded pork sit in its cooking juices 15 minutes before serving makes it much more flavorful and moist.",
+        },
+        "uses": [
+            {
+                "name": "Pulled Pork Sandwich",
+                "subtitle": "on a toasted roll with cabbage slaw and pickled jalapeños",
+                "extras": ["Crusty rolls, toasted", "Pickled jalapeños", "Extra salsa"],
+                "steps": [
+                    "Toast rolls; pile pork high. Top with slaw and jalapeños.",
+                ],
+            },
+            {
+                "name": "Pulled Pork Rice Bowl",
+                "subtitle": "over cilantro-lime rice with black beans and guacamole",
+                "extras": ["Cilantro-lime rice", "Black beans", "Guacamole", "Sour cream"],
+                "steps": [
+                    "Serve pulled pork over cilantro rice; add black beans and a big spoon of guacamole.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "mexican-chicken-soup",
+        "_keywords": ["mexican", "chicken", "soup", "black beans", "corn", "chipotle", "dinner", "hearty"],
+        "image": "/static/images/Chicken-Bean.jpg",
+        "intro": "A hearty Mexican chicken and black bean soup with corn, fire-roasted tomatoes, and chipotle, topped with avocado, sour cream, and crunchy tortilla strips. Meal-prep gold.",
+        "base": {
+            "title": "Mexican Chicken & Black Bean Soup",
+            "ingredients": [
+                "1.5 lbs boneless chicken breast or thighs",
+                "2 cans (15 oz each) black beans, drained",
+                "1 can (15 oz) fire-roasted tomatoes",
+                "1 cup corn kernels",
+                "1 chipotle pepper in adobo + 1 tsp sauce",
+                "1 onion, diced",
+                "4 cloves garlic, minced",
+                "1 tsp cumin",
+                "1 tsp smoked paprika",
+                "4 cups chicken broth",
+                "Juice of 1 lime",
+                "Salt and pepper",
+                "Toppings: avocado, sour cream, shredded cheese, tortilla strips, cilantro, lime",
+            ],
+            "steps": [
+                "Sauté onion in a large pot until soft; add garlic, cumin, and paprika; cook 1 minute.",
+                "Add chicken, tomatoes, chipotle, beans, corn, and broth.",
+                "Bring to a boil; reduce heat and simmer 20 minutes until chicken is cooked through.",
+                "Remove chicken; shred with forks. Return to the pot.",
+                "Add lime juice; taste and adjust seasoning.",
+                "Serve with all toppings on the side.",
+            ],
+            "tip": "This soup thickens as it sits, add a splash of broth when reheating to loosen it back up.",
+        },
+        "uses": [
+            {
+                "name": "Classic Mexican Chicken Soup",
+                "subtitle": "with avocado, sour cream, tortilla strips, and cilantro",
+                "extras": ["Avocado slices", "Sour cream", "Shredded cheese", "Tortilla strips", "Cilantro", "Lime"],
+                "steps": [
+                    "Ladle into deep bowls; load up with toppings and squeeze lime over everything.",
+                ],
+            },
+            {
+                "name": "Chicken Soup Taco Bowl",
+                "subtitle": "served over rice instead of as a soup",
+                "extras": ["Steamed rice", "Extra avocado", "Pico de gallo"],
+                "steps": [
+                    "Reduce broth amount to ½ cup to make a thick stew.",
+                    "Serve over steamed rice with avocado and pico de gallo.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "mexican-bean-salad",
+        "_keywords": ["mexican", "bean salad", "lunch", "black beans", "corn", "vegan", "fresh"],
+        "image": "/static/images/Mexican-Bean-Salad.jpg",
+        "intro": "A vibrant Mexican bean salad with black beans, kidney beans, corn, bell pepper, and red onion in a cumin-lime dressing, ready in 10 minutes and keeps for days.",
+        "base": {
+            "title": "Mexican Bean Salad",
+            "ingredients": [
+                "1 can (15 oz) black beans, drained and rinsed",
+                "1 can (15 oz) kidney beans, drained and rinsed",
+                "1 cup corn kernels",
+                "1 red bell pepper, finely diced",
+                "½ red onion, finely diced",
+                "1 jalapeño, minced (optional)",
+                "¼ cup fresh cilantro, chopped",
+                "Dressing: 3 tbsp olive oil, juice of 2 limes, 1 tsp cumin, 1 tsp honey, salt and pepper",
+            ],
+            "steps": [
+                "Whisk all dressing ingredients together until emulsified.",
+                "Combine beans, corn, bell pepper, onion, jalapeño, and cilantro in a large bowl.",
+                "Pour dressing over; toss well.",
+                "Refrigerate 30 minutes before serving, it gets better as it sits.",
+            ],
+            "tip": "This salad actually improves after a day in the fridge, the beans absorb the dressing and everything melds together.",
+        },
+        "uses": [
+            {
+                "name": "Mexican Bean Salad",
+                "subtitle": "on its own with tortilla chips for scooping",
+                "extras": ["Tortilla chips", "Extra lime", "Avocado chunks"],
+                "steps": [
+                    "Serve in a bowl with tortilla chips alongside for scooping.",
+                    "Add avocado chunks and extra lime just before serving.",
+                ],
+            },
+            {
+                "name": "Bean Salad Burrito Bowl",
+                "subtitle": "over cilantro-lime rice as a complete vegan meal",
+                "extras": ["Cilantro-lime rice", "Guacamole", "Sour cream or vegan yogurt"],
+                "steps": [
+                    "Serve the bean salad over a bowl of cilantro-lime rice.",
+                    "Top with guacamole and sour cream.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "pulled-pork-tacos",
+        "_keywords": ["mexican", "pulled pork", "tacos", "chipotle", "dinner", "tortillas", "slaw"],
+        "image": "/static/images/Pulled-Pork-Tacos.jpg",
+        "servings": 8,
+        "calories_per_serving": 223,
+        "intro": "Slow-cooked chipotle pulled pork piled into warm corn tortillas with pickled red onion, slaw, and a squeeze of lime, the taco that makes everyone happy.",
+        "base": {
+            "title": "Pulled Pork Tacos",
+            "ingredients": [
+                "2.5 lbs pork shoulder (pork butt)",
+                "Spice rub: 2 tsp cumin, 2 tsp smoked paprika, 1 tsp chili powder, 1 tsp garlic powder, 1 tsp oregano, salt and pepper",
+                "2 chipotle peppers in adobo + 1 tbsp sauce",
+                "1 cup chicken broth",
+                "Juice of 1 orange and 1 lime",
+                "Corn or flour tortillas",
+                "Quick-pickled red onion: thin-sliced red onion soaked in lime juice + salt 20 minutes",
+                "Cabbage slaw: shredded cabbage + lime juice + salt",
+                "Toppings: salsa verde, cotija, cilantro, lime wedges, avocado",
+            ],
+            "steps": [
+                "Rub pork all over with spice rub.",
+                "Slow cook with chipotle, adobo, broth, orange juice, and lime juice on low 8 hours or high 4–5 hours.",
+                "Shred pork; return to juices.",
+                "Warm tortillas in a dry skillet or over a gas flame.",
+                "Build tacos: pork, slaw, pickled onion, salsa verde, cotija, and cilantro.",
+                "Squeeze lime over and serve.",
+            ],
+            "tip": "Double tortillas per taco, street-taco style, prevents them tearing under the weight of the filling.",
+        },
+        "uses": [
+            {
+                "name": "Classic Pulled Pork Tacos",
+                "subtitle": "with pickled red onion, slaw, cotija, and salsa verde",
+                "extras": ["Salsa verde", "Cotija cheese", "Cilantro", "Extra lime wedges", "Avocado"],
+                "steps": [
+                    "Warm tortillas; layer pork, slaw, pickled onion, and all toppings.",
+                    "Serve with salsa verde and lime wedges.",
+                ],
+            },
+            {
+                "name": "Pulled Pork Taco Platter",
+                "subtitle": "a spread, all components served separately for everyone to build their own",
+                "extras": ["All toppings in separate bowls", "Extra salsa, guac, and hot sauce"],
+                "steps": [
+                    "Set out pulled pork, tortillas, and all toppings in separate bowls.",
+                    "Let everyone build their own tacos.",
+                ],
+                "tip": "The DIY platter format is perfect for hosting, everything can be prepped ahead.",
+            },
+        ],
+    },
+    {
+        "_id": "mexican-steak-sandwich",
+        "_keywords": ["mexican", "steak", "sandwich", "dinner", "grilled", "chipotle", "peppers"],
+        "image": "/static/images/Steak-Sandwich.jpg",
+        "intro": "A grilled Mexican-spiced steak sandwich with chipotle mayo, roasted peppers, and caramelized onions on a toasted crusty roll, bold, satisfying, and ready in 30 minutes.",
+        "base": {
+            "title": "Mexican Steak Sandwich",
+            "ingredients": [
+                "1.5 lbs skirt steak or flank steak",
+                "Marinade: 2 tbsp soy sauce, 1 tbsp lime juice, 1 tsp cumin, 1 tsp smoked paprika, 2 cloves garlic minced, 1 tbsp olive oil",
+                "2 bell peppers (mixed), sliced and roasted",
+                "1 large onion, sliced and caramelized",
+                "Chipotle mayo: ¼ cup mayonnaise + 1 chipotle in adobo, blended",
+                "4 crusty rolls (telera, ciabatta, or hoagie rolls)",
+                "Shredded lettuce, sliced avocado, and pickled jalapeños to serve",
+            ],
+            "steps": [
+                "Marinate steak at least 30 minutes.",
+                "Grill or pan-sear steak over high heat 3–4 minutes per side for medium-rare. Rest 5 minutes.",
+                "Caramelize onions in olive oil over medium-low heat 20 minutes.",
+                "Make chipotle mayo: blend mayo with chipotle pepper until smooth.",
+                "Slice steak thinly against the grain.",
+                "Toast rolls; spread chipotle mayo on both sides. Layer steak, peppers, onions, lettuce, avocado, and jalapeños.",
+            ],
+            "tip": "Always slice skirt and flank steak against the grain, it's the difference between tender and chewy.",
+        },
+        "uses": [
+            {
+                "name": "Classic Mexican Steak Sandwich",
+                "subtitle": "with chipotle mayo, roasted peppers, caramelized onions, and avocado",
+                "extras": ["Extra chipotle mayo", "Pickled jalapeños", "Extra avocado"],
+                "steps": [
+                    "Load the toasted roll generously with all components.",
+                    "Serve with pickled jalapeños on the side.",
+                ],
+            },
+            {
+                "name": "Steak & Pepper Burrito",
+                "subtitle": "same steak and peppers wrapped in a large flour tortilla",
+                "extras": ["Large flour tortillas", "Cilantro-lime rice", "Black beans", "Sour cream"],
+                "steps": [
+                    "Layer steak, peppers, onions, rice, beans, chipotle mayo, and sour cream in a large tortilla.",
+                    "Fold and roll tightly; toast seam-side down in a dry skillet.",
+                ],
+            },
+        ],
+    },
+    # ── Korean (new) ─────────────────────────────────────────────────────────
+    {
+        "_id": "gochujang-beef-kimchi",
+        "_keywords": ["korean", "beef", "kimchi", "gochujang", "salad", "lunch", "spicy"],
+        "image": "/static/images/beef-kimchi.jpg",
+        "servings": 4,
+        "calories_per_serving": 412,
+        "intro": "Spicy gochujang-marinated beef over a tangy kimchi salad with sesame and rice, a bold Korean lunch that comes together in 20 minutes and keeps well for meal prep.",
+        "base": {
+            "title": "Gochujang Beef & Kimchi Salad",
+            "ingredients": [
+                "1 lb ground beef or thinly sliced sirloin",
+                "Marinade: 2 tbsp gochujang, 1 tbsp soy sauce, 1 tbsp sesame oil, 1 tbsp honey, 2 cloves garlic minced",
+                "1 cup kimchi, roughly chopped",
+                "2 cups shredded cabbage or mixed greens",
+                "1 cup edamame, cooked",
+                "1 cucumber, sliced",
+                "Sesame dressing: 2 tbsp sesame oil, 1 tbsp rice vinegar, 1 tbsp soy sauce, 1 tsp honey",
+                "Sesame seeds and sliced green onion to garnish",
+                "Steamed rice to serve",
+            ],
+            "steps": [
+                "Toss beef with gochujang marinade.",
+                "Cook beef in a hot skillet over medium-high heat 4–5 minutes until cooked and slightly caramelized. Drain excess fat.",
+                "Whisk sesame dressing together.",
+                "In a large bowl, toss cabbage, kimchi, edamame, and cucumber with dressing.",
+                "Divide salad into bowls over rice. Top with gochujang beef.",
+                "Garnish with sesame seeds and green onion.",
+            ],
+            "tip": "The kimchi's natural sourness and the gochujang's heat balance the honey in the marinade, don't skip either.",
+        },
+        "uses": [
+            {
+                "name": "Gochujang Beef Kimchi Rice Bowl",
+                "subtitle": "over steamed rice with a fried egg on top",
+                "extras": ["Steamed rice", "1 fried egg per bowl", "Extra gochujang", "Sesame seeds"],
+                "steps": [
+                    "Serve the salad and beef over steamed rice.",
+                    "Top each bowl with a fried egg; add extra gochujang to taste.",
+                ],
+                "tip": "The runny yolk from the fried egg makes the whole bowl richer, it's worth the extra minute.",
+            },
+            {
+                "name": "Gochujang Beef Lettuce Wraps",
+                "subtitle": "in butter lettuce cups with kimchi and rice",
+                "extras": ["Butter lettuce leaves", "Extra kimchi", "Short-grain rice"],
+                "steps": [
+                    "Spoon a little rice, beef, and kimchi into each lettuce cup.",
+                    "Add a smear of extra gochujang and fold to eat.",
+                ],
+            },
+        ],
+    },
+    # ── Korean (new) ─────────────────────────────────────────────────────────
+    {
+        "_id": "kimchi-scrambled-eggs",
+        "_keywords": ["korean", "kimchi", "eggs", "breakfast", "brown rice", "high protein", "healthy"],
+        "image": "/static/images/kimchi-eggs.jpg",
+        "servings": 2,
+        "calories_per_serving": 220,
+        "intro": "Fluffy egg whites scrambled with tangy kimchi and served over brown rice, a bold, high-protein Korean breakfast ready in 10 minutes.",
+        "base": {
+            "title": "Kimchi Scrambled Eggs",
+            "ingredients": [
+                "Cooking spray",
+                "1 whole egg + 2 egg whites per person (or 4 egg whites)",
+                "½ cup kimchi, chopped",
+                "1 tsp sesame oil",
+                "1 tsp soy sauce",
+                "2 scallions, sliced",
+                "⅓ cup cooked brown rice per person",
+                "Salt and pepper",
+                "½ cup fresh fruit per person to serve",
+            ],
+            "steps": [
+                "Whisk eggs and egg whites with soy sauce and a pinch of pepper.",
+                "Heat a non-stick pan over medium; coat with cooking spray.",
+                "Add kimchi; stir-fry 1 minute until slightly caramelized.",
+                "Pour in eggs; fold gently until just set, still soft and custardy.",
+                "Drizzle sesame oil; scatter scallions.",
+                "Serve over warm brown rice with fresh fruit alongside.",
+            ],
+            "tip": "Using egg whites keeps this high-protein and light, the kimchi adds so much flavor you won't miss the yolks.",
+        },
+        "uses": [
+            {
+                "name": "Kimchi Scrambled Eggs Over Brown Rice",
+                "subtitle": "with sesame oil, scallions, and fresh fruit",
+                "extras": ["Sesame seeds", "Extra kimchi", "Sliced fruit"],
+                "steps": ["Serve over brown rice; scatter sesame seeds and serve fruit on the side."],
+                "tip": "Make a double batch of scrambled eggs and refrigerate, reheat gently for 2 days of easy breakfasts.",
+            },
+            {
+                "name": "Kimchi Egg Rice Bowl",
+                "subtitle": "with crispy rice, extra kimchi, and a drizzle of gochujang",
+                "extras": ["1 tsp gochujang", "Sesame seeds", "Nori strips"],
+                "steps": [
+                    "Press brown rice into the pan and let it crisp for 2–3 minutes.",
+                    "Top with scrambled eggs; drizzle with gochujang; scatter nori.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "korean-green-salad",
+        "_keywords": ["korean", "salad", "greens", "bulgogi", "chicken", "lunch", "light", "pear", "dressing"],
+        "image": "/static/images/green.jpg",
+        "intro": "Fresh greens, cucumber, pear, and red onion with bulgogi chicken and a bright sesame-soy Korean dressing, a crisp, satisfying lunch that comes together in minutes.",
+        "base": {
+            "title": "Korean Green Salad with Bulgogi Chicken",
+            "ingredients": [
+                "6 oz chicken breast, thinly sliced",
+                "2 tbsp soy sauce",
+                "1 tbsp sesame oil",
+                "1 tsp gochujang",
+                "1 tsp honey",
+                "1 tsp garlic, minced",
+                "4 cups mixed greens",
+                "½ English cucumber, thinly sliced",
+                "1 ripe pear, thinly sliced",
+                "¼ red onion, thinly sliced",
+                "Korean dressing: 2 tbsp rice vinegar, 1 tbsp soy sauce, 1 tsp sesame oil, 1 tsp honey, ½ tsp gochujang, whisked together",
+                "Sesame seeds to garnish",
+            ],
+            "steps": [
+                "Marinate chicken in soy sauce, sesame oil, gochujang, honey, and garlic for 15 minutes.",
+                "Sear chicken in a hot pan 3–4 minutes per side until cooked through; rest and slice.",
+                "Whisk dressing ingredients together.",
+                "Arrange greens, cucumber, pear, and red onion in bowls.",
+                "Top with bulgogi chicken; drizzle dressing over; scatter sesame seeds.",
+            ],
+            "tip": "Slice the pear and cucumber just before serving, both oxidize and soften if prepped too far ahead.",
+        },
+        "uses": [
+            {
+                "name": "Korean Green Salad with Bulgogi Chicken",
+                "subtitle": "with pear, cucumber, and Korean sesame dressing",
+                "extras": ["Extra sesame seeds", "Crispy wonton strips", "Extra gochujang dressing"],
+                "steps": ["Assemble and dress just before serving for maximum crunch."],
+            },
+            {
+                "name": "Korean Grain Bowl",
+                "subtitle": "served over brown rice or quinoa instead of greens",
+                "extras": ["½ cup cooked brown rice or quinoa per person", "Shredded cabbage", "Pickled radish"],
+                "steps": [
+                    "Swap greens for a base of brown rice or quinoa.",
+                    "Arrange toppings over the grain; dress generously.",
+                ],
+                "tip": "The grain version keeps better for meal prep, dress just before eating.",
+            },
+        ],
+    },
+    {
+        "_id": "kongnamul-guk",
+        "_keywords": ["korean", "soup", "soybean sprout", "shrimp", "zucchini", "brown rice", "light", "dinner"],
+        "image": "/static/images/soybean.jpg",
+        "servings": 4,
+        "calories_per_serving": 69,
+        "intro": "Kongnamul Guk, a clean, deeply warming Korean soybean sprout soup with shrimp, served alongside sautéed zucchini, brown rice, and tangy pickled radish.",
+        "base": {
+            "title": "Kongnamul Guk (Soybean Sprout Soup)",
+            "ingredients": [
+                "3 cups soybean sprouts, rinsed",
+                "6 oz shrimp, peeled and deveined",
+                "4 cups water or light anchovy stock",
+                "3 cloves garlic, minced",
+                "1 tbsp soy sauce",
+                "1 tsp sesame oil",
+                "½ tsp Korean red pepper flakes (gochugaru)",
+                "2 scallions, sliced",
+                "1 medium zucchini, sliced into half-moons",
+                "1 tsp sesame oil (for zucchini)",
+                "⅓ cup cooked brown rice per person",
+                "Danmuji (pickled radish) to serve",
+                "Salt",
+            ],
+            "steps": [
+                "Bring stock to a boil; add soybean sprouts and garlic. Simmer 5 minutes.",
+                "Add shrimp; cook 2–3 minutes until pink.",
+                "Season with soy sauce, gochugaru, and salt; simmer 1 more minute.",
+                "Sauté zucchini in sesame oil over high heat 3–4 minutes until lightly golden; season with salt.",
+                "Finish soup with sesame oil and scallions.",
+                "Serve soup alongside brown rice, sautéed zucchini, and pickled radish.",
+            ],
+            "tip": "Don't cover the pot while cooking soybean sprouts, the lid traps a compound that makes them smell off. Always cook uncovered for the first few minutes.",
+        },
+        "uses": [
+            {
+                "name": "Kongnamul Guk with Shrimp",
+                "subtitle": "served alongside sautéed zucchini, brown rice, and pickled radish",
+                "extras": ["Extra gochugaru", "Kimchi", "Nori sheets"],
+                "steps": ["Ladle soup into bowls; serve with rice, zucchini, and danmuji alongside."],
+                "tip": "The soup is even better the next day, the flavors deepen as it sits.",
+            },
+            {
+                "name": "Kongnamul Guk with Tofu",
+                "subtitle": "vegetarian version with silken tofu instead of shrimp",
+                "extras": ["6 oz silken tofu, cubed", "Extra sesame oil", "Extra scallions"],
+                "steps": [
+                    "Replace shrimp with silken tofu, add it in the last 2 minutes so it stays soft.",
+                    "Use vegetable stock instead of anchovy stock.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "korean-mushroom-pancakes",
+        "_keywords": ["korean", "pancakes", "mushroom", "haemul pajeon", "breakfast", "whole wheat", "savory"],
+        "image": "/static/images/korean-pan.jpg",
+        "intro": "Savory Korean mushroom pancakes made with whole wheat flour, crispy at the edges, chewy in the middle, packed with mushrooms and scallions, served with a soy dipping sauce.",
+        "base": {
+            "title": "Korean Mushroom Pancakes",
+            "ingredients": [
+                "1 cup whole wheat flour",
+                "¾ cup cold water",
+                "1 egg",
+                "½ tsp salt",
+                "2 cups mushrooms (shiitake, oyster, or button), thinly sliced",
+                "3 scallions, cut into 2-inch pieces",
+                "1 clove garlic, minced",
+                "Cooking spray",
+                "Dipping sauce: 2 tbsp soy sauce, 1 tbsp rice vinegar, ½ tsp sesame oil, ½ tsp gochugaru, whisked together",
+                "Fresh fruit (½ cup or 1 small piece) to serve",
+            ],
+            "steps": [
+                "Whisk flour, water, egg, and salt until a smooth batter forms.",
+                "Stir in mushrooms, scallions, and garlic.",
+                "Heat a non-stick pan over medium-high; coat well with cooking spray.",
+                "Pour in half the batter; spread to a thin round. Cook 3–4 minutes until edges set and bottom is golden.",
+                "Flip; cook 2–3 minutes more until golden and cooked through.",
+                "Repeat with remaining batter.",
+                "Serve with dipping sauce and fresh fruit alongside.",
+            ],
+            "tip": "Cold water makes the batter lighter, room temperature batter produces denser pancakes.",
+        },
+        "uses": [
+            {
+                "name": "Korean Mushroom Pancakes with Soy Dipping Sauce",
+                "subtitle": "with fresh fruit for a savory-sweet breakfast",
+                "extras": ["Extra scallions", "Sesame seeds", "Extra dipping sauce"],
+                "steps": ["Slice pancakes into wedges; serve with dipping sauce and fruit."],
+                "tip": "Make the full batch and refrigerate, reheat in a dry pan to restore the crispness.",
+            },
+            {
+                "name": "Mushroom Pancakes with Egg",
+                "subtitle": "topped with a fried egg for extra protein",
+                "extras": ["1 egg per person, fried sunny-side up"],
+                "steps": [
+                    "Fry egg in cooking spray to sunny-side up.",
+                    "Place on top of the hot pancake; the yolk becomes a sauce.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "chicken-ginseng-soup",
+        "_keywords": ["korean", "samgyetang", "chicken", "ginseng", "soup", "multigrain rice", "dinner", "restorative"],
+        "image": "/static/images/ginseng.jpg",
+        "intro": "A simplified Samgyetang-inspired chicken ginseng soup, a deeply nourishing, gently flavored broth with tender chicken, served with multigrain rice and vegetable side dishes.",
+        "base": {
+            "title": "Chicken Ginseng Soup",
+            "ingredients": [
+                "1 whole small chicken or 4 bone-in thighs (skin removed)",
+                "6 cups water",
+                "4 dried jujubes (Korean red dates)",
+                "2 tbsp dried ginseng slices (or 1 ginseng tea bag)",
+                "6 cloves garlic",
+                "1 cup glutinous rice or multigrain rice, rinsed",
+                "2 scallions, sliced",
+                "Salt and white pepper",
+                "Kimchi to serve",
+                "Assorted vegetable side dishes (spinach, bean sprouts, or radish) to serve",
+            ],
+            "steps": [
+                "Combine chicken, water, jujubes, ginseng, and garlic in a pot; bring to a boil.",
+                "Skim any foam; add rice. Reduce heat to low and simmer covered 45 minutes.",
+                "Shred chicken from bones; return meat to pot.",
+                "Season generously with salt and white pepper.",
+                "Serve in deep bowls topped with scallions, with multigrain rice, kimchi, and vegetable sides.",
+            ],
+            "tip": "If you can't find ginseng, omit it, the soup is still wonderfully restorative with just the garlic and jujubes. The rice thickens the broth into something silky.",
+        },
+        "uses": [
+            {
+                "name": "Chicken Ginseng Soup with Multigrain Rice",
+                "subtitle": "with kimchi and steamed vegetable side dishes",
+                "extras": ["Extra garlic", "Kimchi", "Sesame oil drizzle"],
+                "steps": [
+                    "Serve soup with a separate bowl of multigrain rice.",
+                    "Arrange kimchi and vegetable sides on the table.",
+                ],
+                "tip": "This soup is the ultimate make-ahead, refrigerate and the broth becomes even richer. Skim the fat that solidifies on top.",
+            },
+            {
+                "name": "Leftover Chicken & Rice Porridge",
+                "subtitle": "thinned to a congee-style rice porridge",
+                "extras": ["Extra water or stock", "Sesame oil", "Sliced scallions", "Gochugaru"],
+                "steps": [
+                    "Add extra water or stock to leftover soup; simmer until the rice breaks down into porridge.",
+                    "Top with sesame oil, scallions, and gochugaru.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "bulgogi-steamed-eggplant",
+        "_keywords": ["korean", "bulgogi", "beef", "eggplant", "dinner", "lettuce wraps", "brown rice", "lean"],
+        "image": "/static/images/bulgogi-eggplant.jpg",
+        "servings": 4,
+        "calories_per_serving": 280,
+        "intro": "Lean bulgogi beef and silky Korean steamed eggplant, served in lettuce cups over brown rice, a light, beautifully balanced Korean dinner.",
+        "base": {
+            "title": "Bulgogi with Korean Steamed Eggplant",
+            "ingredients": [
+                "3 oz lean beef (sirloin or eye of round) per person, very thinly sliced",
+                "Bulgogi marinade: 2 tbsp soy sauce, 1 tbsp sesame oil, 1 tbsp honey, 1 tsp garlic minced, 1 tsp ginger, 1 tbsp pear or apple juice",
+                "2 medium Chinese eggplants, halved lengthwise",
+                "Eggplant sauce: 1 tbsp soy sauce, 1 tsp sesame oil, 1 tsp gochugaru, 1 tsp honey, 1 clove garlic minced",
+                "Butter lettuce leaves",
+                "⅓ cup cooked brown rice per person",
+                "Sesame seeds and scallions to garnish",
+            ],
+            "steps": [
+                "Marinate beef in bulgogi marinade for at least 30 minutes (or overnight).",
+                "Steam eggplant halves over boiling water 8–10 minutes until very tender; cool slightly. Pull into strips.",
+                "Toss eggplant strips with eggplant sauce.",
+                "Sear beef in a very hot pan in a single layer, 1–2 minutes per side, work in batches to avoid steaming.",
+                "Arrange lettuce cups; add rice, beef, and eggplant. Garnish with sesame and scallions.",
+            ],
+            "tip": "Slicing the beef paper-thin while still slightly frozen makes it much easier to handle. A 30-minute freezer stint does the trick.",
+        },
+        "uses": [
+            {
+                "name": "Bulgogi & Eggplant Lettuce Cups",
+                "subtitle": "with brown rice and sesame scallion garnish",
+                "extras": ["Extra gochugaru", "Kimchi", "Pickled cucumber"],
+                "steps": ["Assemble cups to order, the lettuce wilts if pre-assembled."],
+                "tip": "Meal prep the beef and eggplant ahead; assemble in lettuce cups at serving time.",
+            },
+            {
+                "name": "Bulgogi Eggplant Rice Bowl",
+                "subtitle": "over brown rice without lettuce wraps",
+                "extras": ["Extra brown rice", "Fried egg on top", "Gochujang drizzle"],
+                "steps": [
+                    "Serve beef and eggplant directly over a bowl of brown rice.",
+                    "Top with a fried egg and drizzle of gochujang.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "korean-salmon-rice-bowl",
+        "_keywords": ["korean", "salmon", "rice bowl", "bibimbap", "vegetables", "lunch", "dinner", "healthy"],
+        "image": "/static/images/salmon-rice.jpg",
+        "intro": "A Korean-style rice bowl with seared salmon, 1–2 cups of seasoned vegetables, and a drizzle of sesame-soy dressing over brown rice, clean, colorful, and endlessly customizable.",
+        "base": {
+            "title": "Korean Rice Bowl with Salmon",
+            "ingredients": [
+                "3 oz salmon fillet per person",
+                "⅓ cup cooked brown rice or Korean multigrain rice per person",
+                "1–2 cups assorted vegetables: choose from spinach (blanched and squeezed), bean sprouts (blanched), zucchini (sautéed), carrot (julienned), radish (julienned), or eggplant (sautéed)",
+                "Each vegetable seasoned with: sesame oil, soy sauce, garlic, and a pinch of salt",
+                "Sesame-soy dressing: 1 tbsp gochujang, 1 tbsp sesame oil, 1 tbsp soy sauce, 1 tsp honey, 1 tsp rice vinegar, mixed",
+                "Sesame seeds",
+                "Nori sheets (optional)",
+            ],
+            "steps": [
+                "Season and sear salmon skin-side down in a hot pan, 3–4 minutes; flip and cook 1–2 more minutes.",
+                "Prepare each vegetable separately: blanch, sauté, or season raw according to type.",
+                "Mix the dressing.",
+                "Arrange rice in a bowl; fan vegetables around the outside; place salmon in the center.",
+                "Drizzle dressing over; top with sesame seeds.",
+            ],
+            "tip": "Preparing each vegetable separately, even just a few, makes this look and taste like a restaurant bowl. It's the Korean bibimbap approach.",
+        },
+        "uses": [
+            {
+                "name": "Korean Salmon Rice Bowl",
+                "subtitle": "with bibimbap-style seasonal vegetables and gochujang dressing",
+                "extras": ["Extra gochujang", "Fried egg on top", "Extra sesame seeds"],
+                "steps": [
+                    "Build the bowl with vegetables radiating from center.",
+                    "Top with a fried egg and serve with extra gochujang on the side.",
+                ],
+            },
+            {
+                "name": "Salmon Rice Bowl with Raw Toppings",
+                "subtitle": "cold bowl with sashimi-style salmon and crunchy vegetables",
+                "extras": ["Soy sauce", "Wasabi", "Sliced avocado", "Cucumber"],
+                "steps": [
+                    "Use very fresh salmon; slice it raw sashimi-style instead of searing.",
+                    "Serve over cold rice with crunchy cucumber, avocado, and a soy-wasabi drizzle.",
+                ],
+                "tip": "This is only safe with sashimi-grade salmon, confirm with your fishmonger.",
+            },
+        ],
+    },
+    {
+        "_id": "korean-braised-chicken",
+        "_keywords": ["korean", "braised chicken", "dak jjim", "potato", "mushroom", "noodles", "dinner", "comfort"],
+        "image": "/static/images/braised-chicken.jpg",
+        "intro": "Dak Jjim-inspired Korean braised chicken with potatoes, mushrooms, carrot, and onion in a gochujang-soy sauce, a rich, warming one-pot dinner served over whole wheat noodles.",
+        "base": {
+            "title": "Korean Braised Chicken",
+            "ingredients": [
+                "4 skinless chicken breasts or thighs",
+                "2 medium potatoes or yams, cut into large chunks",
+                "2 medium carrots, cut into large chunks",
+                "1 large onion, cut into wedges",
+                "6 oz mushrooms (shiitake or button), halved",
+                "3 scallions, cut into 2-inch pieces",
+                "Braising sauce: 3 tbsp soy sauce, 1 tbsp gochujang, 1 tbsp honey, 1 tbsp sesame oil, 4 cloves garlic minced, 1 tsp ginger, 1 cup water",
+                "½ cup cooked whole wheat noodles per person",
+                "Steamed Chinese broccoli to serve",
+                "Sesame seeds to garnish",
+            ],
+            "steps": [
+                "Combine braising sauce ingredients in a bowl.",
+                "Place chicken, potatoes, carrots, and onion in a wide pot or Dutch oven.",
+                "Pour sauce over; bring to a boil. Cover and reduce to medium-low.",
+                "Braise 25 minutes; add mushrooms and scallions.",
+                "Cook uncovered 10 more minutes until sauce is reduced and chicken is very tender.",
+                "Serve over whole wheat noodles with steamed Chinese broccoli and sesame seeds.",
+            ],
+            "tip": "Braising uncovered at the end is key, the sauce reduces and caramelizes slightly, becoming thick and glossy rather than watery.",
+        },
+        "uses": [
+            {
+                "name": "Korean Braised Chicken with Noodles",
+                "subtitle": "over whole wheat noodles with steamed Chinese broccoli",
+                "extras": ["Extra gochujang", "Sesame seeds", "Scallions"],
+                "steps": ["Serve directly from the pot over noodles; sauce doubles as the noodle dressing."],
+                "tip": "This is even better the next day, refrigerate and the sauce thickens as it cools. Reheat gently.",
+            },
+            {
+                "name": "Braised Chicken Rice Plate",
+                "subtitle": "over brown rice instead of noodles",
+                "extras": ["⅓ cup cooked brown rice per person", "Kimchi alongside"],
+                "steps": [
+                    "Swap noodles for brown rice.",
+                    "Serve with kimchi for the classic Korean side.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "kimchi-tacos",
+        "_keywords": ["korean", "kimchi", "tacos", "tofu", "shrimp", "breakfast", "whole grain", "tortilla"],
+        "image": "/static/images/kimchi-taco.jpg",
+        "intro": "Korean-Mexican breakfast tacos, tofu or shrimp with zucchini, scallions, kimchi, and chili paste, folded into a whole-grain corn tortilla. Bold, light, and surprisingly satisfying.",
+        "base": {
+            "title": "Kimchi Breakfast Tacos",
+            "ingredients": [
+                "½ cup firm tofu (crumbled) or cooked shrimp per person",
+                "½ cup kimchi, chopped",
+                "½ cup diced zucchini",
+                "3 scallions, sliced",
+                "½ cup bean sprouts",
+                "1 clove garlic, minced",
+                "Juice of ½ lime",
+                "1 tsp gochujang or chili paste",
+                "1 tsp sesame oil",
+                "1 small whole-grain corn tortilla per person",
+                "Cooking spray",
+                "Sesame seeds and extra scallions to garnish",
+            ],
+            "steps": [
+                "Heat a pan over medium-high; coat with cooking spray.",
+                "Sauté zucchini and garlic 2–3 minutes until tender.",
+                "Add tofu or shrimp and bean sprouts; cook 2 minutes.",
+                "Stir in kimchi, gochujang, sesame oil, and lime juice. Toss to combine; cook 1 minute more.",
+                "Warm tortilla in a dry pan or directly over a flame.",
+                "Fill tortilla with kimchi mixture; top with scallions and sesame seeds.",
+            ],
+            "tip": "Crumbled firm tofu mimics scrambled egg texture here, press it dry first so it browns rather than steams.",
+        },
+        "uses": [
+            {
+                "name": "Kimchi Breakfast Tacos with Tofu",
+                "subtitle": "with bean sprouts, zucchini, and chili-lime kimchi filling",
+                "extras": ["Extra kimchi", "Lime wedge", "Sriracha"],
+                "steps": ["Assemble and serve immediately, tortillas get soggy if they sit."],
+            },
+            {
+                "name": "Kimchi Shrimp Tacos",
+                "subtitle": "with shrimp instead of tofu for extra protein",
+                "extras": ["6 oz shrimp per person instead of tofu", "Greek yogurt instead of sour cream", "Extra lime"],
+                "steps": [
+                    "Replace tofu with shrimp; cook until pink and lightly caramelized.",
+                    "Add a dollop of plain Greek yogurt on top.",
+                ],
+                "tip": "Shrimp cooks very fast, add it last so it doesn't overcook while the vegetables finish.",
+            },
+        ],
+    },
+    {
+        "_id": "spicy-cod-celery-salad",
+        "_keywords": ["korean", "cod", "fish", "celery", "apple", "salad", "spicy", "dinner", "light"],
+        "image": "/static/images/spicy-cod-celery-salad.jpg",
+        "intro": "Spicy Korean-seasoned cod fillet paired with a creamy apple, onion, and celery salad, bold fish meets cool crunch in a light, elegant dinner.",
+        "base": {
+            "title": "Spicy Cod Fillet with Creamy Apple Onion Celery Salad",
+            "ingredients": [
+                "4 oz cod fillet per person",
+                "1 tsp gochugaru (Korean red pepper flakes)",
+                "1 tsp garlic, minced",
+                "½ tsp onion powder",
+                "1 tbsp soy sauce",
+                "1 tsp sesame oil",
+                "Cooking spray",
+                "Creamy salad: ½ cup thinly sliced apple, ¼ cup thinly sliced onion, ¼ cup thinly sliced celery or Korean radish",
+                "Salad dressing: 2 tbsp Greek yogurt, 1 tbsp rice vinegar, ½ tsp sesame oil, 1 tsp lemon juice, salt and pepper",
+            ],
+            "steps": [
+                "Mix gochugaru, garlic, onion powder, soy sauce, and sesame oil; rub over cod. Marinate 15 minutes.",
+                "Make the salad: toss apple, onion, and celery with dressing ingredients. Refrigerate.",
+                "Heat a non-stick pan over medium-high; coat with cooking spray.",
+                "Sear cod 3–4 minutes per side until flaky and slightly caramelized.",
+                "Serve cod alongside the chilled apple-celery salad.",
+            ],
+            "tip": "The creamy salad is the balance to the spicy cod, make it ahead and keep it cold so the contrast is sharp when served.",
+        },
+        "uses": [
+            {
+                "name": "Spicy Cod with Apple Celery Salad",
+                "subtitle": "hot spiced fish alongside cold creamy salad",
+                "extras": ["Extra lemon wedges", "Brown rice alongside", "Sesame seeds"],
+                "steps": ["Plate the hot cod directly beside the cold salad, the temperature contrast is intentional."],
+                "tip": "Don't overcook the cod, it flakes when done and becomes rubbery past that point.",
+            },
+            {
+                "name": "Spicy Cod Fish Tacos",
+                "subtitle": "flaked into warm corn tortillas with the creamy salad as slaw",
+                "extras": ["2 small whole-grain corn tortillas per person", "Lime wedges", "Extra gochugaru"],
+                "steps": [
+                    "Flake the cooked cod into chunks.",
+                    "Fill tortillas with cod; top with creamy apple-celery salad as the slaw.",
+                    "Squeeze lime over and serve.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "korean-curry-rice",
+        "_keywords": ["korean", "curry", "rice", "shrimp", "fish", "chickpeas", "vegetables", "dinner", "mild"],
+        "image": "/static/images/chicken-katsudon.jpg",
+        "intro": "A golden Korean curry with shrimp or fish, chickpeas, peppers, mushrooms, and green apple, mild, aromatic, and served over brown rice. Weeknight comfort food at its most balanced.",
+        "base": {
+            "title": "Korean Curry Rice",
+            "ingredients": [
+                "6 oz shrimp or white fish (cod, tilapia) per person",
+                "1 can (15 oz) chickpeas, drained",
+                "1 bell pepper, diced",
+                "1 cup mushrooms, sliced",
+                "2 medium carrots, diced",
+                "1 large onion, diced",
+                "½ green apple, peeled and diced",
+                "2 tbsp Korean curry powder (or mild yellow curry powder)",
+                "1 tbsp soy sauce",
+                "1 tsp sesame oil",
+                "2 cups water or light stock",
+                "⅓ cup cooked brown rice per person",
+                "Salt and pepper",
+            ],
+            "steps": [
+                "Sauté onion and carrot in sesame oil over medium heat, 5 minutes.",
+                "Add curry powder; toast 1 minute.",
+                "Add peppers, mushrooms, chickpeas, apple, stock, and soy sauce. Simmer 15 minutes.",
+                "Add shrimp or fish in the last 3–4 minutes; cook until just done.",
+                "Taste and season; serve over brown rice.",
+            ],
+            "tip": "The green apple is traditional in Korean curry, it adds a fruity sweetness that balances the spice and makes it distinctly Korean rather than Indian.",
+        },
+        "uses": [
+            {
+                "name": "Korean Curry Rice with Shrimp",
+                "subtitle": "golden curry over brown rice with pickled radish",
+                "extras": ["Pickled radish (danmuji)", "Extra curry powder", "Sesame seeds"],
+                "steps": ["Serve curry over rice; add pickled radish alongside for color and acidity."],
+                "tip": "Leftovers thicken overnight, add a splash of water when reheating.",
+            },
+            {
+                "name": "Korean Curry Noodles",
+                "subtitle": "poured over glass noodles instead of rice",
+                "extras": ["2 oz glass noodles (dangmyeon) per person, cooked"],
+                "steps": [
+                    "Cook glass noodles per package; drain and toss with a little sesame oil.",
+                    "Ladle curry directly over the noodles in deep bowls.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "bulgogi-chicken-multigrain",
+        "_keywords": ["korean", "bulgogi", "chicken", "multigrain rice", "spinach", "lunch", "meal prep", "clean eating"],
+        "image": "/static/images/bulgogi-chicken.jpg",
+        "intro": "Sesame-soy bulgogi marinated chicken over multigrain rice with steamed spinach, a clean, protein-forward Korean meal-prep lunch that reheats beautifully.",
+        "base": {
+            "title": "Bulgogi Chicken with Multigrain Rice and Steamed Spinach",
+            "ingredients": [
+                "3 oz chicken breast per person, thinly sliced",
+                "Bulgogi marinade: 2 tbsp soy sauce, 1 tbsp sesame oil, 1 tbsp honey, 1 tsp garlic minced, 1 tsp ginger, 1 tbsp pear juice",
+                "⅓ cup dry multigrain rice per person (or brown rice)",
+                "2 cups fresh baby spinach per person",
+                "1 tsp sesame oil (for spinach)",
+                "1 clove garlic, minced (for spinach)",
+                "Sesame seeds and scallions to garnish",
+                "Cooking spray",
+            ],
+            "steps": [
+                "Marinate chicken in bulgogi marinade at least 30 minutes.",
+                "Cook multigrain rice per package directions.",
+                "Steam or blanch spinach 1 minute until wilted; squeeze dry. Toss with sesame oil, garlic, and a pinch of salt.",
+                "Heat a pan over high; coat with cooking spray. Sear chicken 2–3 minutes per side until caramelized and cooked through.",
+                "Divide rice, spinach, and chicken between meal prep containers.",
+                "Garnish with sesame seeds and scallions.",
+            ],
+            "tip": "The high heat sear is what creates the bulgogi caramelized edges, don't crowd the pan or it steams instead of browns.",
+        },
+        "uses": [
+            {
+                "name": "Bulgogi Chicken Meal Prep Bowl",
+                "subtitle": "with multigrain rice, steamed spinach, and sesame",
+                "extras": ["Extra gochujang on the side", "Kimchi", "Pickled cucumber"],
+                "steps": ["Pack into meal prep containers; refrigerate up to 4 days. Reheat rice and chicken; serve spinach cold or warm."],
+                "tip": "Reheat chicken and rice; keep spinach cold, it stays better that way.",
+            },
+            {
+                "name": "Bulgogi Chicken Bibimbap",
+                "subtitle": "assembled bibimbap-style with vegetables and a fried egg",
+                "extras": ["Fried egg", "Extra vegetables (carrot, zucchini, bean sprouts)", "Gochujang dressing"],
+                "steps": [
+                    "Arrange rice in a bowl; fan vegetables and spinach around the outside; place chicken in the center.",
+                    "Top with a fried egg; drizzle gochujang dressing over everything.",
+                    "Mix before eating.",
+                ],
+            },
+        ],
+    },
+    {
+        "_id": "korean-hotteok",
+        "_keywords": ["hotteok", "korean", "pancake", "dessert", "brown sugar", "cinnamon", "peanuts", "street food", "yeasted"],
+        "image": "/static/images/hotteok.jpg",
+        "intro": "Chewy yeasted Korean pancakes with a molten brown sugar, cinnamon, and peanut filling, the beloved Korean street food that's crispy on the outside and gooey inside, ready in about an hour.",
+        "base": {
+            "title": "Hotteok (Korean Sweet Pancakes)",
+            "ingredients": [
+                "[ Dough ]",
+                "1 cup warm water (110°F)",
+                "2 tsp active dry yeast",
+                "1 tsp sugar",
+                "2 cups all-purpose flour",
+                "1/2 cup glutinous rice flour",
+                "1/2 tsp salt",
+                "1 tbsp vegetable oil",
+                "[ Filling ]",
+                "1/2 cup light brown sugar, packed",
+                "1 tsp ground cinnamon",
+                "1/4 cup finely chopped peanuts or walnuts",
+                "[ For Cooking ]",
+                "Neutral oil for the pan",
+            ],
+            "steps": [
+                "Proof yeast in warm water with 1 tsp sugar for 5 minutes until foamy.",
+                "Mix flours and salt in a large bowl. Add yeast mixture and oil; stir into a soft, sticky dough.",
+                "Cover and let rise in a warm spot 45–60 minutes until doubled.",
+                "Mix brown sugar, cinnamon, and peanuts for the filling.",
+                "Heat a skillet over medium with a thin film of oil. With oiled hands, pinch off a golf-ball-sized piece of dough. Flatten, place 1 tbsp filling in the center, and gather edges to seal.",
+                "Place seam-side down in the pan. Cook 2 minutes, then flatten with a spatula. Cook 2–3 more minutes per side until golden and crispy.",
+            ],
+        },
+        "uses": [
+            {
+                "name": "Classic Hotteok",
+                "subtitle": "served straight from the pan, crispy outside and gooey inside",
+                "extras": ["Honey drizzle", "Extra chopped peanuts"],
+                "steps": [
+                    "Serve hotteok fresh from the pan, the filling should be molten.",
+                    "Drizzle a little honey over the top and scatter extra peanuts.",
+                    "Eat immediately while still gooey inside.",
+                ],
+                "tip": "Work in batches and keep cooked hotteok warm in the oven at 200°F, the filling re-melts slightly as they sit.",
+            },
+            {
+                "name": "Nutella Hotteok",
+                "subtitle": "filled with Nutella instead of brown sugar for a chocolatey variation",
+                "extras": ["Nutella", "Sliced banana", "Powdered sugar"],
+                "steps": [
+                    "Substitute 1 tbsp Nutella per hotteok as the filling (no need to mix with cinnamon).",
+                    "Cook the same way. The Nutella will melt into a rich chocolate center.",
+                    "Serve with banana slices and a dusting of powdered sugar.",
+                ],
+                "tip": "Freeze the Nutella filling in small blobs on parchment, cold filling is easier to work with and less messy to seal.",
+            },
+            {
+                "name": "Hotteok Dessert Bowl",
+                "subtitle": "hotteok served alongside vanilla ice cream and caramel sauce",
+                "extras": ["Vanilla ice cream", "Caramel sauce", "Toasted sesame seeds"],
+                "steps": [
+                    "Serve 2 hotteok warm alongside a scoop of vanilla ice cream.",
+                    "Drizzle caramel sauce over both. Scatter sesame seeds.",
+                ],
+                "tip": "The cold ice cream against the hot, crispy hotteok is the best contrast, serve immediately.",
+            },
+        ],
+    },
+    # ── French (new) ─────────────────────────────────────────────────────────
+    {
+        "_id": "ratatouille",
+        "_keywords": ["french", "ratatouille", "vegetable", "eggplant", "zucchini", "tomato", "dinner", "one-pot", "vegan"],
+        "image": "/static/images/rat.jpg",
+        "intro": "A simple, deeply satisfying one-pot French ratatouille, summer vegetables stewed until tender in a garlicky tomato base. Better the next day and endlessly versatile.",
+        "base": {
+            "title": "One-Pot French Ratatouille",
+            "ingredients": [
+                "1 medium eggplant (about 1 lb), cut into 1-inch cubes",
+                "2 medium zucchini, cut into ½-inch rounds",
+                "1 large yellow onion, diced",
+                "4 cloves garlic, minced",
+                "2 medium bell peppers (red and yellow), diced",
+                "1 can (28 oz) crushed tomatoes",
+                "3 tbsp olive oil",
+                "1 tsp dried thyme",
+                "1 tsp herbes de Provence",
+                "Fresh basil and parsley to finish",
+                "Salt and black pepper",
+            ],
+            "steps": [
+                "Salt eggplant cubes generously; let sit 20 minutes, then pat dry.",
+                "Heat olive oil in a large Dutch oven over medium-high. Sear eggplant in batches until golden; remove.",
+                "In the same pot, cook onion and peppers 5 minutes until softened. Add garlic; cook 1 minute.",
+                "Add zucchini, seared eggplant, crushed tomatoes, thyme, and herbes de Provence. Season well.",
+                "Cover and simmer on low 40–45 minutes, stirring occasionally, until all vegetables are very tender.",
+                "Uncover and cook 10 minutes more to concentrate the sauce.",
+                "Stir in fresh basil and parsley; taste and adjust seasoning.",
+            ],
+            "tip": "Ratatouille is better the next day, the flavors deepen significantly overnight. Make it Sunday and eat it all week.",
+        },
+        "uses": [
+            {
+                "name": "Classic Ratatouille with Crusty Bread",
+                "subtitle": "served warm with toasted sourdough for scooping",
+                "extras": ["Sourdough or baguette", "Extra olive oil", "Fresh basil"],
+                "steps": [
+                    "Warm ratatouille; taste and adjust seasoning.",
+                    "Toast bread; rub with a cut garlic clove and drizzle with olive oil.",
+                    "Serve in deep bowls with bread alongside.",
+                ],
+                "tip": "A puddle of good olive oil on top carries the herbs and brightens the whole dish.",
+            },
+            {
+                "name": "Ratatouille with Baked Eggs",
+                "subtitle": "eggs cracked directly into the simmering vegetables",
+                "extras": ["4 eggs", "Crumbled feta", "Extra basil"],
+                "steps": [
+                    "Heat a large skillet of ratatouille until gently bubbling.",
+                    "Make 4 wells; crack an egg into each. Cover and cook 4–5 minutes until whites are just set.",
+                    "Crumble feta over the top; finish with fresh basil.",
+                ],
+                "tip": "This is essentially a ratatouille shakshuka, a full meal in one pan.",
+            },
+            {
+                "name": "Ratatouille Pasta",
+                "subtitle": "tossed with pappardelle and Parmesan",
+                "extras": ["12 oz pappardelle or rigatoni", "½ cup Parmesan, grated", "Extra olive oil"],
+                "steps": [
+                    "Cook pasta; reserve 1 cup pasta water.",
+                    "Toss hot pasta with ratatouille and pasta water to loosen.",
+                    "Finish with olive oil and a generous pile of Parmesan.",
+                ],
+            },
+        ],
+    },
 ]
 
 
 def _find_db_recipe(cluster_summary: dict) -> dict | None:
     """Return a matching RECIPE_DB entry if the cluster's protein/style matches."""
+    cluster_name = cluster_summary.get("name", "").lower()
     search_text = " ".join([
-        cluster_summary.get("name", ""),
+        cluster_name,
         cluster_summary.get("tagline", ""),
         " ".join(cluster_summary.get("ingredients", [])),
         " ".join(str(m) for m in cluster_summary.get("meals", [])),
     ]).lower()
 
+    _STOP = {"and", "the", "with", "for", "from", "over", "into", "that", "this", "are", "your"}
+
     for recipe in RECIPE_DB:
-        if all(kw.lower() in search_text for kw in recipe["_keywords"]):
+        # Primary: ALL significant words from recipe title must appear in cluster name
+        title_words = [
+            w.strip("(),").lower() for w in recipe["base"]["title"].split()
+            if len(w) > 3 and w.lower() not in _STOP
+        ]
+        if title_words and all(w in cluster_name for w in title_words):
+            return recipe
+        # Fallback: ALL keywords must be present (original strict behaviour)
+        keywords = recipe.get("_keywords", [])
+        if keywords and all(kw.lower() in search_text for kw in keywords):
             return recipe
     return None
 
@@ -7083,79 +16594,121 @@ def _scale_amount(amount: str, scale: int) -> str:
     return s
 
 
-def _build_calendar(accepted: list, meal_prep_days: list = None) -> tuple:
+def _scale_amount_f(amount: str, scale: float) -> str:
+    """Multiply the leading number in an amount string by a float scale factor."""
+    if not amount or abs(scale - 1.0) < 0.02:
+        return amount
+    s = amount.strip()
+    m = re.match(r'^(\d+)\s*/\s*(\d+)(.*)', s)
+    if m:
+        val = int(m.group(1)) / int(m.group(2)) * scale
+        rest = m.group(3).strip()
+    else:
+        m = re.match(r'^(\d+\.?\d*)(.*)', s)
+        if not m:
+            return s
+        val = float(m.group(1)) * scale
+        rest = m.group(2).strip()
+    if val >= 10:
+        fmt = str(int(round(val)))
+    elif val >= 2:
+        # Round to nearest 0.5 for practical measuring (2.7 tbsp → 3, 2.3 → 2.5)
+        rounded = round(val * 2) / 2
+        fmt = str(int(rounded)) if rounded == int(rounded) else f"{rounded:.1f}"
+    elif val >= 0.5:
+        # Round to nearest quarter (0.7 cups → 3/4)
+        quarters = round(val * 4) / 4
+        if quarters == int(quarters):
+            fmt = str(int(quarters))
+        elif quarters == 0.25:
+            fmt = "1/4"
+        elif quarters == 0.5:
+            fmt = "1/2"
+        elif quarters == 0.75:
+            fmt = "3/4"
+        elif quarters == 1.25:
+            fmt = "1 1/4"
+        elif quarters == 1.5:
+            fmt = "1 1/2"
+        elif quarters == 1.75:
+            fmt = "1 3/4"
+        else:
+            fmt = f"{quarters:.2f}".rstrip('0').rstrip('.')
+    else:
+        fmt = f"{val:.2f}".rstrip('0').rstrip('.')
+    return (fmt + (' ' + rest if rest else '')).strip()
+
+
+def _build_calendar(accepted: list = None, meal_prep_days: list = None, *, planner: dict = None) -> tuple:  # noqa: ARG001
     """
     Returns (calendar, meal_counts).
-
-    Only schedules meals for the selected meal_prep_days (in week order).
-    Interleaves meals from cluster A and B (A1, B1, A2, B2, …) and assigns
-    one per selected day, wrapping around if there are more days than meals.
+    If planner dict provided, reads from it (new drag-and-drop model).
+    Falls back to per-cluster dayAssignment for old data.
     """
-    if meal_prep_days is None:
-        meal_prep_days = DAYS_SHORT
-
-    selected_indices = [i for i, d in enumerate(DAYS_SHORT) if d in meal_prep_days]
-    calendar = [{'short': DAYS_SHORT[i], 'full': DAYS_FULL[i], 'meals': {}} for i in selected_indices]
+    day_index = {d: i for i, d in enumerate(DAYS_SHORT)}
+    slots: dict = {}
     meal_counts: dict = {}
 
-    by_type: dict = defaultdict(list)
-    for c in accepted:
-        mt = c.get('mealType', '')
-        if mt:
-            by_type[mt].append(c)
+    if planner is not None:
+        # Build reverse map: meal_name → cluster_id for counting
+        meal_cluster_map: dict = {}
+        if accepted:
+            for c in accepted:
+                for m in c.get("meals", []):
+                    if m.get("name"):
+                        meal_cluster_map[m["name"]] = c["id"]
+        for day, day_slots in planner.items():
+            if day in day_index:
+                for slot, meal_name in day_slots.items():
+                    if meal_name:
+                        slots.setdefault(day, {})[slot] = meal_name
+                        cluster_id = meal_cluster_map.get(meal_name)
+                        if cluster_id:
+                            key = (cluster_id, meal_name)
+                            meal_counts[key] = meal_counts.get(key, 0) + 1
+    elif accepted:
+        for c in accepted:
+            for m in c.get("meals", []):
+                if not m.get("name"):
+                    continue
+                assignment = m.get("dayAssignment") or {}
+                day = assignment.get("day") or m.get("suggestedDay", "")
+                slot = assignment.get("meal_slot") or m.get("mealType", "dinner")
+                if day and day in day_index:
+                    slots.setdefault(day, {})[slot] = m["name"]
+                    meal_counts[(c["id"], m["name"])] = 1
 
-    for mt, clusters in by_type.items():
-        interleaved = []
-        if len(clusters) >= 2:
-            c1_meals = clusters[0].get('meals', [])
-            c2_meals = clusters[1].get('meals', [])
-            for i in range(max(len(c1_meals), len(c2_meals))):
-                if i < len(c1_meals) and c1_meals[i].get('name'):
-                    interleaved.append((clusters[0]['id'], c1_meals[i]['name']))
-                if i < len(c2_meals) and c2_meals[i].get('name'):
-                    interleaved.append((clusters[1]['id'], c2_meals[i]['name']))
-        else:
-            for c in clusters:
-                for m in c.get('meals', []):
-                    if m.get('name'):
-                        interleaved.append((c['id'], m['name']))
-
-        if not interleaved:
-            continue
-
-        n = len(interleaved)
-        for slot_idx, cal_day in enumerate(calendar):
-            cid, meal_name = interleaved[slot_idx % n]
-            cal_day['meals'][mt] = meal_name
-            key = (cid, meal_name)
-            meal_counts[key] = meal_counts.get(key, 0) + 1
+    _slot_order = {"breakfast": 0, "lunch": 1, "dinner": 2}
+    calendar = []
+    for i, d in enumerate(DAYS_SHORT):
+        if d in slots:
+            ordered = dict(sorted(slots[d].items(), key=lambda x: _slot_order.get(x[0], 9)))
+            calendar.append({"short": d, "full": DAYS_FULL[i], "meals": ordered})
 
     return calendar, meal_counts
 
 
 # ── General helpers ──────────────────────────────────────────────────────────
-def get_anthropic_client():
-    key = os.getenv("ANTHROPIC_API_KEY")
-    if not key:
-        raise RuntimeError("ANTHROPIC_API_KEY is not set in .env")
-    return anthropic.Anthropic(api_key=key)
+async def _gemini(prompt: str, system: str = None) -> str:
+    config = google_genai_types.GenerateContentConfig(
+        system_instruction=system,
+        max_output_tokens=8192,
+    )
+    response = await asyncio.to_thread(
+        _get_gemini_client().models.generate_content,
+        model="gemini-3.6-flash",
+        contents=prompt,
+        config=config,
+    )
+    return response.text or ""
 
 
 def get_prefs(request: Request) -> dict:
     return request.session.get("preferences") or {}
 
 
-def _sets_per_type(prefs: dict) -> int:
-    meal_prep_days = prefs.get("mealPrepDays", ["Mon", "Tue", "Wed", "Thu", "Fri"])
-    return 2 if len(meal_prep_days) >= 5 else 1
-
-
-def _can_view_plan(clusters: list, meal_types: list, sets_needed: int = 2) -> bool:
-    counts: dict = defaultdict(int)
-    for c in clusters:
-        if c.get("accepted") and not c.get("reserve") and not c.get("skipped"):
-            counts[c.get("mealType", "")] += 1
-    return bool(meal_types) and all(counts[mt] >= sets_needed for mt in meal_types)
+def _can_view_plan(clusters: list, **_) -> bool:
+    return any(c.get("accepted") for c in clusters)
 
 
 # ── User data persistence (Supabase) ─────────────────────────────────────────
@@ -7202,7 +16755,12 @@ def _persist_user(request: Request):
     data["name"] = request.session.get("user_name", data.get("name", ""))
     if "preferences" in request.session:
         data["preferences"] = request.session["preferences"]
-    if "plans_by_week" in request.session:
+    if "cuisinePreferences" in request.session:
+        data["cuisinePreferences"] = request.session["cuisinePreferences"]
+    sk = _store_key(request)
+    if sk in _plans_store:
+        data["plans_by_week"] = _plans_store[sk]
+    elif "plans_by_week" in request.session:
         data["plans_by_week"] = request.session["plans_by_week"]
     for key, val in list(request.session.items()):
         if key.startswith("checked_"):
@@ -7230,9 +16788,12 @@ async def do_login(request: Request, email: str = Form(...), name: str = Form(""
     # Restore saved data, keeping any newer session data on top
     if "preferences" in data and "preferences" not in request.session:
         request.session["preferences"] = data["preferences"]
+    if "cuisinePreferences" in data and "cuisinePreferences" not in request.session:
+        request.session["cuisinePreferences"] = data["cuisinePreferences"]
     if "plans_by_week" in data:
-        session_plans = request.session.get("plans_by_week", {})
-        request.session["plans_by_week"] = {**data["plans_by_week"], **session_plans}
+        sk = _store_key(request)
+        existing = _plans_store.get(sk, {})
+        _plans_store[sk] = {**data["plans_by_week"], **existing}
     for key, val in data.items():
         if key.startswith("checked_") and key not in request.session:
             request.session[key] = val
@@ -7246,6 +16807,9 @@ async def do_login(request: Request, email: str = Form(...), name: str = Form(""
 @app.post("/logout")
 async def do_logout(request: Request):
     _persist_user(request)
+    sk = _store_key(request)
+    _plans_store.pop(sk, None)
+    _persisted_state.pop(sk, None)
     request.session.clear()
     return RedirectResponse("/landing", status_code=302)
 
@@ -7267,6 +16831,32 @@ async def landing_page(request: Request):
         for r in _carousel_sample
     ]
 
+    # Always compute week context so calendar + dates show even without prefs
+    today = date.today()
+    current_week = _week_key(today)
+    selected_week = request.session.get("selectedWeek", current_week)
+    try:
+        week_dates_list = _week_dates(selected_week)
+    except Exception:
+        selected_week = current_week
+        week_dates_list = _week_dates(selected_week)
+
+    cal_year = int(request.session.get("calYear", week_dates_list[0].year))
+    cal_month = int(request.session.get("calMonth", week_dates_list[0].month))
+    month_weeks = _month_weeks(cal_year, cal_month)
+
+    mon0 = week_dates_list[0]
+    sun0 = week_dates_list[6]
+    if mon0.month == sun0.month:
+        week_range_base = f"{mon0.strftime('%b')} {mon0.day}–{sun0.day}, {mon0.year}"
+    else:
+        week_range_base = f"{mon0.strftime('%b')} {mon0.day} – {sun0.strftime('%b')} {sun0.day}, {mon0.year}"
+
+    max_future = _week_key(today + timedelta(weeks=8))
+    prev_week_key_base = _week_key(mon0 - timedelta(weeks=1))
+    next_cand = _week_key(mon0 + timedelta(weeks=1))
+    next_week_key_base = next_cand if next_cand <= max_future else None
+
     ctx: dict = {
         "request": request,
         "has_prefs": has_prefs,
@@ -7274,42 +16864,38 @@ async def landing_page(request: Request):
         "carousel_recipes": carousel_recipes,
         "preferences": prefs or {},
         "calendar_data": [],
-        "week_range": "",
-        "selected_week": "",
-        "current_week": "",
-        "cal_year": date.today().year,
-        "cal_month": date.today().month,
-        "cal_month_name": _MONTH_NAMES[date.today().month - 1],
-        "month_weeks": _month_weeks(date.today().year, date.today().month),
-        "prev_year": date.today().year if date.today().month > 1 else date.today().year - 1,
-        "prev_month": date.today().month - 1 if date.today().month > 1 else 12,
-        "next_year": date.today().year if date.today().month < 12 else date.today().year + 1,
-        "next_month": date.today().month + 1 if date.today().month < 12 else 1,
-        "today_str": date.today().isoformat(),
+        "week_range": week_range_base,
+        "selected_week": selected_week,
+        "current_week": current_week,
+        "cal_year": cal_year,
+        "cal_month": cal_month,
+        "cal_month_name": _MONTH_NAMES[cal_month - 1],
+        "month_weeks": month_weeks,
+        "prev_year": cal_year if cal_month > 1 else cal_year - 1,
+        "prev_month": cal_month - 1 if cal_month > 1 else 12,
+        "next_year": cal_year if cal_month < 12 else cal_year + 1,
+        "next_month": cal_month + 1 if cal_month < 12 else 1,
+        "today_str": today.isoformat(),
+        "today": today,
+        "prev_week_key": prev_week_key_base,
+        "next_week_key": next_week_key_base,
     }
 
     if has_prefs:
-        today = date.today()
-        current_week = _week_key(today)
-        selected_week = request.session.get("selectedWeek", current_week)
-        try:
-            week_dates_list = _week_dates(selected_week)
-        except Exception:
-            selected_week = current_week
-            week_dates_list = _week_dates(selected_week)
 
-        cal_year = int(request.session.get("calYear", week_dates_list[0].year))
-        cal_month = int(request.session.get("calMonth", week_dates_list[0].month))
-        month_weeks = _month_weeks(cal_year, cal_month)
-
-        clusters = load_clusters(request)
-        accepted = [c for c in clusters if c.get("accepted")]
+        plans_by_week: dict = get_plans_by_week(request)
+        week_plan = plans_by_week.get(selected_week)
+        accepted = week_plan.get("clusters", []) if week_plan else []
+        wk_planner = week_plan.get("planner", {}) if week_plan else {}
         meal_prep_days = prefs.get("mealPrepDays", ["Mon", "Tue", "Wed", "Thu", "Fri"])
         day_completions = request.session.get("dayCompletions", {})
 
         calendar_data = []
-        if accepted:
-            cal, _ = _build_calendar(accepted, meal_prep_days)
+        if accepted or wk_planner:
+            if wk_planner:
+                cal, _ = _build_calendar(planner=wk_planner)
+            else:
+                cal, _ = _build_calendar(accepted, meal_prep_days)
             day_name_to_date = {DAYS_SHORT[d.weekday()]: d for d in week_dates_list}
             for cal_day in cal:
                 d = day_name_to_date.get(cal_day["short"])
@@ -7326,29 +16912,17 @@ async def landing_page(request: Request):
                     "is_past": (d < today) if d else False,
                 })
 
-        mon = week_dates_list[0]
-        sun = week_dates_list[6]
-        if mon.month == sun.month:
-            week_range = f"{mon.strftime('%b')} {mon.day}–{sun.day}, {mon.year}"
-        else:
-            week_range = f"{mon.strftime('%b')} {mon.day} – {sun.strftime('%b')} {sun.day}, {mon.year}"
+        _db_map_landing = {r["_id"]: r for r in RECIPE_DB}
+        dessert_ids: list = week_plan.get("desserts", list(request.session.get("desserts", []))) if week_plan else []
+        dessert_recipes_landing = [_db_map_landing[rid] for rid in dessert_ids if rid in _db_map_landing]
 
+        _DOW_COLORS = ["#E07A5F", "#F2CC8F", "#81B29A", "#6D9DC5", "#A78BCA", "#E0956A", "#D4A5A5"]
+        today_color = _DOW_COLORS[today.weekday()]
         ctx.update({
-            "today": today,
-            "today_str": today.isoformat(),
-            "selected_week": selected_week,
-            "current_week": current_week,
-            "week_range": week_range,
-            "cal_year": cal_year,
-            "cal_month": cal_month,
-            "cal_month_name": _MONTH_NAMES[cal_month - 1],
-            "month_weeks": month_weeks,
-            "prev_year": cal_year if cal_month > 1 else cal_year - 1,
-            "prev_month": cal_month - 1 if cal_month > 1 else 12,
-            "next_year": cal_year if cal_month < 12 else cal_year + 1,
-            "next_month": cal_month + 1 if cal_month < 12 else 1,
             "calendar_data": calendar_data,
-            "has_plan": bool(accepted),
+            "has_plan": bool(week_plan),
+            "dessert_recipes": dessert_recipes_landing,
+            "today_color": today_color,
         })
 
     return templates.TemplateResponse("landing.html", ctx)
@@ -7367,85 +16941,206 @@ async def update_plan(request: Request):
     return RedirectResponse("/suggest", status_code=302)
 
 
+@app.get("/profile", response_class=HTMLResponse)
+async def profile_page():
+    return RedirectResponse("/preferences", status_code=302)
+
+
+@app.post("/hide-recipe/{recipe_id}", response_class=HTMLResponse)
+async def hide_recipe(request: Request, recipe_id: str):
+    prefs = request.session.get("preferences", {})
+    hidden: list = prefs.get("hidden_recipes", [])
+    if recipe_id not in hidden:
+        hidden.append(recipe_id)
+    prefs["hidden_recipes"] = hidden
+    request.session["preferences"] = prefs
+    _persist_user(request)
+    return HTMLResponse("")
+
+
+@app.post("/unhide-recipe/{recipe_id}", response_class=HTMLResponse)
+async def unhide_recipe(request: Request, recipe_id: str):
+    prefs = request.session.get("preferences", {})
+    hidden: list = prefs.get("hidden_recipes", [])
+    prefs["hidden_recipes"] = [h for h in hidden if h != recipe_id]
+    request.session["preferences"] = prefs
+    _persist_user(request)
+    return HTMLResponse("")
+
+
 @app.get("/preferences", response_class=HTMLResponse)
 async def preferences_page(request: Request):
     prefs = request.session.get("preferences")
     if not prefs:
-        return RedirectResponse("/onboarding")
+        return RedirectResponse("/setup")
+    hidden_ids: list = prefs.get("hidden_recipes", [])
+    _db_map = {r["_id"]: r for r in RECIPE_DB}
+    hidden_recipes = [
+        {"id": rid, "title": _db_map[rid]["base"]["title"], "image": _db_map[rid].get("image", "")}
+        for rid in hidden_ids if rid in _db_map
+    ]
     return templates.TemplateResponse("preferences.html", {
         "request": request,
         "preferences": prefs,
+        "hidden_recipes": hidden_recipes,
     })
 
 
 @app.post("/save-preferences")
 async def save_preferences(
     request: Request,
-    meal_types: List[str] = Form(default=[]),
     servings: int = Form(2),
     dietary_needs: str = Form(""),
-    budget_level: str = Form("moderate"),
+    adventure_level: str = Form("curious"),
     meal_prep_days: List[str] = Form(default=[]),
+    shopping_frequency: str = Form("weekly"),
 ):
-    if not meal_types:
-        meal_types = ["dinner"]
     if not meal_prep_days:
-        meal_prep_days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+        meal_prep_days = request.session.get("preferences", {}).get("mealPrepDays", ["Mon", "Tue", "Wed", "Thu", "Fri"])
+    if shopping_frequency not in ("weekly", "biweekly"):
+        shopping_frequency = "weekly"
+    existing = request.session.get("preferences", {})
     request.session["preferences"] = {
-        "mealTypes": meal_types,
+        **existing,
         "servings": servings,
         "dietaryNeeds": dietary_needs.strip(),
-        "budgetLevel": budget_level,
+        "adventureLevel": adventure_level,
         "mealPrepDays": meal_prep_days,
+        "shoppingFrequency": shopping_frequency,
     }
     _persist_user(request)
-    return RedirectResponse("/landing", status_code=303)
+    return RedirectResponse("/preferences", status_code=303)
+
+
+@app.post("/sync-nutrition-goal")
+async def sync_nutrition_goal(request: Request):
+    body = await request.json()
+    calories = int(body.get("calories", 0))
+    if calories >= 500:
+        existing = request.session.get("preferences", {})
+        existing["calorieGoal"] = calories
+        request.session["preferences"] = existing
+        _persist_user(request)
+    return JSONResponse({"ok": True})
+
+
+@app.get("/auth/google")
+async def google_login(request: Request):
+    redirect_uri = str(request.url_for("google_callback"))
+    return await oauth.google.authorize_redirect(request, redirect_uri)
+
+
+@app.get("/auth/google/callback", name="google_callback")
+async def google_callback(request: Request):
+    try:
+        token = await oauth.google.authorize_access_token(request)
+        user = token.get("userinfo") or {}
+        email = (user.get("email") or "").lower().strip()
+        name = user.get("name") or email.split("@")[0]
+        if not email:
+            return RedirectResponse("/login?error=1", status_code=302)
+        uid = _user_id(email)
+        data = load_user_data(uid)
+        request.session["user_id"] = uid
+        request.session["user_email"] = email
+        request.session["user_name"] = name
+        if "preferences" in data and "preferences" not in request.session:
+            request.session["preferences"] = data["preferences"]
+        if "cuisinePreferences" in data and "cuisinePreferences" not in request.session:
+            request.session["cuisinePreferences"] = data["cuisinePreferences"]
+        if "plans_by_week" in data:
+            sk = _store_key(request)
+            existing = _plans_store.get(sk, {})
+            _plans_store[sk] = {**data["plans_by_week"], **existing}
+        data["name"] = name
+        data["email"] = email
+        save_user_data(uid, data)
+    except Exception:
+        return RedirectResponse("/login?error=1", status_code=302)
+    return RedirectResponse("/landing", status_code=302)
+
+
+@app.get("/setup", response_class=HTMLResponse)
+async def onboarding(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request, "preferences": {}})
 
 
 @app.get("/onboarding", response_class=HTMLResponse)
-async def onboarding(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request, "preferences": {}})
+async def onboarding_redirect(request: Request):
+    return RedirectResponse("/setup", status_code=301)
+
+
+@app.get("/check-session")
+async def check_session(request: Request):
+    prefs = request.session.get("preferences")
+    clusters = load_clusters(request)
+    planner = request.session.get("planner", {})
+    plans_by_week = get_plans_by_week(request)
+    has_saved_plans = any(
+        p.get("clusters") for p in plans_by_week.values()
+    )
+    has_activity = bool(clusters) or any(bool(v) for v in planner.values()) or has_saved_plans
+    if not prefs and not has_activity:
+        return JSONResponse({"has_session": False})
+    if not has_activity:
+        return JSONResponse({"has_session": False})
+    return JSONResponse({"has_session": True, "continue_url": "/suggest"})
+
+
+@app.post("/clear-session")
+async def clear_session_route(request: Request):
+    for key in ["preferences", "clusters", "planner", "desserts", "weekDays",
+                "mode", "cuisinePreferences", "existingIngredients"]:
+        request.session.pop(key, None)
+    sk = _store_key(request)
+    _plans_store.pop(sk, None)
+    _persisted_state.pop(sk, None)
+    user_id = request.session.get("user_id")
+    if user_id:
+        try:
+            data = load_user_data(user_id)
+            data["plans_by_week"] = {}
+            save_user_data(user_id, data)
+        except Exception:
+            pass
+    return JSONResponse({"ok": True})
 
 
 @app.post("/setup")
 async def setup(
     request: Request,
-    meal_types: List[str] = Form(default=[]),
     servings: int = Form(2),
     dietary_needs: str = Form(""),
     budget_level: str = Form("moderate"),
     meal_prep_days: List[str] = Form(default=[]),
+    mode: str = Form("suggestions"),
 ):
-    if not meal_types:
-        meal_types = ["dinner"]
     if not meal_prep_days:
         meal_prep_days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
     request.session["preferences"] = {
-        "mealTypes": meal_types,
         "servings": servings,
         "dietaryNeeds": dietary_needs.strip(),
         "budgetLevel": budget_level,
         "mealPrepDays": meal_prep_days,
     }
+    request.session["mode"] = mode
     _persist_user(request)
-    return RedirectResponse("/mode", status_code=303)
+    if mode == "existing":
+        return RedirectResponse("/ingredients", status_code=303)
+    return RedirectResponse("/cuisine", status_code=303)
 
 
 @app.post("/update-settings")
 async def update_settings(
     request: Request,
-    meal_types: List[str] = Form(default=[]),
     servings: int = Form(2),
     dietary_needs: str = Form(""),
     budget_level: str = Form("moderate"),
     meal_prep_days: List[str] = Form(default=[]),
 ):
-    if not meal_types:
-        meal_types = ["dinner"]
     if not meal_prep_days:
         meal_prep_days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
     request.session["preferences"] = {
-        "mealTypes": meal_types,
         "servings": servings,
         "dietaryNeeds": dietary_needs.strip(),
         "budgetLevel": budget_level,
@@ -7453,7 +17148,7 @@ async def update_settings(
     }
     _persist_user(request)
     clear_clusters(request)
-    return RedirectResponse("/mode", status_code=303)
+    return RedirectResponse("/cuisine", status_code=303)
 
 
 @app.get("/mode", response_class=HTMLResponse)
@@ -7477,14 +17172,13 @@ async def set_mode(request: Request, mode: str = Form(...)):
 async def cuisine_page(request: Request):
     if not request.session.get("preferences"):
         return RedirectResponse("/")
-    saved = request.session.get("cuisinePreferences", {})
     return templates.TemplateResponse("cuisine.html", {
         "request": request,
         "preferences": get_prefs(request),
         "cuisines": CUISINES,
         "seasons": SEASONS,
-        "selected_cuisines": saved.get("cuisines") or random.sample(CUISINES, 3),
-        "selected_season": saved.get("season", ""),
+        "selected_cuisines": [],
+        "selected_season": "",
     })
 
 
@@ -7496,6 +17190,7 @@ async def save_cuisine(
 ):
     request.session["cuisinePreferences"] = {"cuisines": cuisines, "season": season}
     clear_clusters(request)
+    _persist_user(request)
     return RedirectResponse("/suggest", status_code=303)
 
 
@@ -7564,73 +17259,251 @@ async def suggest_page(request: Request):
         return RedirectResponse("/")
     clusters = load_clusters(request)
     prefs = request.session["preferences"]
-    meal_types: list = prefs.get("mealTypes", [])
+    week_days: list = request.session.get("weekDays", prefs.get("mealPrepDays", ["Mon", "Tue", "Wed", "Thu", "Fri"]))
     mode = request.session.get("mode", "suggestions")
     existing = request.session.get("existingIngredients", [])
-    sets_per_type = _sets_per_type(prefs)
-    has_clusters_by_mt = {
-        mt: any(
-            not c.get("reserve") and not c.get("skipped") and c.get("mealType") == mt
-            for c in clusters
-        )
-        for mt in meal_types
-    }
+    has_clusters = any(not c.get("reserve") and not c.get("skipped") for c in clusters)
+    planner: dict = request.session.get("planner", {})
+    planned_count = sum(len(slots) for slots in planner.values())
+    selected_desserts: list = list(request.session.get("desserts", []))
+    cp = request.session.get("cuisinePreferences", {})
+    selected_cuisines_for_dessert: list = cp.get("cuisines", [])
+    all_dessert_recipes = [
+        {
+            "id": r["_id"],
+            "title": r["base"]["title"],
+            "image": r.get("image", ""),
+            "cuisine": _DESSERT_CUISINE.get(r["_id"], ""),
+            "selected": r["_id"] in selected_desserts,
+        }
+        for r in RECIPE_DB
+        if "dessert" in _RECIPE_MEAL_TYPES.get(r["_id"], [])
+    ]
+    # Filter by selected cuisines; fall back to all if none match
+    if selected_cuisines_for_dessert:
+        filtered = [d for d in all_dessert_recipes if d["cuisine"] in selected_cuisines_for_dessert]
+        dessert_recipes = filtered if filtered else all_dessert_recipes
+    else:
+        dessert_recipes = all_dessert_recipes
     return templates.TemplateResponse(
         "suggest.html",
         {
             "request": request,
             "preferences": prefs,
             "clusters": clusters,
-            "has_clusters_by_mt": has_clusters_by_mt,
-            "can_view_plan": _can_view_plan(clusters, meal_types, sets_per_type),
-            "meal_types": meal_types,
+            "has_clusters": has_clusters,
+            "can_view_plan": _can_view_plan(clusters),
             "mode": mode,
             "existing_ingredients": existing,
-            "sets_per_type": sets_per_type,
+            "week_days": week_days,
+            "planner": planner,
+            "planned_count": planned_count,
+            "dessert_recipes": dessert_recipes,
+            "selected_desserts": selected_desserts,
         },
     )
 
 
-@app.post("/generate/{meal_type}", response_class=HTMLResponse)
-async def generate_suggestions(request: Request, meal_type: str):
+# ── Calorie estimation ────────────────────────────────────────────────────────
+
+_SKIP_AMOUNT_WORDS = {
+    "a", "an", "the", "cup", "cups", "tbsp", "tsp", "oz", "lb", "lbs",
+    "g", "kg", "ml", "l", "handful", "bunch", "pinch", "dash", "clove",
+    "cloves", "can", "package", "pkg", "slice", "slices", "piece", "pieces",
+    "small", "medium", "large", "whole",
+}
+
+def _estimate_recipe_calories(recipe: dict) -> int:
+    """
+    Returns calories per serving. Uses stored real data when available,
+    otherwise estimates from meal type and ingredient profile.
+    """
+    if "calories_per_serving" in recipe:
+        return recipe["calories_per_serving"]
+
+    meal_types = _RECIPE_MEAL_TYPES.get(recipe["_id"], ["dinner"])
+    keywords = set(recipe.get("_keywords", []))
+    ing_text = " ".join(recipe["base"].get("ingredients", [])).lower()
+
+    cal = 420 if "breakfast" in meal_types else 620
+
+    # Protein source
+    if keywords & {"beef", "pork", "lamb", "bison"}:
+        cal += 110
+    elif keywords & {"chicken", "turkey"}:
+        cal += 30
+    elif keywords & {"salmon", "tuna", "shrimp", "fish", "seafood"}:
+        cal += 10
+    elif keywords & {"tofu", "tempeh", "lentil", "bean", "chickpea", "lentils", "beans"}:
+        cal -= 70
+
+    # Carb load
+    if any(k in ing_text for k in ["pasta", "noodle", "spaghetti", "fettuccine", "penne", "rigatoni"]):
+        cal += 170
+    elif any(k in ing_text for k in [" rice", "quinoa", "farro", "couscous", "orzo"]):
+        cal += 110
+    elif any(k in ing_text for k in ["bread", "tortilla", "bun", "pita", "flatbread", "wrap"]):
+        cal += 90
+    elif any(k in ing_text for k in ["potato", "sweet potato"]):
+        cal += 70
+
+    # Richness / fat
+    if any(k in ing_text for k in ["heavy cream", "coconut cream", "coconut milk", "full-fat"]):
+        cal += 90
+    if any(k in ing_text for k in ["parmesan", "mozzarella", "cheddar", "feta", "gruyere", "brie"]):
+        cal += 60
+    if any(k in ing_text for k in [" butter", "ghee"]) and "peanut butter" not in ing_text:
+        cal += 40
+
+    # Lighter profiles
+    if keywords & {"salad"} or "salad" in recipe["base"]["title"].lower():
+        cal -= 110
+
+    return round(cal / 25) * 25
+
+
+# ── Recipe vector index (TF-IDF for semantic ingredient search) ───────────────
+
+_recipe_vectorizer: TfidfVectorizer | None = None
+_recipe_vectors = None   # scipy sparse matrix
+_recipe_vector_ids: list[str] = []
+
+
+def _build_recipe_vectors() -> None:
+    """Build TF-IDF index over all recipes. Called once at module load."""
+    global _recipe_vectorizer, _recipe_vectors, _recipe_vector_ids
+
+    texts, ids = [], []
+    for recipe in RECIPE_DB:
+        rid = recipe["_id"]
+        cal = _estimate_recipe_calories(recipe)
+        cal_tier = "light" if cal < 450 else "hearty" if cal > 700 else "moderate"
+        cuisine = _RECIPE_CUISINE.get(rid, "")
+        meal_types = _RECIPE_MEAL_TYPES.get(rid, ["dinner"])
+        keywords = recipe.get("_keywords", [])
+        # Extract ingredient core names (skip numeric prefixes and unit words)
+        ing_names = []
+        for ing in recipe["base"].get("ingredients", [])[:8]:
+            parts = ing.lower().split()
+            start = 0
+            while start < len(parts) and (parts[start][0].isdigit() or parts[start] in _SKIP_AMOUNT_WORDS):
+                start += 1
+            ing_names.append(" ".join(parts[start:start+3]))
+
+        text = (
+            f"{recipe['base']['title']} {cuisine} {' '.join(meal_types)} "
+            f"{' '.join(keywords)} {' '.join(ing_names)} {cal_tier} {cal}kcal"
+        )
+        texts.append(text)
+        ids.append(rid)
+
+    vec = TfidfVectorizer(ngram_range=(1, 2), min_df=1, sublinear_tf=True)
+    _recipe_vectors = vec.fit_transform(texts)
+    _recipe_vectorizer = vec
+    _recipe_vector_ids = ids
+
+
+def _semantic_recipe_ids(query: str, n: int = 30, exclude_ids: set = None) -> list[str]:
+    """Return top-n recipe IDs ranked by TF-IDF cosine similarity to query."""
+    if _recipe_vectorizer is None or _recipe_vectors is None:
+        return [r["_id"] for r in RECIPE_DB[:n]]
+    q_vec = _recipe_vectorizer.transform([query.lower()])
+    sims = cosine_similarity(q_vec, _recipe_vectors)[0]
+    ranked = sorted(enumerate(sims), key=lambda x: -x[1])
+    result: list[str] = []
+    for idx, _score in ranked:
+        rid = _recipe_vector_ids[idx]
+        if exclude_ids and rid in exclude_ids:
+            continue
+        result.append(rid)
+        if len(result) >= n:
+            break
+    return result
+
+
+# Build index immediately (RECIPE_DB and lookup dicts are already populated)
+_build_recipe_vectors()
+
+
+def _build_recipe_catalog(dietary_needs: str = "", selected_cuisines: list = None, hidden_recipe_ids: list = None, max_recipes: int = None, allowed_ids: set = None) -> str:
+    """Build a compact catalog of DB recipes for Claude to select from."""
+    import random as _random
+    dn = dietary_needs.lower()
+    is_veg = any(w in dn for w in ["vegetarian", "vegan", "plant-based"])
+    is_vegan = "vegan" in dn
+    is_gf = any(w in dn for w in ["gluten-free", "gluten free", "celiac"])
+    _VEGAN_EXCL = {"eggs", "dairy", "cheese", "milk", "yogurt", "butter", "cream", "honey"}
+    _hidden = set(hidden_recipe_ids or [])
+
+    lines = []
+    for recipe in RECIPE_DB:
+        rid = recipe["_id"]
+        title = recipe["base"]["title"]
+        meal_types = _RECIPE_MEAL_TYPES.get(rid, ["dinner"])
+        keywords = set(recipe.get("_keywords", []))
+        cuisine = _RECIPE_CUISINE.get(rid, "")
+
+        if rid in _hidden:
+            continue
+
+        # Semantic filter: only include pre-selected IDs if provided
+        if allowed_ids is not None and rid not in allowed_ids:
+            continue
+
+        # Dietary filtering
+        if is_veg and keywords & _MEAT_KEYWORDS:
+            continue
+        if is_vegan and (keywords & _MEAT_KEYWORDS or keywords & _VEGAN_EXCL):
+            continue
+
+        # Hard-filter to selected cuisines to keep prompt small
+        if selected_cuisines and cuisine and cuisine not in selected_cuisines:
+            continue
+        cuisine_tag = f" [{cuisine}]" if cuisine else ""
+
+        cal = _estimate_recipe_calories(recipe)
+        base_srv = recipe.get("servings")
+        srv_tag = f" {base_srv}srv" if base_srv else ""
+        variations = [u["name"] for u in recipe.get("uses", [])][:3]
+        mt_str = "/".join(meal_types)
+        var_str = " | ".join(variations)
+        lines.append(f"[{rid}] {title}{cuisine_tag} ({mt_str}{srv_tag}) {cal}cal  {var_str}")
+
+    # Trim to max_recipes while keeping a balanced breakfast/main split
+    if max_recipes and len(lines) > max_recipes:
+        breakfast_lines = [l for l in lines if "(breakfast)" in l]
+        main_lines = [l for l in lines if "(breakfast)" not in l]
+        n_b = min(len(breakfast_lines), max(4, max_recipes // 6))
+        n_m = max_recipes - n_b
+        _random.shuffle(breakfast_lines)
+        _random.shuffle(main_lines)
+        lines = breakfast_lines[:n_b] + main_lines[:n_m]
+        _random.shuffle(lines)
+
+    return "\n".join(lines)
+
+
+@app.post("/generate", response_class=HTMLResponse)
+async def generate_suggestions(request: Request):
     prefs = request.session.get("preferences")
     if not prefs:
         return HTMLResponse("<p class='error-msg'>Session expired. <a href='/'>Start over</a></p>")
 
-    allowed_meal_types = {"breakfast", "lunch", "dinner"}
-    if meal_type not in allowed_meal_types:
-        return HTMLResponse("")
+    # Clear the planner and dessert selections when new suggestions are generated
+    request.session.pop("planner", None)
+    request.session["desserts"] = []
 
     servings: int = prefs.get("servings", 2)
     dietary_needs: str = prefs.get("dietaryNeeds", "")
     budget_level: str = prefs.get("budgetLevel", "moderate")
-    meal_prep_days: list = prefs.get("mealPrepDays", ["Mon", "Tue", "Wed", "Thu", "Fri"])
+    week_days: list = request.session.get("weekDays", prefs.get("mealPrepDays", ["Mon", "Tue", "Wed", "Thu", "Fri"]))
     mode: str = request.session.get("mode", "suggestions")
 
-    n_days = len(meal_prep_days) if meal_prep_days else 5
-
-    if n_days >= 5:
-        n_shown = 2
-        c1_size = math.ceil(n_days / 2)   # e.g. 5→3, 6→3, 7→4
-        c2_size = math.floor(n_days / 2)  # e.g. 5→2, 6→3, 7→3
-    else:
-        n_shown = 1
-        c1_size = max(1, n_days)
-        c2_size = 0
-
-    n_total_clusters = n_shown * 2  # shown + same number of reserve backups
-
-    if n_shown == 2:
-        cluster_sizes_note = (
-            f"Cluster 1 must have exactly {c1_size} meals. "
-            f"Cluster 2 must have exactly {c2_size} meals. "
-            f"Together they cover all {n_days} meal prep days with no repeats."
-        )
-    else:
-        cluster_sizes_note = (
-            f"Each cluster must have exactly {c1_size} meal{'s' if c1_size != 1 else ''} "
-            f"covering all {n_days} meal prep day{'s' if n_days != 1 else ''}."
-        )
+    n_days = len(week_days) if week_days else 5
+    n_shown = 6
+    n_reserve = 2
+    n_total = n_shown + n_reserve
+    meals_per_cluster = max(2, math.ceil(n_days / 2))
 
     raw_existing = request.session.get("existingIngredients", [])
     existing: list = []
@@ -7661,6 +17534,7 @@ The user already has these ingredients:
 """
 
     cuisine_note = ""
+    selected_cuisines = []
     if mode == "suggestions":
         cp = request.session.get("cuisinePreferences", {})
         selected_cuisines = cp.get("cuisines", [])
@@ -7669,130 +17543,101 @@ The user already has these ingredients:
             cuisine_note += f"\nCuisine style: {', '.join(selected_cuisines)}."
         if season and season in _SEASON_GUIDANCE:
             cuisine_note += f"\nSeason: {season}. Lean into {_SEASON_GUIDANCE[season]}"
-        for cuisine in selected_cuisines:
-            if cuisine in _CUISINE_RECIPE_LIBRARY:
-                recipes = _CUISINE_RECIPE_LIBRARY[cuisine]
-                cuisine_note += f"\n{cuisine} featured recipes ] strongly prefer these when suggesting {cuisine} meals:\n"
-                cuisine_note += "\n".join(f"  - {r}" for r in recipes)
 
-    if budget_level == "budget":
-        adventure_note = "\nBudget: keep ingredients minimal and affordable [ skip optional garnishes, specialty items, and pricier add-ons. Use pantry staples and everyday proteins."
-    elif budget_level == "flexible":
-        adventure_note = "\nBudget: flexible ] feel free to include specialty ingredients, premium proteins, and optional extras."
-    else:
-        adventure_note = "\nBudget: moderate [ include all core ingredients but note which extras are optional."
+    try:
+        _budget_num = float(str(budget_level).replace("$", "").replace(",", "").strip())
+        adventure_note = f"\nBudget: approximately ${_budget_num:.0f}/week — keep ingredient costs in mind and note which extras are optional."
+    except (ValueError, TypeError):
+        if budget_level == "budget":
+            adventure_note = "\nBudget: keep ingredients minimal and affordable, skip optional garnishes, specialty items, and pricier add-ons."
+        elif budget_level == "flexible":
+            adventure_note = "\nBudget: flexible, feel free to include specialty ingredients, premium proteins, and optional extras."
+        else:
+            adventure_note = "\nBudget: moderate, include all core ingredients but note which extras are optional."
+
+    adventure_level = prefs.get("adventureLevel", "curious")
+    if adventure_level == "familiar":
+        adventure_note += " Stick to approachable, recognizable dishes the user likely already knows."
+    elif adventure_level == "bold":
+        adventure_note += " Be adventurous, include bold flavors, global ingredients, and less common techniques."
 
     favorite_ids_pref: list = prefs.get("favorited_recipes", [])
-    fav_titles = [
-        r["base"]["title"] for r in RECIPE_DB
-        if r["_id"] in favorite_ids_pref
-        and meal_type in _RECIPE_MEAL_TYPES.get(r["_id"], [])
-    ]
+    fav_titles = [r["base"]["title"] for r in RECIPE_DB if r["_id"] in favorite_ids_pref]
     if fav_titles:
         if budget_level == "budget":
             favorites_note = (
-                f"\nFavorites: The user has saved these recipes ] since they're on a budget, "
-                f"prioritize these familiar favorites heavily: {', '.join(fav_titles)}."
-            )
-        elif budget_level == "flexible":
-            favorites_note = (
-                f"\nFavorites: The user has saved these recipes, but feel free to explore new ideas too: "
-                f"{', '.join(fav_titles)}."
+                f"\nFavorites: The user has saved these recipes, prioritize them heavily: {', '.join(fav_titles)}."
             )
         else:
             favorites_note = (
-                f"\nFavorites: Try to include at least one of these saved recipes alongside new suggestions: "
-                f"{', '.join(fav_titles)}."
+                f"\nFavorites: Try to include at least one of these saved recipes: {', '.join(fav_titles)}."
             )
     else:
         favorites_note = ""
 
-    if meal_type != "breakfast":
-        library_note = """
-Some featured recipes to draw from when they fit the user's preferences (feel free to also suggest other meals alongside these):
-Proteins: Baked Harissa Salmon, Baked Salmon with Pistachio Pesto, Crispy Turmeric Salmon with Yogurt Sauce, Garlic Shrimp with Smoked Paprika & Honey, Honey Mustard Garlic Shrimp, Baked Miso Maple Tofu, Herby Parmesan Meatballs, Hot Honey Zaatar Turkey Sausage, Miso Maple Chili Crisp Chicken
-Sides: Crispy Roasted Potatoes with Chili & Paprika, Honey-Roasted Broccolini & Kale, Curry-Roasted Cauliflower with Minty Yogurt, Roasted Butternut Squash with Kale & Coconut Cream, Garlic Sauteed Green Beans with Dijon Vinaigrette, Roasted Zucchini with Parmesan & Basil
-Sauce: Miso Tahini Sauce
-You can name a cluster after one of these proteins and pair it with the sides [ but also freely suggest other meals that are not on this list."""
-    else:
-        library_note = ""
+    _hidden_ids = get_prefs(request).get("hidden_recipes", [])
+    _catalog_cuisines = selected_cuisines if mode == "suggestions" else []
+    _allowed_ids: set | None = None
 
-    # Breakfast gets food-specific guidance regardless of adventure level
-    if meal_type == "breakfast":
-        breakfast_note = """
-Breakfast clusters must be actual breakfast foods. Good options: granola and yogurt bowls (parfaits), overnight oats with toppings, smoothie bowls, avocado toast and egg toasts, muffins or banana bread, eggs any style (scrambled, fried, poached), omelettes, frittatas, shakshuka, breakfast burritos, French toast, pancakes or waffles. Each cluster should share a prep-ahead base (e.g. a baked egg base, a batch of granola, a muffin batter, an oat base)."""
-    else:
-        breakfast_note = ""
+    if mode == "existing" and existing:
+        # Build a query from the user's ingredients and dietary context
+        ing_names = " ".join(i["name"] for i in existing if i.get("name"))
+        _semantic_query = f"{ing_names} {dietary_needs}".strip()
+        _allowed_ids = set(_semantic_recipe_ids(_semantic_query, n=35, exclude_ids=set(_hidden_ids)))
+    elif not _catalog_cuisines:
+        # No cuisine filter and not ingredient-based: cap at 80 for token budget
+        pass
 
-    # Avoid repeating proteins already planned for other meal types this week
-    other_type_clusters = [
-        c for c in load_clusters(request)
-        if c.get("mealType") != meal_type and not c.get("reserve")
-    ]
-    other_meal_names = []
-    for c in other_type_clusters:
-        for m in c.get("meals", []):
-            if m.get("name"):
-                other_meal_names.append(m["name"])
-    if other_meal_names:
-        other_meal_note = (
-            f"\nIMPORTANT: The following specific recipes are already planned for other meals this week: "
-            f"{', '.join(other_meal_names)}. Do NOT suggest any of these exact recipes for {meal_type}. "
-            f"You may use the same proteins but with different preparations, sauces, or styles."
-        )
-    else:
-        other_meal_note = ""
-
-    system_prompt = (
-        "You are a meal planning assistant. Each cluster is a single meal-prep session: "
-        "one protein or base cooked once, eaten different ways across the week. "
-        "Never mix proteins within a cluster. Return ONLY valid JSON ] no markdown fences, no explanation."
+    _catalog_max = None if (_catalog_cuisines or _allowed_ids) else 50
+    catalog = _build_recipe_catalog(
+        dietary_needs, _catalog_cuisines, _hidden_ids,
+        max_recipes=_catalog_max, allowed_ids=_allowed_ids,
     )
 
-    user_prompt = f"""Create {meal_type} suggestions for a weekly meal plan.
+    system_prompt = (
+        "You are a meal planning assistant. Select recipes ONLY from the provided catalog. "
+        "Do NOT generate ingredients — they are pulled from the database automatically. "
+        "Return ONLY valid JSON, no markdown fences, no explanation."
+    )
+
+    user_prompt = f"""Create a weekly meal plan by selecting recipes from the catalog below.
+
+RECIPE CATALOG (format: [recipe_id] Title [cuisine] (meal_type Nsrv) NNNcal  Variation1 | Variation2 | Variation3):
+{catalog}
 
 User:
 - Servings: {servings} people
 - Dietary restrictions: {dietary_needs or 'none'}{adventure_note}
-- Meal prep days: {', '.join(meal_prep_days)}
-{existing_note}{cuisine_note}{favorites_note}{library_note}{breakfast_note}{other_meal_note}
+- Meal prep days: {', '.join(week_days)}
+{existing_note}{cuisine_note}{favorites_note}
 
 Rules:
-- Suggest exactly {n_total_clusters} clusters (clusters {n_shown + 1}-{n_total_clusters} are hidden backup alternatives matching the same meal-count structure)
-- {cluster_sizes_note}
-- CRITICAL [ each cluster must have ONE single protein or base that is cooked ONCE during meal prep. Every meal in the cluster is a different way to serve that same cooked base. Never mix proteins within a cluster (e.g. no beef + chicken in the same cluster). The clusterName should be the protein/base itself (e.g. "Ground Beef", "Roasted Salmon", "Baked Tofu").
-- The first {n_shown} cluster(s) cover the meal prep days: cluster 1 uses a fresh/perishable protein, cluster 2 (if present) uses a different protein ] never the same one as cluster 1
-- Plain descriptive names only [ no puns or marketing language
-- Ingredient amounts for exactly {servings} person/people per meal. Real portions: protein 4-6 oz, grains 1/2 cup dry, eggs 2 per person.
-- Keep ingredient names consistent and specific where it matters (e.g. "cherry tomatoes", "red bell pepper", "poblano peppers" are fine). Avoid redundant qualifiers: write "parsley" not "fresh flat-leaf parsley", "ginger" not "fresh ginger", "garlic" not "garlic cloves". Never repeat the same ingredient under two slightly different names.
-- suggestedDay: one day abbreviation e.g. "Mon"
-- category: exactly one of "Produce", "Meat & Seafood", "Dairy & Eggs", "Bakery", "Pantry", "Frozen"
-
+- Suggest exactly {n_total} clusters ({n_shown} displayed + {n_reserve} hidden backups)
+- CRITICAL: recipe_id MUST be an exact id from the catalog above. Do NOT invent ids.
+- variation names MUST be exact strings from the catalog (the part after the ). Do NOT invent variation names.
+- Each cluster uses ONE recipe_id. Pick {meals_per_cluster} variations from that recipe for the meals array.
+- BREAKFAST SEPARATION: exactly 2 of the first {n_shown} clusters must be breakfast recipes (meal_type "breakfast"). Set clusterCategory "breakfast". The other {n_shown - 2} shown clusters must be lunch/dinner. Set clusterCategory "main".
+- Clusters 1–2: breakfast recipes. Clusters 3–{n_shown}: lunch/dinner. Make the 2 breakfast clusters use DIFFERENT recipe_ids.
+- No two clusters may share the same recipe_id.
+- suggestedDay: one abbreviation from the meal prep days ({', '.join(week_days)}), spread across different days
+- calories: use the NNNcal figure from the catalog as the base. Adjust per meal variation: if a variation removes rice/bread show fewer calories, if it adds bread/noodles show more. Each meal in the meals array gets its own calories value. Give a specific integer per meal.
 Return this exact JSON (no markdown):
 {{
   "clusters": [
     {{
       "id": "short_unique_id",
-      "clusterName": "Plain descriptive name",
-      "tagline": "One-line description",
-      "meals": [{{"name": "Meal Name", "description": "One sentence.", "suggestedDay": "Mon"}}],
-      "ingredients": [{{"name": "ingredient", "amount": "2", "unit": "cups", "userHas": false, "category": "Produce"}}],
+      "recipe_id": "exact-id-from-catalog",
+      "clusterCategory": "breakfast",
+      "meals": [{{"variation": "Exact Variation Name From Catalog", "mealType": "breakfast", "suggestedDay": "Mon", "calories": 400}}],
       "difficulty": "Easy"
     }}
   ]
 }}"""
 
     try:
-        client = get_anthropic_client()
-        message = await asyncio.to_thread(
-            client.messages.create,
-            model="claude-haiku-4-5-20251001",
-            max_tokens=8000,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-
-        raw = message.content[0].text
+        raw = await _gemini(user_prompt, system=system_prompt)
+        if not raw:
+            raise ValueError("No text block in response")
         json_match = re.search(r"\{[\s\S]*\}", raw)
         if not json_match:
             raise ValueError("No JSON found in response")
@@ -7801,31 +17646,98 @@ Return this exact JSON (no markdown):
         data = json.loads(json_str)
         new_clusters = data.get("clusters", [])
 
-        type_count = 0
-        for cluster in new_clusters:
-            cluster["mealType"] = meal_type
+        _db_lookup = {r["_id"]: r for r in RECIPE_DB}
+
+        for i, cluster in enumerate(new_clusters):
             cluster["accepted"] = False
             cluster["skipped"] = False
+            cluster["reserve"] = (i >= n_shown)
             if not cluster.get("id"):
                 cluster["id"] = str(uuid.uuid4())[:8]
-            type_count += 1
-            cluster["reserve"] = (type_count > n_shown)
 
-        # Merge into the shared store safely
+            # Expand from DB using recipe_id
+            recipe_id = cluster.get("recipe_id")
+            db_rec = _db_lookup.get(recipe_id) if recipe_id else None
+            if db_rec:
+                cluster["clusterName"] = db_rec["base"]["title"]
+                intro = db_rec.get("intro", "")
+                cluster["tagline"] = re.split(r"[\[\]|]", intro)[0].strip()[:100]
+                cluster["image"] = db_rec.get("image", "")
+                uses_by_name = {u["name"]: u for u in db_rec.get("uses", [])}
+                recipe_title = db_rec["base"]["title"]
+                db_calories = _estimate_recipe_calories(db_rec)
+                # Build variation display names.
+                # If NO distinctive recipe words appear in the variation, prepend context:
+                #   "with" recipe  → "{Turmeric Salmon} and {Crispy Potato Bowl}"
+                #                    "{Pistachio Salmon} and {Butternut Squash Bowl}"
+                #   plain recipe   → "{Lemon Bean} {Pita Pocket Vegetable Salad}"
+                # Overlap check uses _VAR_STOP-filtered stems so generic words
+                # (vegetable, salad, bowl…) don't mask a missing key ingredient.
+                _r_content = {w.lower().rstrip("s") for w in _content_words(recipe_title)}
+                _ctx = _recipe_name_context(recipe_title)
+                for meal in cluster.get("meals", []):
+                    var = meal.get("variation", "")
+                    _v_stem = {w.lower().rstrip("s") for w in re.split(r"[\s\-/&,]+", var) if len(w) > 2}
+                    if var and not (_r_content & _v_stem):
+                        if _ctx["with_key"]:
+                            meal["name"] = f"{_ctx['with_key']} and {var}"
+                        elif _ctx["full_ctx"]:
+                            meal["name"] = f"{_ctx['full_ctx']} {var}"
+                        else:
+                            meal["name"] = var
+                    else:
+                        meal["name"] = var
+                    meal["calories"] = db_calories
+                    use = uses_by_name.get(var, {})
+                    if use.get("subtitle") and not meal.get("description"):
+                        meal["description"] = use["subtitle"]
+            elif not cluster.get("clusterName"):
+                cluster["clusterName"] = cluster.get("id", "Meal Set")
+
+            # Replace AI-generated ingredients with exact RECIPE_DB ingredients
+            if db_rec:
+                db_srv = max(db_rec.get("servings", 4), 1)
+                n_meals_c = max(len(cluster.get("meals", [])), 1)
+                base_scale = (servings * n_meals_c) / db_srv
+                structured: list = []
+                for raw in db_rec["base"].get("ingredients", []):
+                    item = _raw_ing_to_structured(raw, base_scale)
+                    if item:
+                        structured.append(item)
+                # Include extras for each selected variation (at per-serving scale)
+                uses_by_name = {u["name"]: u for u in db_rec.get("uses", [])}
+                seen_extra_keys: set = set()
+                for meal in cluster.get("meals", []):
+                    var = meal.get("variation", "")
+                    use = uses_by_name.get(var, {})
+                    extra_scale = servings  # extras are per-use per-serving
+                    for raw in use.get("extras", []):
+                        key = raw.lower().strip() if isinstance(raw, str) else ""
+                        if not key or key in seen_extra_keys:
+                            continue
+                        seen_extra_keys.add(key)
+                        item = _raw_ing_to_structured(raw, extra_scale)
+                        if item:
+                            structured.append(item)
+                cluster["ingredients"] = structured
+
+            if not cluster.get("clusterCategory"):
+                meal_types = [m.get("mealType", "") for m in cluster.get("meals", [])]
+                cluster["clusterCategory"] = "breakfast" if meal_types and all(t == "breakfast" for t in meal_types) else "main"
+
         sk = _store_key(request)
         async with _get_cluster_lock(sk):
-            existing_clusters = load_clusters(request)
-            # Remove any old clusters for this meal type, then append fresh ones
-            kept = [c for c in existing_clusters if c.get("mealType") != meal_type]
-            save_clusters(request, kept + new_clusters)
+            save_clusters(request, new_clusters)
 
+        visible = [c for c in new_clusters if not c.get("reserve")]
+        week_days_ctx = request.session.get("weekDays", prefs.get("mealPrepDays", ["Mon", "Tue", "Wed", "Thu", "Fri"]))
         return templates.TemplateResponse(
-            "partials/meal_type_section.html",
+            "partials/clusters_list.html",
             {
                 "request": request,
-                "meal_type": meal_type,
-                "clusters": new_clusters,
+                "clusters": visible,
                 "mode": mode,
+                "week_days": week_days_ctx,
             },
         )
 
@@ -7834,6 +17746,17 @@ Return this exact JSON (no markdown):
             "partials/generate_error.html",
             {"request": request, "error": str(exc)},
         )
+
+
+def _cluster_card_ctx(request: Request, cluster: dict) -> dict:
+    prefs = get_prefs(request)
+    week_days = request.session.get("weekDays", prefs.get("mealPrepDays", ["Mon", "Tue", "Wed", "Thu", "Fri"]))
+    return {
+        "request": request,
+        "cluster": cluster,
+        "mode": request.session.get("mode", "suggestions"),
+        "week_days": week_days,
+    }
 
 
 @app.post("/toggle/{cluster_id}", response_class=HTMLResponse)
@@ -7848,7 +17771,6 @@ async def toggle_cluster(request: Request, cluster_id: str):
             save_clusters(request, clusters)
 
     if not target:
-        # Store was wiped (e.g. server restart) ] prompt reload
         return HTMLResponse(
             f'<div id="cluster-{cluster_id}" class="cluster-card" '
             f'style="padding:20px;text-align:center;">'
@@ -7857,11 +17779,7 @@ async def toggle_cluster(request: Request, cluster_id: str):
             f'</div>'
         )
 
-    mode = request.session.get("mode", "suggestions")
-    return templates.TemplateResponse(
-        "partials/cluster_card.html",
-        {"request": request, "cluster": target, "mode": mode},
-    )
+    return templates.TemplateResponse("partials/cluster_card.html", _cluster_card_ctx(request, target))
 
 
 @app.post("/skip/{cluster_id}", response_class=HTMLResponse)
@@ -7874,27 +17792,18 @@ async def skip_cluster(request: Request, cluster_id: str):
         if not target:
             return HTMLResponse(f'<div id="cluster-{cluster_id}" style="display:none"></div>')
 
-        meal_type = target["mealType"]
         target["skipped"] = True
 
-        # Try next queued reserve first
         replacement = next(
-            (c for c in clusters if
-             c.get("mealType") == meal_type and
-             c.get("reserve") and
-             not c.get("skipped")),
+            (c for c in clusters if c.get("reserve") and not c.get("skipped")),
             None
         )
         if replacement:
             replacement["reserve"] = False
         else:
-            # All reserves used [ loop back to oldest skipped non-accepted cluster
             replacement = next(
                 (c for c in clusters if
-                 c.get("mealType") == meal_type and
-                 c.get("skipped") and
-                 not c.get("accepted") and
-                 c["id"] != cluster_id),
+                 c.get("skipped") and not c.get("accepted") and c["id"] != cluster_id),
                 None
             )
             if replacement:
@@ -7903,19 +17812,150 @@ async def skip_cluster(request: Request, cluster_id: str):
 
         save_clusters(request, clusters)
 
-    mode = request.session.get("mode", "suggestions")
     if replacement:
-        return templates.TemplateResponse(
-            "partials/cluster_card.html",
-            {"request": request, "cluster": replacement, "mode": mode},
-        )
+        return templates.TemplateResponse("partials/cluster_card.html", _cluster_card_ctx(request, replacement))
     return HTMLResponse(
         f'<div id="cluster-{cluster_id}" style="display:none;height:0;margin:0;padding:0;overflow:hidden;"></div>'
     )
 
 
+@app.post("/cluster/{cluster_id}/meal-type", response_class=HTMLResponse)
+async def change_meal_type(
+    request: Request,
+    cluster_id: str,
+    meal_name: str = Form(...),
+    next_type: str = Form(...),
+):
+    _valid = {"breakfast", "lunch", "dinner"}
+    if next_type not in _valid:
+        next_type = "lunch"
+    clusters = load_clusters(request)
+    for c in clusters:
+        if c["id"] == cluster_id:
+            for m in c.get("meals", []):
+                if m.get("name") == meal_name:
+                    m["mealType"] = next_type
+            meal_types = list({m.get("mealType", "dinner") for m in c.get("meals", [])})
+            if len(meal_types) == 1:
+                c["clusterCategory"] = meal_types[0]
+            save_clusters(request, clusters)
+            return templates.TemplateResponse(
+                "partials/cluster_card.html", _cluster_card_ctx(request, c)
+            )
+    return HTMLResponse(f'<div id="cluster-{cluster_id}"></div>')
+
+
+@app.post("/assign-meal")
+async def assign_meal(
+    request: Request,
+    cluster_id: str = Form(...),
+    meal_index: int = Form(...),
+    day: str = Form(""),
+    meal_slot: str = Form(""),
+):
+    sk = _store_key(request)
+    async with _get_cluster_lock(sk):
+        clusters = load_clusters(request)
+        target = next((c for c in clusters if c["id"] == cluster_id), None)
+        if target and 0 <= meal_index < len(target.get("meals", [])):
+            target["meals"][meal_index]["dayAssignment"] = {"day": day, "meal_slot": meal_slot}
+            save_clusters(request, clusters)
+    return HTMLResponse("")
+
+
 _CAT_ORDER = ["Produce", "Meat & Seafood", "Dairy & Eggs", "Bakery", "Frozen", "Pantry"]
 _VALID_CATS = set(_CAT_ORDER)
+
+_OPTIONAL_MARKERS = {"optional", "garnish", "for serving", "to taste", "for topping", "for drizzling", "for finishing"}
+
+def _categorize_ingredient(name: str) -> str:
+    n = name.lower()
+    # Compound pantry terms first — prevent "fish sauce", "peanut butter",
+    # "coconut cream" etc. from being caught by meat/dairy/produce checks
+    _COMPOUND_PANTRY = ["fish sauce","oyster sauce","hoisin sauce","worcestershire sauce",
+                        "hot sauce","soy sauce","sesame oil","peanut butter","almond butter",
+                        "nut butter","coconut milk","coconut cream","coconut water",
+                        "almond milk","oat milk","soy milk","rice milk"]
+    if any(k in n for k in _COMPOUND_PANTRY): return "Pantry"
+    if any(k in n for k in ["chicken","beef","pork","turkey","lamb","salmon","tuna","shrimp","fish","steak","sausage","bacon","anchovy","cod","halibut","tilapia","mahi","sea bass","crab","lobster","scallop","clam","mussel","ground meat","ground beef","ground turkey","prosciutto","pancetta","chorizo","duck","venison","bison"]): return "Meat & Seafood"
+    if any(k in n for k in ["butter","egg","milk","cream","yogurt","cheese","feta","parmesan","mozzarella","ricotta","brie","cheddar","gouda","kefir","ghee","half and half","sour cream","cottage cheese","mascarpone","gruyere","goat cheese"]): return "Dairy & Eggs"
+    if "frozen" in n: return "Frozen"
+    if any(k in n for k in ["bread","baguette","tortilla","pita","croissant","sourdough","bun","roll","wrap","naan","crouton","bagel","focaccia","ciabatta","brioche"]): return "Bakery"
+    # Pantry before produce — catches oils, starches, spices that contain produce words
+    if any(k in n for k in ["oil","vinegar","sauce","paste","powder","starch","flour","sugar","salt","syrup","broth","stock","extract","baking","soda","yeast","lard","shortening","mayo","mayonnaise","mustard","ketchup","honey","molasses","jam","jelly","preserve","pickle","canned","raisin","currant","tahini","miso","hummus","sriracha","gochujang","dried fruit"]): return "Pantry"
+    if any(k in n for k in ["lettuce","spinach","kale","arugula","broccoli","carrot","tomato","cucumber","zucchini","pepper","onion","garlic","ginger","celery","mushroom","avocado","lemon","lime","orange","apple","berry","herb","cilantro","parsley","basil","mint","thyme","rosemary","scallion","green onion","shallot","leek","potato","sweet potato","butternut","squash","eggplant","asparagus","green bean","corn","pea","beet","radish","cabbage","bok choy","fennel","artichoke","mango","pineapple","coconut","fig","peach","plum","cherry","grape","banana","watermelon","jalapeño","serrano","habanero","chili","cauliflower","broccolini","rapini","endive","radicchio","watercress","chard","collard","turnip","parsnip","rutabaga","kohlrabi","daikon","edamame"]): return "Produce"
+    return "Pantry"
+
+
+def _raw_ing_to_structured(raw: str, scale: float) -> dict | None:
+    """Parse a RECIPE_DB ingredient string and return a structured grocery dict, or None to skip."""
+    if not isinstance(raw, str):
+        return None
+    clean = raw.strip().lstrip("+-•* ").strip()
+    # Skip section headers like "For the coconut sauce:" or any line ending with ":"
+    if clean.endswith(":") or re.match(r"^for\b", clean, re.IGNORECASE):
+        return None
+    p = _parse_ingredient(clean)
+    name = p["food_name"]
+    if not name:
+        return None
+    qty = p["qty"]
+    unit = p["unit"] or ""
+    if qty is not None:
+        scaled = qty * scale
+        amt_str = str(int(scaled)) if scaled == int(scaled) else f"{scaled:.2g}"
+    else:
+        amt_str = ""
+    optional = any(marker in clean.lower() for marker in _OPTIONAL_MARKERS)
+    return {
+        "name": name,
+        "amount": amt_str,
+        "unit": unit,
+        "category": _categorize_ingredient(name),
+        "optional": optional,
+        "userHas": False,
+    }
+
+_FRAC_MAP = {"¼": "0.25", "½": "0.5", "¾": "0.75", "⅓": "0.333", "⅔": "0.667", "⅛": "0.125", "⅜": "0.375", "⅝": "0.625"}
+_VOLUME_UNITS = {"cup", "cups", "tbsp", "tsp", "tablespoon", "tablespoons", "teaspoon", "teaspoons",
+                 "oz", "ounce", "ounces", "lb", "lbs", "pound", "pounds", "g", "gram", "grams",
+                 "ml", "liter", "liters", "pint", "pints", "quart", "quarts",
+                 "clove", "cloves", "slice", "slices", "large", "medium", "small",
+                 "package", "pkg", "can", "stick", "sticks"}
+
+
+def _parse_dessert_ingredient(ing_str: str) -> tuple:
+    """Parse '2 cups flour' → (qty_float_or_None, unit_str, base_name_str)."""
+    s = ing_str.strip()
+    for f, v in _FRAC_MAP.items():
+        s = s.replace(f, v)
+    m = re.match(r'^(\d+(?:[./]\d+)?)\s+(\S+)\s+(.+)$', s)
+    if m:
+        raw_qty, token, rest = m.group(1), m.group(2).lower(), m.group(3).split(",")[0].strip()
+        try:
+            qty = float(raw_qty) if "/" not in raw_qty else float(raw_qty.split("/")[0]) / float(raw_qty.split("/")[1])
+        except ValueError:
+            qty = None
+        if token in _VOLUME_UNITS:
+            return qty, token, rest
+        return qty, "", (token + " " + rest)
+    m = re.match(r'^(\d+(?:\.\d+)?)\s+(.+)$', s)
+    if m:
+        try:
+            qty = float(m.group(1))
+        except ValueError:
+            qty = None
+        return qty, "", m.group(2).split(",")[0].strip()
+    return None, "", s.split(",")[0].strip()
+
+
+def _categorize_dessert_ingredient(name: str) -> str:
+    n = name.lower()
+    if any(k in n for k in ["butter","egg","milk","cream","yogurt","cheese","custard","ricotta","mascarpone"]): return "Dairy & Eggs"
+    if any(k in n for k in ["lemon","lime","orange","apple","banana","berry","berries","peach","cherry","strawberry","blueberry","raspberry","mango","pear","fig","date","raisin","zest","fruit"]): return "Produce"
+    if any(k in n for k in ["flour","bread crumb","croissant","biscuit","pastry","puff pastry","phyllo","brioche"]): return "Bakery"
+    if any(k in n for k in ["frozen"]): return "Frozen"
+    return "Pantry"
 
 
 def _build_grocery_by_recipe(accepted: list) -> list:
@@ -7927,17 +17967,25 @@ def _build_grocery_by_recipe(accepted: list) -> list:
             if not ing.get("userHas", False):
                 items.append({**ing, "key": _normalize_ingredient(ing.get("name", ""))})
         if items:
+            meal_types = list({m.get("mealType", "dinner") for m in cluster.get("meals", []) if m.get("mealType")})
             result.append({
                 "name": cluster.get("clusterName", ""),
-                "meal_type": cluster.get("mealType", "dinner"),
-                "items": items,
+                "meal_type": meal_types[0] if len(meal_types) == 1 else "mixed",
+                "lines": items,
             })
     return result
 
 
-def _build_grocery_data(accepted: list, meal_prep_days: list) -> tuple:
+def _clean_ingredient_name(name: str) -> str:
+    """Strip prep/descriptor words from a stored ingredient name (handles old cached data)."""
+    words = name.split()
+    clean = [w for w in words if w.lower() not in _STRIP_WORDS]
+    return " ".join(clean).strip() or name
+
+
+def _build_grocery_data(accepted: list, meal_prep_days: list, planner: dict = None) -> tuple:
     """Return (raw_items, grocery_by_category) for a list of accepted clusters."""
-    _, meal_counts = _build_calendar(accepted, meal_prep_days)
+    _, meal_counts = _build_calendar(accepted, meal_prep_days, planner=planner)
     grocery_map: dict = {}
     for cluster in accepted:
         cluster_meals = [m for m in cluster.get("meals", []) if m.get("name")]
@@ -7945,10 +17993,14 @@ def _build_grocery_data(accepted: list, meal_prep_days: list) -> tuple:
         scale = max(1, round(sum(meal_counts.get((cluster["id"], m["name"]), 1) for m in cluster_meals) / n_meals)) if n_meals else 1
         for ing in cluster.get("ingredients", []):
             if not ing.get("userHas", False):
-                key = _normalize_ingredient(ing["name"])
+                display_name = _clean_ingredient_name(ing["name"])
+                key = _normalize_ingredient(display_name)
                 if key not in grocery_map:
-                    grocery_map[key] = {**ing, "name": key, "key": key,
-                                        "amount": _scale_amount(str(ing.get("amount", "")), scale)}
+                    grocery_map[key] = {**ing, "name": display_name, "key": key,
+                                        "amount": _scale_amount(str(ing.get("amount", "")), scale),
+                                        "optional": ing.get("optional", False)}
+                elif not ing.get("optional", False):
+                    grocery_map[key]["optional"] = False
     raw_items = list(grocery_map.values())
     by_cat: dict = {}
     for item in raw_items:
@@ -7957,59 +18009,317 @@ def _build_grocery_data(accepted: list, meal_prep_days: list) -> tuple:
     return raw_items, {c: by_cat[c] for c in _CAT_ORDER if c in by_cat}
 
 
-@app.get("/plan", response_class=HTMLResponse)
-async def plan_page(request: Request):
-    clusters = load_clusters(request)
-    accepted = [c for c in clusters if c.get("accepted")]
-    if not accepted:
-        return RedirectResponse("/suggest")
-
-    prefs = get_prefs(request)
-    meal_types: list = prefs.get("mealTypes", [])
-    meal_prep_days: list = prefs.get("mealPrepDays", ["Mon", "Tue", "Wed", "Thu", "Fri"])
-
-    # Save this plan under the current selected week so /grocery can show it
+@app.get("/grocery", response_class=HTMLResponse)
+async def plan_page(request: Request, background_tasks: BackgroundTasks, week: str = None):
     today = date.today()
-    selected_week = request.session.get("selectedWeek", _week_key(today))
-    plans_by_week: dict = request.session.get("plans_by_week", {})
-    plans_by_week[selected_week] = {
-        "clusters": accepted,
-        "meal_types": meal_types,
-        "meal_prep_days": meal_prep_days,
-    }
-    request.session["plans_by_week"] = plans_by_week
-    _persist_user(request)
+    current_week = _week_key(today)
+    prefs = get_prefs(request)
+    week_days: list = prefs.get("mealPrepDays", ["Mon", "Tue", "Wed", "Thu", "Fri"])
+    plans_by_week: dict = get_plans_by_week(request)
 
-    checked: List[str] = request.session.get(f"checked_{selected_week}", [])
-    calendar, _ = _build_calendar(accepted, meal_prep_days)
-    raw_items, grocery_by_category = _build_grocery_data(accepted, meal_prep_days)
+    # Save current session clusters into their designated week only
+    clusters = load_clusters(request)
+    accepted_now = [c for c in clusters if c.get("accepted")]
+    selected_week_session = request.session.get("selectedWeek", current_week)
+    if accepted_now:
+        planner: dict = request.session.get("planner", {})
+        desserts = sorted(request.session.get("desserts", []))
+        new_cluster_ids = sorted(c.get("_id", c.get("base", {}).get("title", "")) for c in accepted_now)
+        plans_by_week[selected_week_session] = {
+            "clusters": accepted_now,
+            "meal_prep_days": week_days,
+            "planner": planner,
+            "desserts": desserts,
+        }
+        save_plans_by_week(request, plans_by_week)
+        _pfx = _store_key(request)
+        for _k in list(_recipe_store.keys()):
+            if _k.startswith(_pfx): del _recipe_store[_k]
+        sk = _store_key(request)
+        last = _persisted_state.get(sk, {})
+        if (last.get("week") != selected_week_session
+                or last.get("cluster_ids") != new_cluster_ids
+                or last.get("planner") != planner
+                or last.get("desserts") != desserts):
+            _persist_user(request)
+            _persisted_state[sk] = {"week": selected_week_session, "cluster_ids": new_cluster_ids,
+                                    "planner": planner, "desserts": desserts}
+
+    # Determine which week to display — honour ?week= exactly, no cross-week fallback
+    if week and re.match(r"^\d{4}-W\d{2}$", week):
+        view_week = week
+        request.session["selectedWeek"] = week
+    else:
+        view_week = selected_week_session
+
+    def _fmt_week(wk: str) -> str:
+        try:
+            dates = _week_dates(wk)
+            return f"{dates[0].strftime('%b %-d')} – {dates[-1].strftime('%-d')}"
+        except Exception:
+            return wk
+
+    # Build week nav: all weeks with plans + current + 8 weeks ahead (empty or not)
+    plan_week_keys = set(plans_by_week.keys())
+    future_week_keys = {_week_key(today + timedelta(weeks=i)) for i in range(0, 9)}
+    all_weeks = sorted(plan_week_keys | future_week_keys, reverse=True)
+    view_week_label = _fmt_week(view_week)
+    week_nav = [{"key": wk, "label": _fmt_week(wk), "active": wk == view_week, "has_plan": wk in plans_by_week} for wk in all_weeks]
+
+    week_plan = plans_by_week.get(view_week)
+    if not week_plan:
+        return templates.TemplateResponse("plan.html", {
+            "request": request,
+            "empty": True,
+            "view_week": view_week,
+            "view_week_label": view_week_label,
+            "week_nav": week_nav,
+            "current_week": current_week,
+        })
+
+    accepted = week_plan.get("clusters", [])
+    wk_days = week_plan.get("meal_prep_days", week_days)
+    wk_planner = week_plan.get("planner", {})
+
+    if not accepted:
+        return templates.TemplateResponse("plan.html", {
+            "request": request,
+            "empty": True,
+            "view_week": view_week,
+            "view_week_label": view_week_label,
+            "week_nav": week_nav,
+            "current_week": current_week,
+        })
+
+    checked: List[str] = request.session.get(f"checked_{view_week}", [])
+    calendar, _ = _build_calendar(planner=wk_planner) if wk_planner else _build_calendar(accepted)
+    raw_items, grocery_by_category = _build_grocery_data(accepted, wk_days, planner=wk_planner)
     grocery_by_recipe = _build_grocery_by_recipe(accepted)
+
+    _db_map = {r["_id"]: r for r in RECIPE_DB}
+
+    # USDA macro store key (same prefix as recipes page)
+    sk_mac = f"{_store_key(request)}:{view_week}"
+
+    # Trigger USDA computation for any cluster not yet computed
+    if USDA_API_KEY:
+        for ci, c in enumerate(accepted):
+            mkey = f"{sk_mac}:{ci}"
+            if mkey not in _macro_store:
+                _macro_store[mkey] = "computing"
+                background_tasks.add_task(_bg_compute_macros, mkey, c, int(get_prefs(request).get("servings", 2)))
+
+    # Build meal_calories from USDA data; fall back to DB/estimated calories_per_serving
+    meal_calories: dict = {}
+    for ci, c in enumerate(accepted):
+        mkey = f"{sk_mac}:{ci}"
+        usda_result = _macro_store.get(mkey)
+        db_rec = _db_map.get(c.get("recipe_id", ""))
+        db_cal = _estimate_recipe_calories(db_rec) if db_rec else 0
+        for ui, m in enumerate(c.get("meals", [])):
+            if not m.get("name"):
+                continue
+            if isinstance(usda_result, list) and ui < len(usda_result):
+                cal = usda_result[ui].get("calories", 0)
+                if cal:
+                    meal_calories[m["name"]] = cal
+                    continue
+            if db_cal:
+                meal_calories[m["name"]] = db_cal
+
+    # ── Portion scaling to match calorie goal ─────────────────────────────────
+    calorie_goal: int = int(prefs.get("calorieGoal", 0))
+    portion_scale: float = 1.0
+    if calorie_goal >= 500 and meal_calories:
+        # Use calendar day totals for avg; each day must have at least 2 meals worth of calories
+        day_totals = []
+        for day in calendar:
+            day_cal = sum(meal_calories.get(m_name, 0) for m_name in day.get("meals", {}).values())
+            n_slots = len(day.get("meals", {}))
+            if day_cal > 0 and n_slots >= 2:
+                day_totals.append(day_cal)
+        # Fallback: sum all unique meal calories and divide by n_days
+        if not day_totals:
+            total_cal = sum(meal_calories.values())
+            n_days = max(len(wk_days), 1)
+            day_totals = [total_cal / n_days] if total_cal else []
+        if day_totals:
+            # Scale so the highest-calorie day lands at or just under the goal.
+            # Using max (not avg) guarantees no day ever goes over.
+            max_daily_cal = max(day_totals)
+            raw_scale = calorie_goal / max_daily_cal
+            portion_scale = min(max(raw_scale, 0.25), 4.0)
+            # Scale grocery ingredient amounts
+            if abs(portion_scale - 1.0) > 0.02:
+                for item in raw_items:
+                    scaled = _scale_amount_f(str(item.get("amount", "")), portion_scale)
+                    # Count-based items (no unit) must stay whole numbers
+                    unit = (item.get("unit") or "").strip()
+                    if not unit:
+                        try:
+                            scaled = str(max(1, round(float(scaled))))
+                        except (ValueError, TypeError):
+                            pass
+                    item["amount"] = scaled
+            # Scale displayed meal calories
+            meal_calories = {k: int(round(v * portion_scale)) for k, v in meal_calories.items()}
+
+    meal_labels = {"breakfast": "Breakfast", "lunch": "Lunch", "dinner": "Dinner"}
+
+    # Build prep checklist from accepted clusters that have prep_tasks in DB
+    prep_checklist = []
+    for c in accepted:
+        db_rec = _db_map.get(c.get("recipe_id", ""))
+        tasks = db_rec.get("prep_tasks") if db_rec else None
+        if tasks:
+            prep_checklist.append({"name": c.get("clusterName", db_rec["base"]["title"]), "tasks": tasks})
+
+    # Load desserts for this week
+    dessert_ids: list = week_plan.get("desserts", list(request.session.get("desserts", [])))
+    dessert_recipes = [_db_map[rid] for rid in dessert_ids if rid in _db_map]
+
+    # Add dessert ingredients, merging into existing items where possible
+    if dessert_recipes:
+        raw_items_map: dict = {item["key"]: item for item in raw_items}
+        seen_dessert: set = set()
+        for dr in dessert_recipes:
+            recipe_title = dr.get("base", {}).get("title", "Dessert")
+            recipe_lines: list = []
+            for ing_str in dr.get("base", {}).get("ingredients", []):
+                qty, unit, base_name = _parse_dessert_ingredient(ing_str)
+                key = _normalize_ingredient(base_name)
+                if not key:
+                    continue
+                cat = _categorize_dessert_ingredient(base_name)
+                display = ing_str.split(",")[0].strip()
+
+                if key in raw_items_map:
+                    # Merge: add quantity to the existing grocery item
+                    existing = raw_items_map[key]
+                    if qty is not None:
+                        ex_unit = (existing.get("unit") or "").lower()
+                        if ex_unit == unit.lower() or not unit or not ex_unit:
+                            try:
+                                ex_qty = float(existing.get("amount") or 0)
+                                merged = ex_qty + qty
+                                existing["amount"] = str(int(merged)) if merged == int(merged) else str(round(merged, 2))
+                            except (ValueError, TypeError):
+                                pass
+                    recipe_lines.append({**existing, "name": display})
+                else:
+                    unique_key = "d_" + key
+                    amt_str = str(int(qty)) if qty is not None and qty == int(qty) else (str(round(qty, 2)) if qty is not None else "")
+                    item = {"name": base_name, "key": unique_key, "amount": amt_str, "unit": unit or "", "category": cat, "dessert": True}
+                    recipe_lines.append(item)
+                    if key not in seen_dessert:
+                        seen_dessert.add(key)
+                        raw_items_map[unique_key] = item
+                        grocery_by_category.setdefault(cat, []).append(item)
+                        raw_items = raw_items + [item]
+            if recipe_lines:
+                grocery_by_recipe.append({"name": recipe_title, "meal_type": "dessert", "lines": recipe_lines})
+
+    # Build dessert_calories from USDA (background) or DB/estimated calories_per_serving
+    dessert_calories: dict = {}
+    for di, dr in enumerate(dessert_recipes):
+        dkey = f"{sk_mac}:dessert:{di}"
+        title = dr.get("base", {}).get("title", "")
+        if not title:
+            continue
+        usda_d = _macro_store.get(dkey)
+        if isinstance(usda_d, list) and usda_d:
+            cal = usda_d[0].get("calories", 0)
+            if cal:
+                dessert_calories[title] = int(round(cal * portion_scale))
+                continue
+        db_cal_d = _estimate_recipe_calories(dr)
+        if db_cal_d:
+            dessert_calories[title] = int(round(db_cal_d * portion_scale))
+        # Trigger USDA computation if not yet started
+        if USDA_API_KEY and dkey not in _macro_store:
+            _macro_store[dkey] = "computing"
+            background_tasks.add_task(_bg_compute_macros, dkey, dr, int(get_prefs(request).get("servings", 2)))
+
+    # week_nav and view_week_label already built above (before the empty check)
 
     return templates.TemplateResponse(
         "plan.html",
         {
             "request": request,
             "preferences": prefs,
-            "meal_types": meal_types,
+            "meal_labels": meal_labels,
             "accepted_clusters": accepted,
             "calendar": calendar,
+            "has_meals": bool(calendar),
             "grocery_list": raw_items,
             "grocery_by_category": grocery_by_category,
             "grocery_by_recipe": grocery_by_recipe,
             "checked_items": checked,
-            "week_key": selected_week,
+            "week_key": view_week,
+            "meal_calories": meal_calories,
+            "week_nav": week_nav,
+            "current_week": current_week,
+            "view_week_label": view_week_label,
+            "dessert_recipes": dessert_recipes,
+            "dessert_calories": dessert_calories,
+            "prep_checklist": prep_checklist,
+            "portion_scale": portion_scale,
+            "calorie_goal": calorie_goal,
         },
     )
+
+
+@app.post("/planner/set")
+async def planner_set(
+    request: Request,
+    day: str = Form(...),
+    slot: str = Form(...),
+    meal_name: str = Form(...),
+):
+    if day not in DAYS_SHORT or slot not in ("breakfast", "lunch", "dinner"):
+        return HTMLResponse("", status_code=400)
+    planner = request.session.get("planner", {})
+    planner.setdefault(day, {})[slot] = meal_name
+    request.session["planner"] = planner
+    return HTMLResponse("")
+
+
+@app.post("/planner/clear")
+async def planner_clear(
+    request: Request,
+    day: str = Form(...),
+    slot: str = Form(...),
+):
+    planner = request.session.get("planner", {})
+    if day in planner and slot in planner[day]:
+        del planner[day][slot]
+        if not planner[day]:
+            del planner[day]
+    request.session["planner"] = planner
+    return HTMLResponse("")
+
+
+@app.post("/dessert/toggle/{recipe_id}")
+async def dessert_toggle(request: Request, recipe_id: str):
+    desserts: list = list(request.session.get("desserts", []))
+    if recipe_id in desserts:
+        desserts.remove(recipe_id)
+        added = False
+    else:
+        desserts.append(recipe_id)
+        added = True
+    request.session["desserts"] = desserts
+    return JSONResponse({"added": added, "id": recipe_id})
 
 
 @app.get("/browse", response_class=HTMLResponse)
 async def browse_recipes(request: Request):
     prefs = get_prefs(request)
     favorite_ids: list = prefs.get("favorited_recipes", [])
-    selected_meal_types: list = prefs.get("mealTypes", ["breakfast", "lunch", "dinner"])
+    selected_meal_types: list = ["breakfast", "lunch", "dinner"]
 
-    groups: dict[str, list] = {"breakfast": [], "lunch": [], "dinner": []}
-    cuisine_groups: dict[str, list] = {"Italian": [], "Mexican": [], "Japanese": [], "Chinese": [], "American": [], "French": [], "Korean": [], "Mediterranean": [], "Indian": [], "Spanish": [], "Vietnamese": []}
+    groups: dict[str, list] = {"breakfast": [], "lunch": [], "dinner": [], "dessert": []}
+    cuisine_groups: dict[str, list] = {"Italian": [], "Mexican": [], "Japanese": [], "Chinese": [], "American": [], "French": [], "Korean": [], "Mediterranean": [], "Indian": [], "Spanish": [], "Vietnamese": [], "Thai": [], "Dessert": []}
     all_entries: list = []
     recipe_data: dict = {}
 
@@ -8017,6 +18327,7 @@ async def browse_recipes(request: Request):
         rid = recipe["_id"]
         meal_types = _RECIPE_MEAL_TYPES.get(rid, ["lunch", "dinner"])
         cuisine = _RECIPE_CUISINE.get(rid)
+        use_names = [u["name"] for u in recipe.get("uses", [])]
         entry = {
             "id": rid,
             "image": recipe.get("image", ""),
@@ -8026,17 +18337,17 @@ async def browse_recipes(request: Request):
                 recipe["base"]["title"],
                 recipe.get("intro", ""),
                 " ".join(recipe.get("_keywords", [])),
-                " ".join(u["name"] for u in recipe.get("uses", [])),
+                " ".join(use_names),
             ]).lower(),
-            "uses_names": [u["name"] for u in recipe.get("uses", [])],
+            "uses_names": use_names,
             "meal_types": meal_types,
             "cuisine": cuisine,
         }
         recipe_data[rid] = {
             "id": rid,
-            "image": recipe.get("image", ""),
-            "title": recipe["base"]["title"],
-            "intro": recipe.get("intro", ""),
+            "image": entry["image"],
+            "title": entry["title"],
+            "intro": entry["intro"],
             "ingredients": recipe["base"].get("ingredients", []),
             "steps": recipe["base"].get("steps", []),
             "uses": [
@@ -8106,6 +18417,32 @@ async def browse_recipes(request: Request):
     })
 
 
+@app.get("/recipe/{recipe_id}")
+async def get_recipe_detail(recipe_id: str):
+    for recipe in RECIPE_DB:
+        if recipe["_id"] == recipe_id:
+            return JSONResponse({
+                "id": recipe_id,
+                "image": recipe.get("image", ""),
+                "title": recipe["base"]["title"],
+                "intro": recipe.get("intro", ""),
+                "ingredients": recipe["base"].get("ingredients", []),
+                "steps": recipe["base"].get("steps", []),
+                "uses": [
+                    {
+                        "name": u["name"],
+                        "subtitle": u.get("subtitle", ""),
+                        "image": u.get("image", ""),
+                        "extras": u.get("extras", []),
+                        "steps": u.get("steps", []),
+                        "tip": u.get("tip"),
+                    }
+                    for u in recipe.get("uses", [])
+                ],
+            })
+    return JSONResponse({}, status_code=404)
+
+
 @app.post("/favorite/{recipe_id}")
 async def toggle_favorite(request: Request, recipe_id: str):
     prefs = get_prefs(request)
@@ -8118,34 +18455,74 @@ async def toggle_favorite(request: Request, recipe_id: str):
         is_fav = True
     prefs["favorited_recipes"] = favs
     request.session["preferences"] = prefs
+    _persist_user(request)
     return JSONResponse({"favorited": is_fav, "id": recipe_id})
 
 
 @app.get("/grocery", response_class=HTMLResponse)
 async def grocery_page(request: Request):
     prefs = get_prefs(request)
-    plans_by_week: dict = request.session.get("plans_by_week", {})
+    plans_by_week: dict = get_plans_by_week(request)
+    shopping_frequency = prefs.get("shoppingFrequency", "weekly")
+
+    # Collect all week keys that have plans, oldest-first for pairing
+    valid_weeks = sorted(wk for wk, p in plans_by_week.items() if p.get("clusters"))
 
     weeks_data = []
-    for week_key in sorted(plans_by_week.keys(), reverse=True):
-        plan = plans_by_week[week_key]
-        accepted = plan.get("clusters", [])
-        if not accepted:
-            continue
-        meal_prep_days = plan.get("meal_prep_days", prefs.get("mealPrepDays", ["Mon","Tue","Wed","Thu","Fri"]))
-        week_dates = _week_dates(week_key)
-        week_range = f"{week_dates[0].strftime('%b %-d')} – {week_dates[6].strftime('%b %-d')}"
-        raw_items, grocery_by_category = _build_grocery_data(accepted, meal_prep_days)
-        grocery_by_recipe = _build_grocery_by_recipe(accepted)
-        checked = request.session.get(f"checked_{week_key}", [])
-        weeks_data.append({
-            "week_key": week_key,
-            "week_range": week_range,
-            "grocery_list": raw_items,
-            "grocery_by_category": grocery_by_category,
-            "grocery_by_recipe": grocery_by_recipe,
-            "checked_items": checked,
-        })
+
+    if shopping_frequency == "biweekly":
+        # Pair consecutive weeks: [wk0, wk1], [wk2, wk3], ...
+        pairs = [valid_weeks[i:i + 2] for i in range(0, len(valid_weeks), 2)]
+        for pair in reversed(pairs):  # newest pair first
+            combined_accepted = []
+            combined_meal_days = prefs.get("mealPrepDays", ["Mon", "Tue", "Wed", "Thu", "Fri"])
+            combined_checked = []
+            for wk in pair:
+                plan = plans_by_week[wk]
+                combined_accepted.extend(plan.get("clusters", []))
+                combined_meal_days = plan.get("meal_prep_days", combined_meal_days)
+                combined_checked.extend(request.session.get(f"checked_{wk}", []))
+            if not combined_accepted:
+                continue
+            first_dates = _week_dates(pair[0])
+            last_dates = _week_dates(pair[-1])
+            week_range = f"{first_dates[0].strftime('%b %-d')} – {last_dates[6].strftime('%b %-d')}"
+            panel_key = pair[0]  # use first week as the panel id
+            raw_items, grocery_by_category = _build_grocery_data(combined_accepted, combined_meal_days)
+            grocery_by_recipe = _build_grocery_by_recipe(combined_accepted)
+            combined_calendar, _ = _build_calendar(combined_accepted, combined_meal_days)
+            weeks_data.append({
+                "week_key": panel_key,
+                "week_range": week_range,
+                "grocery_list": raw_items,
+                "grocery_by_category": grocery_by_category,
+                "grocery_by_recipe": grocery_by_recipe,
+                "checked_items": list(set(combined_checked)),
+                "clusters": combined_accepted,
+                "calendar": combined_calendar,
+            })
+    else:
+        for week_key in reversed(valid_weeks):  # newest first
+            plan = plans_by_week[week_key]
+            accepted = plan.get("clusters", [])
+            wk_planner = plan.get("planner")
+            meal_prep_days = plan.get("meal_prep_days", prefs.get("mealPrepDays", ["Mon", "Tue", "Wed", "Thu", "Fri"]))
+            week_dates = _week_dates(week_key)
+            week_range = f"{week_dates[0].strftime('%b %-d')} – {week_dates[6].strftime('%b %-d')}"
+            raw_items, grocery_by_category = _build_grocery_data(accepted, meal_prep_days)
+            grocery_by_recipe = _build_grocery_by_recipe(accepted)
+            calendar, _ = _build_calendar(planner=wk_planner) if wk_planner else _build_calendar(accepted, meal_prep_days)
+            checked = request.session.get(f"checked_{week_key}", [])
+            weeks_data.append({
+                "week_key": week_key,
+                "week_range": week_range,
+                "grocery_list": raw_items,
+                "grocery_by_category": grocery_by_category,
+                "grocery_by_recipe": grocery_by_recipe,
+                "checked_items": checked,
+                "clusters": accepted,
+                "calendar": calendar,
+            })
 
     active_week = request.query_params.get("week", weeks_data[0]["week_key"] if weeks_data else "")
     return templates.TemplateResponse(
@@ -8155,6 +18532,7 @@ async def grocery_page(request: Request):
             "preferences": prefs,
             "weeks": weeks_data,
             "active_week": active_week,
+            "shopping_frequency": shopping_frequency,
         },
     )
 
@@ -8176,38 +18554,224 @@ async def toggle_grocery(request: Request, item_key: str, week: str = Query(""))
     )
 
 
-@app.get("/recipes", response_class=HTMLResponse)
-async def recipes_page(request: Request):
+@app.get("/grocery/substitute", response_class=HTMLResponse)
+async def grocery_substitute(request: Request, ingredient: str = Query("")):
+    if not ingredient:
+        return HTMLResponse("")
+    try:
+        raw = await _gemini(
+            f"Give exactly 3 common ingredient substitutions for '{ingredient}' in cooking. "
+            "Format: one substitute per line, very brief (e.g. 'Greek yogurt, same amount'). "
+            "No intro, no numbering, no bullets, no extra text."
+        )
+        subs = [s.strip() for s in raw.strip().split("\n") if s.strip()][:3]
+        html_items = "".join(f"<li>{s}</li>" for s in subs)
+        return HTMLResponse(
+            f'<div class="sub-suggestions">'
+            f'<p class="sub-suggestions-label">Swap ideas</p>'
+            f'<ul class="sub-suggestions-list">{html_items}</ul>'
+            f'<button class="sub-close" onclick="this.closest(\'.sub-suggestions\').remove()">✕</button>'
+            f'</div>'
+        )
+    except Exception:
+        return HTMLResponse('<div class="sub-suggestions"><p class="sub-loading">Couldn\'t load substitutions.</p></div>')
+
+
+@app.get("/plan", response_class=HTMLResponse)
+async def recipes_page(request: Request, background_tasks: BackgroundTasks, week: str = None):
+    today = date.today()
+    current_week = _week_key(today)
+    plans_by_week: dict = get_plans_by_week(request)
+
+    # Resolve view week from param or session
+    if week and re.match(r"^\d{4}-W\d{2}$", week):
+        view_week = week
+        request.session["selectedWeek"] = week
+    else:
+        view_week = request.session.get("selectedWeek", current_week)
+
+    # Save any in-progress session clusters into plans_by_week (same as /plan does)
     clusters = load_clusters(request)
+    accepted_now = [c for c in clusters if c.get("accepted")]
+    if accepted_now:
+        prefs = get_prefs(request)
+        week_days: list = prefs.get("mealPrepDays", ["Mon", "Tue", "Wed", "Thu", "Fri"])
+        planner: dict = request.session.get("planner", {})
+        desserts = sorted(request.session.get("desserts", []))
+        new_cluster_ids = sorted(c.get("_id", c.get("base", {}).get("title", "")) for c in accepted_now)
+        plans_by_week[view_week] = {
+            "clusters": accepted_now,
+            "meal_prep_days": week_days,
+            "planner": planner,
+            "desserts": desserts,
+        }
+        save_plans_by_week(request, plans_by_week)
+        sk = _store_key(request)
+        last = _persisted_state.get(sk, {})
+        if (last.get("week") != view_week
+                or last.get("cluster_ids") != new_cluster_ids
+                or last.get("planner") != planner
+                or last.get("desserts") != desserts):
+            _persist_user(request)
+            _persisted_state[sk] = {"week": view_week, "cluster_ids": new_cluster_ids,
+                                    "planner": planner, "desserts": desserts}
+
+    # Build week nav (same pattern as grocery page)
+    def _fmt_wk(wk: str) -> str:
+        try:
+            d = _week_dates(wk)
+            return f"{d[0].strftime('%b %-d')} – {d[-1].strftime('%-d')}"
+        except Exception:
+            return wk
+
+    plan_keys = set(plans_by_week.keys())
+    future_keys = {_week_key(today + timedelta(weeks=i)) for i in range(0, 9)}
+    all_nav = sorted(plan_keys | future_keys, reverse=True)
+    view_week_label = _fmt_wk(view_week)
+    week_nav = [{"key": w, "label": _fmt_wk(w), "active": w == view_week, "has_plan": w in plans_by_week} for w in all_nav]
+    idx = next((i for i, w in enumerate(all_nav) if w == view_week), 0)
+    prev_week_r = week_nav[idx + 1] if idx + 1 < len(week_nav) else None
+    next_week_r = week_nav[idx - 1] if idx > 0 else None
+
+    week_ctx = {
+        "view_week": view_week,
+        "view_week_label": view_week_label,
+        "week_nav": week_nav,
+        "prev_week": prev_week_r,
+        "next_week": next_week_r,
+        "current_week": current_week,
+        "week_key": view_week,
+    }
+
+    week_plan = plans_by_week.get(view_week)
     _mt_order = {"breakfast": 0, "lunch": 1, "dinner": 2}
     accepted = sorted(
-        [c for c in clusters if c.get("accepted")],
+        [c for c in (week_plan.get("clusters", []) if week_plan else []) if c.get("accepted")],
         key=lambda c: _mt_order.get(c.get("mealType", ""), 99),
     )
-    if not accepted:
-        return RedirectResponse("/suggest")
 
-    sk = _store_key(request)
+    if not accepted:
+        return templates.TemplateResponse("recipes.html", {
+            "request": request,
+            "recipe_clusters": None,
+            "preferences": get_prefs(request),
+            **week_ctx,
+        })
+
+    sk = f"{_store_key(request)}:{view_week}"
     cached = _recipe_store.get(sk)
     if not cached:
-        cached = await _generate_recipes(accepted, request)
-        _recipe_store[sk] = cached
+        try:
+            cached = await _generate_recipes(accepted, request)
+        except Exception:
+            cached = []
+        if cached:
+            _recipe_store[sk] = cached
+
+    prefs = get_prefs(request)
+    servings: int = int(prefs.get("servings", 2))
+
+    # Kick off USDA macro computation per cluster if not yet computed
+    if cached and USDA_API_KEY:
+        for ci, cluster in enumerate(cached):
+            mkey = f"{sk}:{ci}"
+            if mkey not in _macro_store:
+                _macro_store[mkey] = "computing"
+                background_tasks.add_task(_bg_compute_macros, mkey, cluster, servings)
 
     return templates.TemplateResponse(
         "recipes.html",
         {
             "request": request,
-            "preferences": get_prefs(request),
+            "preferences": prefs,
             "recipe_clusters": cached,
+            "macro_sk": sk,
+            "usda_enabled": bool(USDA_API_KEY),
+            **week_ctx,
         },
     )
+
+
+@app.get("/api/macros/{ci}/{ui}", response_class=HTMLResponse)
+async def macros_fragment(request: Request, ci: int, ui: int, sk: str = ""):
+    """HTMX polling endpoint — returns one use's macro pills, or empty to keep polling."""
+    if not sk:
+        return HTMLResponse("")
+    mkey = f"{sk}:{ci}"
+    result = _macro_store.get(mkey)
+    if result == "computing" or result is None:
+        return HTMLResponse("")  # still working — poll again
+    if not result or ui >= len(result):
+        return HTMLResponse(f'<div id="macros-{ci}-{ui}"></div>')  # nothing to show, stop polling
+    m = result[ui]
+    return HTMLResponse(
+        f'<div id="macros-{ci}-{ui}" class="macro-pills">'
+        f'<span class="macro-pill macro-cal">{m["calories"]} kcal</span>'
+        f'<span class="macro-pill macro-p">{m["protein_g"]}g protein</span>'
+        f'<span class="macro-pill macro-c">{m["carbs_g"]}g carbs</span>'
+        f'<span class="macro-pill macro-f">{m["fat_g"]}g fat</span>'
+        f'</div>'
+    )
+
+
+@app.get("/api/macros-panel/{ci}", response_class=HTMLResponse)
+async def macros_panel(request: Request, background_tasks: BackgroundTasks, ci: int, sk: str = ""):
+    """HTMX endpoint — returns full macro table for all uses of a cluster."""
+    if not sk:
+        return HTMLResponse("")
+    if not USDA_API_KEY:
+        return HTMLResponse('<p style="color:var(--text-3);font-size:.8rem;padding:10px 0;">Add <code>USDA_API_KEY</code> to your .env file to enable macro tracking.</p>')
+    mkey = f"{sk}:{ci}"
+    result = _macro_store.get(mkey)
+    if result is None:
+        # Not yet started or previously failed — retry if we have the cluster data
+        cached = _recipe_store.get(sk, [])
+        if cached and ci < len(cached):
+            prefs = get_prefs(request)
+            servings = int(prefs.get("servings", 2))
+            _macro_store[mkey] = "computing"
+            background_tasks.add_task(_bg_compute_macros, mkey, cached[ci], servings)
+            result = "computing"
+    if result == "computing":
+        return HTMLResponse(
+            f'<div hx-get="/api/macros-panel/{ci}?sk={sk}" hx-trigger="every 4s" hx-swap="outerHTML"'
+            f' style="color:var(--text-3);font-size:.8rem;padding:10px 0;">Computing macros…</div>'
+        )
+    if not result or not isinstance(result, list):
+        return HTMLResponse('<p style="color:var(--text-3);font-size:.8rem;padding:10px 0;">Macros unavailable for this recipe.</p>')
+    cached = _recipe_store.get(sk, [])
+    cluster = cached[ci] if cached and ci < len(cached) else {}
+    uses = cluster.get("uses", [])
+    rows = ""
+    for ui, m in enumerate(result):
+        name = uses[ui].get("name", f"Variation {ui + 1}") if ui < len(uses) else f"Variation {ui + 1}"
+        rows += (
+            f"<tr>"
+            f"<td class='mp-name'>{name}</td>"
+            f"<td class='mp-num'>{m.get('calories', '—')}</td>"
+            f"<td class='mp-num'>{m.get('protein_g', '—')}g</td>"
+            f"<td class='mp-num'>{m.get('fat_g', '—')}g</td>"
+            f"<td class='mp-num'>{m.get('carbs_g', '—')}g</td>"
+            f"</tr>"
+        )
+    html = (
+        "<table class='macros-table'>"
+        "<thead><tr>"
+        "<th>Variation</th><th>Cal</th><th>Protein</th><th>Fat</th><th>Carbs</th>"
+        "</tr></thead>"
+        f"<tbody>{rows}</tbody>"
+        "</table>"
+    )
+    return HTMLResponse(html)
 
 
 @app.post("/recipes/regenerate")
 async def regenerate_recipes(request: Request):
     sk = _store_key(request)
-    _recipe_store.pop(sk, None)
-    return RedirectResponse("/recipes", status_code=303)
+    for k in list(_recipe_store.keys()):
+        if k.startswith(sk):
+            del _recipe_store[k]
+    return RedirectResponse("/plan", status_code=303)
 
 
 def _db_recipe_for_cluster(cluster_summary: dict, used_db_ids: set) -> dict | None:
@@ -8230,8 +18794,8 @@ def _db_recipe_for_cluster(cluster_summary: dict, used_db_ids: set) -> dict | No
     return None
 
 
-async def _ai_recipe(client, cluster_summary: dict, servings: int, dietary_note: str, other_bases: list[str]) -> dict | None:
-    """Generate a recipe via AI. other_bases lists base titles already used ] avoid repeating them."""
+async def _ai_recipe(cluster_summary: dict, servings: int, dietary_note: str, other_bases: list[str]) -> dict | None:
+    """Generate a recipe via AI. other_bases lists base titles already used. Avoid repeating them."""
     meal_names: list = cluster_summary.get("meals", [])
 
     uses_instruction = ""
@@ -8251,6 +18815,12 @@ Use these exact strings as each "name" field, in this order:
 Cluster:
 {json.dumps(cluster_summary, indent=2)}
 {uses_instruction}
+
+INGREDIENT COMPLETENESS (critical):
+- Include EVERY ingredient actually needed: salt, sugar, oil, butter, baking powder, baking soda, vinegar, soy sauce, spices, seasonings, herbs, flour, eggs, dairy — nothing omitted.
+- If a real recipe for this dish requires a leavening agent, sweetener, fat, acid, or seasoning, it must appear in the list.
+- Format each as "amount unit ingredient", e.g. "1 tsp baking powder", "2 tbsp sugar", "0.5 tsp salt".
+- A cook should be able to make this from the list alone without looking anything up.
 
 CRITICAL JSON RULES:
 - Straight double quotes only. No curly/smart quotes.
@@ -8278,13 +18848,7 @@ Return exactly this JSON (no markdown):
   ]
 }}"""
 
-    message = await asyncio.to_thread(
-        client.messages.create,
-        model="claude-haiku-4-5-20251001",
-        max_tokens=4000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = message.content[0].text
+    raw = await _gemini(prompt)
     json_match = re.search(r"\{[\s\S]*\}", raw)
     if not json_match:
         return None
@@ -8293,6 +18857,33 @@ Return exactly this JSON (no markdown):
         return json.loads(json_str)
     except json.JSONDecodeError:
         return None
+
+
+def _fallback_recipe_from_cluster(cluster_summary: dict) -> dict:
+    """Build a minimal recipe card from cluster data when AI generation fails."""
+    meal_names = cluster_summary.get("meals", [])
+    return {
+        "id": cluster_summary.get("id"),
+        "intro": cluster_summary.get("tagline", ""),
+        "base": {
+            "title": cluster_summary.get("name", "Meal Prep"),
+            "ingredients": cluster_summary.get("ingredients", []),
+            "steps": [
+                "Prep and measure all ingredients.",
+                "Cook using your preferred method.",
+                "Divide into portions and store in airtight containers for up to 4 days.",
+            ],
+        },
+        "uses": [
+            {
+                "name": name,
+                "extras": [],
+                "steps": [f"Serve with the base prep."],
+                "tip": None,
+            }
+            for name in meal_names
+        ],
+    }
 
 
 async def _generate_recipes(accepted: list, request: Request) -> list:
@@ -8314,9 +18905,7 @@ async def _generate_recipes(accepted: list, request: Request) -> list:
             ],
         })
 
-    client = get_anthropic_client()
-
-    # Phase 1: sequential DB matching [ each DB entry used at most once
+    # Phase 1: sequential DB matching. Each DB entry used at most once
     used_db_ids: set = set()
     plan: list = []  # list of ("db", recipe) or ("ai", cluster_summary)
     for cs in clusters_summary:
@@ -8331,11 +18920,12 @@ async def _generate_recipes(accepted: list, request: Request) -> list:
     ai_items = [(i, cs) for i, (kind, cs) in enumerate(plan) if kind == "ai"]
 
     ai_results = await asyncio.gather(*[
-        _ai_recipe(client, cs, servings, dietary_note, db_bases)
+        _ai_recipe(cs, servings, dietary_note, db_bases)
         for _, cs in ai_items
-    ])
+    ], return_exceptions=True)
+    ai_results = [r if not isinstance(r, BaseException) else None for r in ai_results]
 
-    # Merge back in original order
+    # Merge back in original order; fall back to cluster data if AI fails
     ai_iter = iter(ai_results)
     final = []
     for kind, data in plan:
@@ -8343,8 +18933,7 @@ async def _generate_recipes(accepted: list, request: Request) -> list:
             final.append(data)
         else:
             r = next(ai_iter)
-            if r:
-                final.append(r)
+            final.append(r if r else _fallback_recipe_from_cluster(data))
 
     return final
 
@@ -8363,7 +18952,7 @@ async def dashboard(request: Request):
         selected_week = current_week
         week_dates_list = _week_dates(selected_week)
 
-    # Calendar month to display ] default to month of selected week's Monday
+    # Calendar month to display. Default to month of selected week's Monday
     cal_year = int(request.session.get("calYear", week_dates_list[0].year))
     cal_month = int(request.session.get("calMonth", week_dates_list[0].month))
     month_weeks = _month_weeks(cal_year, cal_month)
@@ -8371,13 +18960,12 @@ async def dashboard(request: Request):
     clusters = load_clusters(request)
     accepted = [c for c in clusters if c.get("accepted")]
     prefs = get_prefs(request)
-    meal_types = prefs.get("mealTypes", [])
-    meal_prep_days = prefs.get("mealPrepDays", ["Mon", "Tue", "Wed", "Thu", "Fri"])
+    _week_plan = get_plans_by_week(request).get(selected_week, {})
     day_completions = request.session.get("dayCompletions", {})
 
     calendar_data = []
     if accepted:
-        cal, _ = _build_calendar(accepted, meal_prep_days)
+        cal, _ = _build_calendar(accepted)
         day_name_to_date = {DAYS_SHORT[d.weekday()]: d for d in week_dates_list}
         for cal_day in cal:
             d = day_name_to_date.get(cal_day["short"])
@@ -8488,7 +19076,37 @@ async def new_plan(request: Request):
     request.session.pop("cuisinePreferences", None)
     request.session.pop("checkedGrocery", None)
     request.session.pop("mode", None)
+    request.session.pop("weekDays", None)
+    request.session.pop("planner", None)
     return RedirectResponse("/mode")
+
+
+@app.post("/plan-week")
+async def plan_week_route(request: Request, week: str = Form(...)):
+    """Start a completely fresh plan for a specific week (wipes all plan state)."""
+    if re.match(r"^\d{4}-W\d{2}$", week):
+        request.session["selectedWeek"] = week
+    clear_clusters(request)
+    _recipe_store.pop(_store_key(request), None)
+    for key in ["existingIngredients", "cuisinePreferences", "checkedGrocery",
+                "mode", "weekDays", "planner", "desserts", "preferences"]:
+        request.session.pop(key, None)
+    return RedirectResponse("/setup", status_code=303)
+
+
+@app.post("/plan/copy")
+async def copy_plan(request: Request, from_week: str = Form(...), to_week: str = Form(...)):
+    """Copy a full plan from one week to another."""
+    if not (re.match(r"^\d{4}-W\d{2}$", from_week) and re.match(r"^\d{4}-W\d{2}$", to_week)):
+        return RedirectResponse("/plan", status_code=303)
+    plans = get_plans_by_week(request)
+    src = plans.get(from_week)
+    if src and from_week != to_week:
+        import copy as _copy
+        plans[to_week] = _copy.deepcopy(src)
+        save_plans_by_week(request, plans)
+        request.session["selectedWeek"] = to_week
+    return RedirectResponse(f"/plan?week={to_week}", status_code=303)
 
 
 @app.get("/reset")

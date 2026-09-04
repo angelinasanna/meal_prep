@@ -1,10 +1,13 @@
 {% set difficulty_colors = {'Easy': 'difficulty-easy', 'Medium': 'difficulty-medium', 'Hard': 'difficulty-hard'} %}
 {% set diff_class = difficulty_colors[cluster.difficulty] if cluster.difficulty in difficulty_colors else 'difficulty-easy' %}
+{% set mt_labels = {'breakfast': 'Breakfast', 'lunch': 'Lunch', 'dinner': 'Dinner'} %}
+{% set mt_badge  = {'breakfast': 'badge-breakfast', 'lunch': 'badge-lunch', 'dinner': 'badge-dinner'} %}
+{% set mt_next   = {'breakfast': 'lunch', 'lunch': 'dinner', 'dinner': 'breakfast'} %}
 
 <div
   class="cluster-card {% if cluster.accepted %}accepted{% endif %}"
   id="cluster-{{ cluster.id }}"
-  data-meal-type="{{ cluster.mealType }}"
+  data-category="{{ cluster.clusterCategory or 'main' }}"
 >
   {% if cluster.accepted %}
   <div class="cluster-accepted-bar">
@@ -13,50 +16,52 @@
   </div>
   {% endif %}
 
+  {% if cluster.image %}
+  <img src="{{ cluster.image }}" alt="{{ cluster.clusterName }}"
+       style="width:100%;aspect-ratio:4/3;object-fit:cover;display:block;">
+  {% endif %}
+
   <div class="cluster-body">
     <div class="cluster-top">
-      <div>
-        <div class="cluster-name">{{ cluster.clusterName }}</div>
-        <div class="cluster-tagline">{{ cluster.tagline }}</div>
-      </div>
+      <div class="cluster-name">{{ cluster.clusterName }}</div>
     </div>
 
-    <div class="meals-label">Meals from this set</div>
-    <div class="meals-list">
+    <!-- Meals list — deduplicated, max 3 shown -->
+    <div class="cluster-meals-list">
+      {% set ns = namespace(seen=[]) %}
       {% for meal in cluster.meals %}
-      <div class="meal-item">
-        <div class="meal-dot"></div>
-        <div>
-          <div class="meal-item-name">{{ meal.name }}</div>
-          {% if meal.description %}
-          <div class="meal-item-desc">{{ meal.description }}</div>
-          {% endif %}
-        </div>
+      {% if meal.name and meal.name not in ns.seen and ns.seen | length < 3 %}
+      {% set ns.seen = ns.seen + [meal.name] %}
+      <div class="cluster-meal-item"
+           data-meal="{{ meal.name | e }}"
+           data-type="{{ meal.mealType or 'dinner' }}">
+        <button
+          class="section-badge {{ mt_badge.get(meal.mealType or 'dinner', 'badge-dinner') }} chip-badge"
+          title="Tap to change meal type"
+          hx-post="/cluster/{{ cluster.id }}/meal-type"
+          hx-vals='{"meal_name": "{{ meal.name | e }}", "next_type": "{{ mt_next.get(meal.mealType or 'dinner', 'breakfast') }}"}'
+          hx-target="#cluster-{{ cluster.id }}"
+          hx-swap="outerHTML"
+        >{{ mt_labels.get(meal.mealType or 'dinner', '') }}</button>
+        <span class="chip-name">{{ meal.name }}</span>
+        {% if meal.calories %}<span class="meal-cal-badge" title="Estimated from meal type and primary ingredients">{{ meal.calories }} cal</span>{% endif %}
       </div>
+      {% endif %}
       {% endfor %}
     </div>
 
-    <div class="ingredients-label">Ingredients</div>
-    <div class="ingredient-tags">
-      {% for ing in cluster.ingredients %}
-        {% if ing.userHas and mode == 'existing' %}
-        <span class="ing-tag have">{{ ing.name }}</span>
-        {% else %}
-        <span class="ing-tag">{{ ing.amount }} {{ ing.unit }} {{ ing.name }}</span>
-        {% endif %}
-      {% endfor %}
-    </div>
-
-    {% if not cluster.accepted %}
-    <div class="cluster-actions">
-      <button
-        class="btn-accept"
-        hx-post="/toggle/{{ cluster.id }}"
-        hx-target="#cluster-{{ cluster.id }}"
-        hx-swap="outerHTML"
-      >
-        Add to plan
-      </button>
+    {% if cluster.accepted %}
+    <button
+      class="btn-undo"
+      style="margin-top:12px;"
+      hx-post="/toggle/{{ cluster.id }}"
+      hx-target="#cluster-{{ cluster.id }}"
+      hx-swap="outerHTML"
+    >
+      Remove from plan
+    </button>
+    {% else %}
+    <div class="cluster-actions" style="margin-top:16px;">
       <button
         class="btn-skip"
         hx-post="/skip/{{ cluster.id }}"
@@ -65,16 +70,27 @@
       >
         Try another
       </button>
+      <button
+        class="btn-accept"
+        hx-post="/toggle/{{ cluster.id }}"
+        hx-target="#cluster-{{ cluster.id }}"
+        hx-swap="outerHTML"
+      >
+        Add to plan
+      </button>
     </div>
-    {% else %}
-    <button
-      class="btn-undo"
-      hx-post="/toggle/{{ cluster.id }}"
-      hx-target="#cluster-{{ cluster.id }}"
-      hx-swap="outerHTML"
-    >
-      Remove from plan
-    </button>
+    {% if cluster.recipe_id %}
+    <div style="text-align:center;margin-top:8px;">
+      <button
+        style="background:none;border:none;font-size:.72rem;color:var(--text-3);cursor:pointer;padding:2px 4px;text-decoration:underline;text-underline-offset:2px;"
+        hx-post="/hide-recipe/{{ cluster.recipe_id }}"
+        hx-target="#cluster-{{ cluster.id }}"
+        hx-swap="outerHTML"
+        onclick="this.closest('.cluster-card').style.display='none'"
+      >Never suggest this
+      </button>
+    </div>
+    {% endif %}
     {% endif %}
   </div>
 </div>

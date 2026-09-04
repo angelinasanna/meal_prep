@@ -31,23 +31,13 @@
   });
 
   function validateStep(idx) {
-    if (idx === 0) {
-      const anyChecked = document.querySelectorAll('input[name="meal_types"]:checked');
-      if (!anyChecked.length) {
-        shake(sections[0]);
-        return false;
-      }
-    }
     return true;
   }
 
-  function shake(el) {
-    el.style.animation = 'none';
-    el.offsetHeight;
-    el.style.animation = 'shake .3s ease';
-  }
-
-  show(0);
+  var startStep = new URLSearchParams(window.location.search).get('step') === 'last'
+    ? sections.length - 1
+    : 0;
+  show(startStep);
 })();
 
 // ── Meal type row toggle (driven by native checkbox change) ──
