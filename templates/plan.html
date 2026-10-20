@@ -3,160 +3,633 @@
 {% block extra_container_class %}{% endblock %}
 
 {% block content %}
-{% set meal_labels = {'breakfast': 'Breakfast', 'lunch': 'Lunch', 'dinner': 'Dinner'} %}
+{% if empty %}
+{% set ns_idx = namespace(val=0) %}
+{% for w in (week_nav or []) %}{% if w.active %}{% set ns_idx.val = loop.index0 %}{% endif %}{% endfor %}
+{% set prev_week_e = week_nav[ns_idx.val + 1] if week_nav and ns_idx.val + 1 < week_nav | length else None %}
+{% set next_week_e = week_nav[ns_idx.val - 1] if week_nav and ns_idx.val > 0 else None %}
+<div style="padding-top:12px;">
+  <!-- Week nav — empty state -->
+  <div style="margin-bottom:28px;">
+    <div style="display:flex;align-items:center;gap:8px;">
+    <h1 class="plan-section-title" style="margin:0;flex-shrink:0;">Week of {{ view_week_label or 'this week' }}</h1>
+    <div style="display:flex;align-items:center;gap:4px;flex-shrink:0;margin-left:2px;">
+      {% if prev_week_e %}
+      <a href="/grocery?week={{ prev_week_e.key }}"
+         style="width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:50%;border:1.5px solid var(--border);background:var(--card);color:var(--text-2);text-decoration:none;font-size:.95rem;transition:border-color .15s;"
+         onmouseover="this.style.borderColor='var(--green)'" onmouseout="this.style.borderColor='var(--border)'">‹</a>
+      {% else %}
+      <span style="width:28px;height:28px;opacity:.3;display:flex;align-items:center;justify-content:center;font-size:.95rem;color:var(--border-dk);">‹</span>
+      {% endif %}
+      {% if next_week_e %}
+      <a href="/grocery?week={{ next_week_e.key }}"
+         style="width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:50%;border:1.5px solid var(--border);background:var(--card);color:var(--text-2);text-decoration:none;font-size:.95rem;transition:border-color .15s;"
+         onmouseover="this.style.borderColor='var(--green)'" onmouseout="this.style.borderColor='var(--border)'">›</a>
+      {% else %}
+      <span style="width:28px;height:28px;opacity:.3;display:flex;align-items:center;justify-content:center;font-size:.95rem;color:var(--border-dk);">›</span>
+      {% endif %}
+    </div>
+    </div>
+    <div style="margin-top:6px;min-height:26px;">
+      {% if view_week == current_week %}<span class="dash-week-pill">Current</span>{% endif %}
+    </div>
+  </div>
+
+  <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:40vh;text-align:center;padding:40px 24px;position:relative;overflow:hidden;">
+    <h2 style="font-family:system-ui,-apple-system,sans-serif;font-size:.85rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--black);margin-bottom:10px;">No grocery list yet</h2>
+    <p style="font-size:.9rem;color:var(--text-3);max-width:280px;line-height:1.6;">Plan your meals and your grocery list will appear here.</p>
+  </div>
+</div>
+{% else %}
+{% set meal_labels = meal_labels or {'breakfast': 'Breakfast', 'lunch': 'Lunch', 'dinner': 'Dinner'} %}
+
+<style>
+/* ── Calorie badges ── */
+.cal-day-name {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+}
+
+.cal-day-total {
+  font-size: .6rem;
+  font-weight: 600;
+  color: var(--text-3);
+  white-space: nowrap;
+  letter-spacing: .04em;
+}
+
+.cal-day-total.over-goal,
+.cal-day-total.on-goal,
+.cal-day-total.under-goal { background: none; color: var(--text-3); }
+
+.cal-slot-cal {
+  display: block;
+  font-size: .63rem;
+  color: var(--text-3);
+  margin-top: 2px;
+  font-weight: 500;
+}
+
+/* ── Grocery section doodle border ── */
+.plan-grocery-outer {
+  background-image: linear-gradient(rgba(245,239,226,0.72), rgba(245,239,226,0.72)), url('/static/food-doodle.jpg');
+  background-size: auto, 40% auto;
+  background-repeat: repeat, repeat;
+  background-position: top left, top left;
+  margin: 36px -clamp(16px, 4vw, 48px) 0;
+  padding: 20px 24px 0;
+}
+
+.plan-grocery-inner {
+  background: var(--bg);
+  border-radius: 18px 18px 0 0;
+  padding: clamp(16px, 2.5vw, 24px) clamp(20px, 4vw, 40px) clamp(24px, 4vw, 40px);
+  margin-top: 14px;
+  margin-left: -24px;
+  margin-right: -24px;
+}
+
+/* ── Grocery header row (lives in doodle zone) ── */
+.plan-grocery-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 2px 2px 0;
+}
+
+.plan-grocery-title {
+  font-family: 'Caveat', cursive;
+  font-size: clamp(1.7rem, 4vw, 2.6rem);
+  font-weight: 700;
+  font-style: normal;
+  color: var(--black);
+  margin: 0 0 1px;
+  line-height: 1.1;
+}
+
+.plan-grocery-meta {
+  font-size: .8125rem;
+  color: var(--black);
+  margin: 0;
+}
+
+.plan-grocery-budget {
+  text-align: right;
+  flex-shrink: 0;
+  padding-bottom: 2px;
+}
+
+.plan-grocery-budget-amount {
+  font-size: 1.5rem;
+  font-weight: 800;
+  color: var(--green);
+  line-height: 1;
+  letter-spacing: -.02em;
+}
+
+.plan-grocery-budget-label {
+  font-size: .7rem;
+  color: var(--text-2);
+  margin-top: 2px;
+}
+
+/* ── Controls row ── */
+.plan-grocery-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 18px;
+  flex-wrap: wrap;
+}
+
+.view-toggle {
+  display: flex;
+  gap: 0;
+  padding: 0;
+  background: none;
+  border-bottom: 1.5px solid var(--border-dk);
+  align-self: flex-end;
+}
+
+.view-toggle-btn {
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: .65rem;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  background: none;
+  border: none;
+  border-bottom: 3px solid transparent;
+  margin-bottom: -2px;
+  padding: 2px 14px 8px;
+  cursor: pointer;
+  transition: color .15s, border-color .15s;
+  white-space: nowrap;
+}
+
+.view-toggle-btn:hover:not(.active) {
+  color: var(--text-2);
+}
+
+.view-toggle-btn.active {
+  color: var(--black);
+  font-weight: 700;
+  border-bottom-color: var(--green);
+  background: none;
+  box-shadow: none;
+}
+
+/* ── Per-item remove/substitute menu ── */
+.grocery-item { flex-wrap: wrap; position: relative; }
+.gi-menu-btn {
+  margin-left: auto;
+  background: none;
+  border: none;
+  padding: 2px 6px;
+  font-size: 1rem;
+  color: var(--text-3);
+  cursor: pointer;
+  border-radius: 6px;
+  opacity: 0;
+  transition: opacity .15s, background .15s;
+  flex-shrink: 0;
+}
+.grocery-item:hover .gi-menu-btn,
+.grocery-item.menu-open .gi-menu-btn { opacity: 1; }
+.gi-menu-btn:hover { background: var(--bg); color: var(--text-2); }
+.gi-action-bar {
+  width: 100%;
+  display: flex;
+  gap: 8px;
+  padding: 4px 0 2px 36px;
+}
+.gi-sub-row {
+  width: 100%;
+  display: flex;
+  gap: 8px;
+  padding: 4px 0 4px 36px;
+  align-items: center;
+}
+.gi-action-btn {
+  font-size: .72rem;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1.5px solid var(--border);
+  background: var(--card);
+  color: var(--text-2);
+  cursor: pointer;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.gi-action-btn:hover { border-color: var(--pond); color: var(--pond); background: #e8f4f0; }
+.gi-remove-btn:hover { border-color: #e57373; color: #c0392b; background: #fef0ee; }
+.gi-sub-input {
+  flex: 1;
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  padding: 5px 10px;
+  font-size: .8rem;
+  background: var(--card);
+  color: var(--black);
+  outline: none;
+}
+.gi-sub-input:focus { border-color: var(--pond); }
+
+.store-select {
+  border: 1.5px solid var(--border);
+  border-radius: 20px;
+  padding: 5px 28px 5px 12px;
+  font-size: .78rem;
+  font-weight: 600;
+  color: var(--text-2);
+  background: var(--card) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23888' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 10px center;
+  -webkit-appearance: none;
+  cursor: pointer;
+  transition: border-color .15s;
+}
+
+.store-select:hover { border-color: var(--pond); }
+.store-select:focus { outline: none; border-color: var(--green); }
+
+/* ── Recipe view ── */
+.recipe-group {
+  margin-bottom: 20px;
+}
+
+.recipe-group-header {
+  font-family: inherit;
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  background: none;
+  padding: 20px 0 6px;
+  border-bottom: 1.5px solid var(--border-dk);
+}
+</style>
 
 <div style="padding-top:12px;">
 
   <!-- Week calendar -->
-  <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:14px;">
-    <h1 class="plan-section-title">Your week</h1>
-    <a href="/suggest" class="btn btn-ghost btn-sm">Change selections</a>
+  {% set ns_idx = namespace(val=0) %}
+  {% for w in week_nav %}{% if w.active %}{% set ns_idx.val = loop.index0 %}{% endif %}{% endfor %}
+  {% set prev_week = week_nav[ns_idx.val + 1] if week_nav and ns_idx.val + 1 < week_nav | length else None %}
+  {% set next_week = week_nav[ns_idx.val - 1] if week_nav and ns_idx.val > 0 else None %}
+
+  <div style="margin-bottom:14px;">
+    <div style="display:flex;align-items:center;gap:8px;">
+      <h1 class="plan-section-title" style="margin:0;flex-shrink:0;">Week of {{ view_week_label }}</h1>
+      <div style="display:flex;align-items:center;gap:4px;margin-left:16px;flex-shrink:0;">
+        {% if prev_week %}
+        <a href="/grocery?week={{ prev_week.key }}" title="{{ prev_week.label }}"
+           style="width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:50%;border:1.5px solid var(--border);background:var(--card);color:var(--text-2);text-decoration:none;transition:border-color .15s;"
+           onmouseover="this.style.borderColor='var(--green)'" onmouseout="this.style.borderColor='var(--border)'">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+        </a>
+        {% else %}
+        <span style="width:28px;height:28px;opacity:.3;display:flex;align-items:center;justify-content:center;color:var(--border-dk);">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+        </span>
+        {% endif %}
+        {% if next_week %}
+        <a href="/grocery?week={{ next_week.key }}" title="{{ next_week.label }}"
+           style="width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:50%;border:1.5px solid var(--border);background:var(--card);color:var(--text-2);text-decoration:none;transition:border-color .15s;"
+           onmouseover="this.style.borderColor='var(--green)'" onmouseout="this.style.borderColor='var(--border)'">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+        </a>
+        {% else %}
+        <span style="width:28px;height:28px;opacity:.3;display:flex;align-items:center;justify-content:center;color:var(--border-dk);">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+        </span>
+        {% endif %}
+      </div>
+      {% if has_meals %}
+      <div style="margin-left:auto;flex-shrink:0;display:flex;align-items:center;gap:8px;">
+        <button onclick="openCopyPlan()" class="btn-edit btn-pond btn-no-arrow" style="cursor:pointer;">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+          Copy to
+        </button>
+        <a href="#" onclick="startPlanning();return false;" class="btn-edit">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+          Edit
+        </a>
+      </div>
+      {% endif %}
+    </div>
+    <div style="margin-top:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+      {% if week_key == current_week %}<span class="dash-week-pill">Current</span>{% endif %}
+    </div>
   </div>
 
-  <div class="week-calendar" style="--cal-cols: {{ calendar | length }};">
-    {% for day in calendar %}
-    <div class="cal-day{% if loop.index0 >= 5 %} cal-weekend{% endif %}">
-      <div class="cal-day-name">{{ day.short }}</div>
-      {% for mt in meal_types %}
-        {% if mt in day.meals %}
-        <div class="cal-slot cal-slot-{{ mt }}">
-          <span class="cal-slot-type">{{ meal_labels[mt] }}</span>
-          <span class="cal-slot-meal">{{ day.meals[mt] }}</span>
+  <div style="background:white;border-radius:var(--r-lg);padding:12px;margin-bottom:28px;">
+    <div class="week-calendar" style="--cal-cols: {{ calendar | length }};">
+      {% for day in calendar %}
+      {% set ns = namespace(day_cal=0) %}
+      {% for slot, meal_name in day.meals.items() %}{% set ns.day_cal = ns.day_cal + (meal_calories.get(meal_name, 0) if meal_calories else 0) %}{% endfor %}
+      <div class="cal-day{% if loop.index0 >= 5 %} cal-weekend{% endif %}"{% if ns.day_cal %} data-day-cal="{{ ns.day_cal }}"{% endif %}>
+        <div class="cal-day-name">
+          {{ day.short }}
+          {% if ns.day_cal %}<span class="cal-day-total" id="cal-total-{{ day.short }}">{{ ns.day_cal }}</span>{% endif %}
         </div>
-        {% else %}
+        {% for slot, meal_name in day.meals.items() %}
+        <div class="cal-slot cal-slot-{{ slot }}">
+          <span class="cal-slot-type">{{ meal_labels.get(slot, slot|title) }}</span>
+          <span class="cal-slot-meal">{{ meal_name }}</span>
+          {% if meal_calories and meal_calories.get(meal_name) %}
+          <span class="cal-slot-cal" title="Estimated from meal type and primary ingredients">{{ meal_calories.get(meal_name) }} cal</span>
+          {% endif %}
+        </div>
+        {% endfor %}
+        {% if not day.meals %}
         <div class="cal-slot-empty"></div>
         {% endif %}
-      {% endfor %}
-    </div>
-    {% endfor %}
-  </div>
-
-  <!-- Grocery list -->
-  <div class="grocery-section">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
-      <h2 class="grocery-title">Grocery list</h2>
-      <span style="font-size:.8rem;color:var(--text-3);">{{ grocery_list | length }} items</span>
-    </div>
-
-    <!-- Controls row: view toggle + store selector -->
-    <div class="grocery-controls">
-      <div class="grocery-view-toggle">
-        <button class="grocery-view-btn active" id="btn-by-cat" onclick="setView('cat')">By category</button>
-        <button class="grocery-view-btn" id="btn-by-recipe" onclick="setView('recipe')">By recipe</button>
-      </div>
-      <select class="grocery-store-select" id="store-select" onchange="updatePrice()">
-        <option value="1.00">Trader Joe's</option>
-        <option value="1.40">Whole Foods</option>
-        <option value="0.85">Kroger</option>
-        <option value="0.90">Target</option>
-        <option value="0.78">Walmart</option>
-        <option value="0.70">Costco</option>
-      </select>
-    </div>
-
-    <!-- Price estimate -->
-    <p class="grocery-price-est" id="price-est"></p>
-
-    {% if grocery_by_category %}
-
-    <!-- By category view (default) -->
-    <div class="grocery-list" id="view-cat">
-      {% for category, items in grocery_by_category.items() %}
-      <div class="grocery-category-header">{{ category }}</div>
-      {% for item in items %}
-      {% set is_checked = item.key in checked_items %}
-      <div class="grocery-item {{ 'done' if is_checked else '' }}" data-category="{{ item.get('category', 'Pantry') }}">
-        <input type="checkbox" class="grocery-checkbox"
-          data-key="{{ item.key }}" data-week="{{ week_key }}"
-          {{ 'checked' if is_checked else '' }} onchange="toggleGrocery(this)" />
-        <span class="grocery-name">{{ item.name | capitalize }}</span>
-        <span class="grocery-amount">{{ item.amount }} {{ item.unit }}</span>
       </div>
       {% endfor %}
-      {% endfor %}
     </div>
 
-    <!-- By recipe view (hidden by default) -->
-    <div class="grocery-list" id="view-recipe" style="display:none;">
-      {% for cluster in grocery_by_recipe %}
-      <div class="grocery-category-header">
-        {{ cluster.name }}
-        <span style="font-weight:400;text-transform:none;letter-spacing:0;font-size:.7rem;margin-left:6px;opacity:.7;">{{ meal_labels.get(cluster.meal_type, cluster.meal_type) }}</span>
-      </div>
-      {% for item in cluster.items %}
-      {% set is_checked = item.key in checked_items %}
-      <div class="grocery-item {{ 'done' if is_checked else '' }}" data-category="{{ item.get('category', 'Pantry') }}">
-        <input type="checkbox" class="grocery-checkbox"
-          data-key="{{ item.key }}" data-week="{{ week_key }}"
-          {{ 'checked' if is_checked else '' }} onchange="toggleGrocery(this)" />
-        <span class="grocery-name">{{ item.name | capitalize }}</span>
-        <span class="grocery-amount">{{ item.amount }} {{ item.unit }}</span>
+    {% if dessert_recipes %}
+    <div style="display:flex;flex-direction:row;flex-wrap:wrap;gap:8px;padding:4px 4px 4px;">
+      {% for dr in dessert_recipes %}
+      <div style="padding:5px 6px;border-radius:6px;background:#FEF0EE;flex:1;min-width:140px;cursor:default;">
+        <div style="font-size:.58rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#C04040;margin-bottom:2px;">Dessert</div>
+        <div style="font-size:.75rem;font-weight:600;color:#6B0000;line-height:1.3;">{{ dr.base.title }}</div>
+        {% if dessert_calories and dessert_calories.get(dr.base.title) %}
+        <div style="margin-top:2px;font-size:.63rem;font-weight:500;color:var(--text-3);">{{ dessert_calories[dr.base.title] }} cal</div>
+        {% endif %}
       </div>
       {% endfor %}
-      {% endfor %}
-    </div>
-
-    {% else %}
-    <div class="card card-body" style="text-align:center;color:var(--text-3);font-size:.875rem;">
-      You already have everything you need.
     </div>
     {% endif %}
   </div>
 
-  <div style="margin-top:36px;display:flex;flex-direction:column;align-items:center;gap:12px;padding-bottom:16px;">
-    <a href="/recipes" id="recipes-btn" class="btn btn-primary btn-lg" style="width:100%;max-width:340px;">Get the recipes</a>
-  </div>
+  <!-- Grocery section — doodle border frame -->
+  <div class="plan-grocery-outer">
 
-  <!-- Loading overlay -->
-  <div id="recipes-loading" style="display:none;position:fixed;inset:0;background:rgba(244,240,232,0.92);backdrop-filter:blur(8px);z-index:200;flex-direction:column;align-items:center;justify-content:center;gap:20px;">
-    <div class="spinner" style="width:36px;height:36px;"></div>
-    <p style="font-family:'Cormorant Garamond',Georgia,serif;font-size:1.4rem;font-style:italic;color:var(--black);">Writing your recipes…</p>
-    <p style="font-size:.8125rem;color:var(--text-3);">This takes about 15 seconds.</p>
-  </div>
+    <!-- Header lives on the doodle background -->
+    <div class="plan-grocery-hdr">
+      <div>
+        <h2 class="plan-grocery-title">Your list</h2>
+        <p class="plan-grocery-meta">{{ grocery_list | length }} items this week</p>
+      </div>
+      <div class="plan-grocery-budget">
+        <select class="store-select" id="store-select" onchange="updateBudget()" style="margin-bottom:6px;">
+          <option value="0">Any store</option>
+          <option value="1">Whole Foods</option>
+          <option value="2">Trader Joe's</option>
+          <option value="3">Walmart</option>
+          <option value="4">Kroger</option>
+        </select>
+        <div class="plan-grocery-budget-amount" id="budget-amount">—</div>
+        <div class="plan-grocery-budget-label">est. total</div>
+      </div>
+    </div>
+
+    <div class="plan-grocery-inner">
+
+      <!-- Controls -->
+      <div class="plan-grocery-controls">
+        <div class="view-toggle">
+          <button class="view-toggle-btn active" id="btn-view-cat" onclick="setGroceryView('cat')">By section</button>
+          <button class="view-toggle-btn" id="btn-view-recipe" onclick="setGroceryView('recipe')">By recipe</button>
+        </div>
+      </div>
+
+      {% if grocery_by_category %}
+
+      <!-- By section view -->
+      <div class="grocery-list" id="view-cat" style="margin-top:0;">
+        {% for category, items in grocery_by_category.items() %}
+        <div class="grocery-category-header">{{ category }}</div>
+        {% for item in items %}
+        {% set is_checked = item.key in checked_items %}
+        <div class="grocery-item {{ 'done' if is_checked else '' }}" data-category="{{ item.get('category', 'Pantry') }}" data-name="{{ item.name | e }}">
+          <input type="checkbox" class="grocery-checkbox"
+            data-key="{{ item.key }}" data-week="{{ week_key }}"
+            {{ 'checked' if is_checked else '' }} onchange="toggleGrocery(this)" />
+          <span class="grocery-name">{{ item.name | capitalize }}</span>
+          <span class="grocery-amount">{{ item.amount }} {{ item.unit }}</span>
+          <button class="gi-menu-btn" onclick="toggleItemMenu(this)" aria-label="Options">&#8942;</button>
+          <div class="gi-action-bar" style="display:none;">
+            <button class="gi-action-btn gi-remove-btn" onclick="planRemoveItem(this)">Remove</button>
+            <button class="gi-action-btn gi-sub-btn" onclick="planSubItem(this)">Substitute</button>
+          </div>
+          <div class="gi-sub-row" style="display:none;">
+            <input type="text" class="gi-sub-input" placeholder="Type replacement…" />
+            <button class="gi-action-btn" onclick="planApplySub(this)">Apply</button>
+          </div>
+        </div>
+        {% endfor %}
+        {% endfor %}
+      </div>
+
+      <!-- By recipe view -->
+      <div class="grocery-list" id="view-recipe" style="display:none;margin-top:0;">
+        {% if grocery_by_recipe %}
+          {% for group in grocery_by_recipe %}
+          <div class="recipe-group">
+            <div class="recipe-group-header">{{ group.name }}</div>
+            {% for item in group.lines %}
+            {% set is_checked = item.key in checked_items %}
+            <div class="grocery-item {{ 'done' if is_checked else '' }}" data-name="{{ item.name | e }}">
+              <input type="checkbox" class="grocery-checkbox"
+                data-key="{{ item.key }}" data-week="{{ week_key }}"
+                {{ 'checked' if is_checked else '' }} onchange="toggleGrocery(this)" />
+              <span class="grocery-name">{{ item.name | capitalize }}</span>
+              <span class="grocery-amount">{{ item.amount }} {{ item.unit }}</span>
+              <button class="gi-menu-btn" onclick="toggleItemMenu(this)" aria-label="Options">&#8942;</button>
+              <div class="gi-action-bar" style="display:none;">
+                <button class="gi-action-btn gi-remove-btn" onclick="planRemoveItem(this)">Remove</button>
+                <button class="gi-action-btn gi-sub-btn" onclick="planSubItem(this)">Substitute</button>
+              </div>
+              <div class="gi-sub-row" style="display:none;">
+                <input type="text" class="gi-sub-input" placeholder="Type replacement…" />
+                <button class="gi-action-btn" onclick="planApplySub(this)">Apply</button>
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+          {% endfor %}
+        {% endif %}
+      </div>
+
+      {% else %}
+      <div style="text-align:center;color:var(--text-3);font-size:.875rem;padding:24px 0;">
+        You already have everything you need.
+      </div>
+      {% endif %}
+
+    </div><!-- /plan-grocery-inner -->
+  </div><!-- /plan-grocery-outer -->
+
 </div>
+{% endif %}
 {% endblock %}
 
 {% block extra_js %}
+{% if not empty %}
 <script>
-var BASE_PRICE = {'Produce':4.00,'Meat & Seafood':12.00,'Dairy & Eggs':4.50,'Bakery':3.50,'Frozen':4.50,'Pantry':2.75};
+/* ── Sync calorie goal from localStorage to server ── */
+(function() {
+  var serverGoal = {{ calorie_goal or 0 }};
+  var goals;
+  try { goals = JSON.parse(localStorage.getItem('mise_nutrition_goals')); } catch(e) {}
+  var clientGoal = (goals && goals.calories) ? goals.calories : 0;
+  if (clientGoal >= 500 && clientGoal !== serverGoal) {
+    fetch('/sync-nutrition-goal', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({calories: clientGoal})
+    }).then(function() {
+      window.location.reload();
+    });
+  }
 
-function updatePrice() {
-  var mult = parseFloat(document.getElementById('store-select').value);
-  var items = document.querySelectorAll('#view-cat .grocery-item');
-  var total = 0;
-  items.forEach(function(el) {
-    var cat = el.dataset.category || 'Pantry';
-    total += (BASE_PRICE[cat] || 3.00) * mult;
+  /* Calorie goal coloring — server already scaled so ratio should ≈ 1 */
+  var calGoal = clientGoal || serverGoal || 2000;
+  document.querySelectorAll('.cal-day[data-day-cal]').forEach(function(day) {
+    var actual = parseInt(day.dataset.dayCal, 10);
+    var badge = day.querySelector('.cal-day-total');
+    if (!badge) return;
+    var ratio = actual / calGoal;
+    badge.title = actual + ' cal · goal ' + calGoal;
+    if (ratio > 1.10) badge.classList.add('over-goal');
+    else if (ratio >= 0.85) badge.classList.add('on-goal');
+    else badge.classList.add('under-goal');
+    badge.textContent = actual + ' cal';
   });
-  var label = document.getElementById('store-select').options[document.getElementById('store-select').selectedIndex].text;
-  document.getElementById('price-est').textContent = 'Estimated total at ' + label + ': ~$' + total.toFixed(0);
+})();
+
+var _groceryItemCount = {{ grocery_list | length }};
+
+var _STORE_PRICE = [3.50, 4.80, 3.20, 2.60, 3.00];
+
+function updateBudget() {
+  var storeIdx = parseInt(document.getElementById('store-select').value, 10);
+  var perItem = _STORE_PRICE[storeIdx] || 3.50;
+  var total = (_groceryItemCount * perItem).toFixed(2);
+  document.getElementById('budget-amount').textContent = storeIdx === 0 ? '—' : '$' + total;
 }
 
-function setView(v) {
-  document.getElementById('view-cat').style.display    = v === 'cat'    ? 'block' : 'none';
-  document.getElementById('view-recipe').style.display = v === 'recipe' ? 'block' : 'none';
-  document.getElementById('btn-by-cat').classList.toggle('active',    v === 'cat');
-  document.getElementById('btn-by-recipe').classList.toggle('active', v === 'recipe');
+function setGroceryView(mode) {
+  document.getElementById('view-cat').style.display = mode === 'cat' ? '' : 'none';
+  document.getElementById('view-recipe').style.display = mode === 'recipe' ? '' : 'none';
+  document.getElementById('btn-view-cat').classList.toggle('active', mode === 'cat');
+  document.getElementById('btn-view-recipe').classList.toggle('active', mode === 'recipe');
 }
 
 function toggleGrocery(cb) {
-  cb.closest('.grocery-item').classList.toggle('done', cb.checked);
-  // sync the same item in the other view
+  var checked = cb.checked;
   var key = cb.dataset.key;
   document.querySelectorAll('.grocery-checkbox[data-key="' + key + '"]').forEach(function(c) {
-    c.checked = cb.checked;
-    c.closest('.grocery-item').classList.toggle('done', cb.checked);
+    c.checked = checked;
+    c.closest('.grocery-item').classList.toggle('done', checked);
   });
   var url = '/grocery/toggle/' + key + (cb.dataset.week ? '?week=' + encodeURIComponent(cb.dataset.week) : '');
   fetch(url, {method: 'POST'});
 }
 
-document.getElementById('recipes-btn').addEventListener('click', function(e) {
-  e.preventDefault();
-  document.getElementById('recipes-loading').style.display = 'flex';
-  window.location.href = this.href;
-});
+/* ── Per-item menu ── */
+function toggleItemMenu(btn) {
+  var item = btn.closest('.grocery-item');
+  var bar = item.querySelector('.gi-action-bar');
+  var open = bar.style.display !== 'none';
+  // Close all open menus first
+  document.querySelectorAll('.grocery-item.menu-open').forEach(function(el) {
+    el.classList.remove('menu-open');
+    el.querySelector('.gi-action-bar').style.display = 'none';
+    var sr = el.querySelector('.gi-sub-row'); if (sr) sr.style.display = 'none';
+  });
+  if (!open) {
+    item.classList.add('menu-open');
+    bar.style.display = 'flex';
+  }
+}
 
-updatePrice();
+function planRemoveItem(btn) {
+  var item = btn.closest('.grocery-item');
+  var name = item.dataset.name || '';
+  item.style.transition = 'opacity .22s, max-height .28s';
+  item.style.opacity = '0';
+  item.style.overflow = 'hidden';
+  item.style.maxHeight = item.offsetHeight + 'px';
+  requestAnimationFrame(function() {
+    item.style.maxHeight = '0';
+    item.style.padding = '0';
+    setTimeout(function() { item.remove(); }, 290);
+  });
+  // Mirror removal in the other view
+  if (name) {
+    document.querySelectorAll('.grocery-item[data-name="' + CSS.escape(name) + '"]').forEach(function(el) {
+      if (el !== item) el.style.display = 'none';
+    });
+  }
+}
+
+function planSubItem(btn) {
+  var item = btn.closest('.grocery-item');
+  item.querySelector('.gi-action-bar').style.display = 'none';
+  var row = item.querySelector('.gi-sub-row');
+  row.style.display = 'flex';
+  var inp = row.querySelector('.gi-sub-input');
+  inp.value = '';
+  inp.focus();
+}
+
+function planApplySub(btn) {
+  var item = btn.closest('.grocery-item');
+  var inp = item.querySelector('.gi-sub-input');
+  var val = inp.value.trim();
+  if (!val) { item.querySelector('.gi-sub-row').style.display = 'none'; item.classList.remove('menu-open'); return; }
+  var nameEl = item.querySelector('.grocery-name');
+  if (nameEl) nameEl.textContent = val.charAt(0).toUpperCase() + val.slice(1);
+  item.querySelector('.gi-sub-row').style.display = 'none';
+  item.classList.remove('menu-open');
+  // Mirror in other view
+  var name = item.dataset.name || '';
+  if (name) {
+    document.querySelectorAll('.grocery-item[data-name="' + CSS.escape(name) + '"]').forEach(function(el) {
+      if (el !== item) { var n = el.querySelector('.grocery-name'); if (n) n.textContent = val.charAt(0).toUpperCase() + val.slice(1); }
+    });
+  }
+  item.dataset.name = val.toLowerCase();
+}
+
+/* ── Copy plan ── */
+function openCopyPlan() {
+  document.getElementById('copy-plan-modal').style.display = 'flex';
+}
+document.addEventListener('DOMContentLoaded', function() {
+  var m = document.getElementById('copy-plan-modal');
+  if (m) m.addEventListener('click', function(e) { if (e.target === m) m.style.display = 'none'; });
+});
 </script>
+
+<!-- Copy plan modal -->
+<div id="copy-plan-modal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.45);align-items:center;justify-content:center;">
+  <div style="background:#fff;border-radius:20px;padding:32px 28px;max-width:380px;width:90%;box-shadow:0 8px 40px rgba(0,0,0,.18);">
+    <div style="font-family:'Caveat',cursive;font-size:1.75rem;font-weight:700;color:var(--black);margin-bottom:6px;">Copy this plan</div>
+    <p style="font-size:.85rem;color:var(--text-3);margin:0 0 20px;line-height:1.55;">Choose a week to copy this plan to. Any existing plan for that week will be replaced.</p>
+    <form action="/plan/copy" method="post">
+      <input type="hidden" name="from_week" value="{{ week_key }}" />
+      <label style="font-size:.68rem;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--text-2);display:block;margin-bottom:6px;">Copy to week</label>
+      <select name="to_week" style="width:100%;border:1.5px solid var(--border);border-radius:10px;padding:10px 14px;font-size:.9rem;background:var(--card);color:var(--black);margin-bottom:20px;box-sizing:border-box;">
+        {% for w in week_nav %}{% if not w.active %}
+        <option value="{{ w.key }}">{{ w.label }}{% if w.has_plan %} (has plan){% endif %}</option>
+        {% endif %}{% endfor %}
+      </select>
+      <div style="display:flex;gap:10px;">
+        <button type="button" onclick="document.getElementById('copy-plan-modal').style.display='none'" style="flex:1;padding:10px;border:1.5px solid var(--border);border-radius:10px;background:none;font-size:.875rem;color:var(--text-2);cursor:pointer;">Cancel</button>
+        <button type="submit" style="flex:1;padding:10px;border:none;border-radius:10px;background:var(--green);color:#fff;font-size:.875rem;font-weight:600;cursor:pointer;">Copy plan</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+{% endif %}
 {% endblock %}

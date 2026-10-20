@@ -4,27 +4,71 @@
 {% block content %}
 <div style="padding-top:12px;">
 
-  <div style="margin-bottom:6px;">
-    <h1 class="plan-section-title">Your recipes</h1>
+  <!-- Week nav header + Plan again -->
+  {% set ns_idx = namespace(val=0) %}
+  {% for w in (week_nav or []) %}{% if w.active %}{% set ns_idx.val = loop.index0 %}{% endif %}{% endfor %}
+  {% set _prev = week_nav[ns_idx.val + 1] if week_nav and ns_idx.val + 1 < week_nav | length else None %}
+  {% set _next = week_nav[ns_idx.val - 1] if week_nav and ns_idx.val > 0 else None %}
+  <div style="margin-bottom:14px;">
+    <div style="display:flex;align-items:center;gap:8px;">
+      <h1 class="plan-section-title" style="margin:0;flex-shrink:0;">Week of {{ view_week_label or 'this week' }}</h1>
+      <div style="display:flex;align-items:center;gap:4px;margin-left:16px;flex-shrink:0;">
+        {% if _prev %}
+        <a href="/plan?week={{ _prev.key }}" style="width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:50%;border:1.5px solid var(--border);background:var(--card);color:var(--text-2);text-decoration:none;font-size:.95rem;transition:border-color .15s;" onmouseover="this.style.borderColor='var(--green)'" onmouseout="this.style.borderColor='var(--border)'">‹</a>
+        {% else %}
+        <span style="width:28px;height:28px;opacity:.3;display:flex;align-items:center;justify-content:center;font-size:.95rem;color:var(--border-dk);">‹</span>
+        {% endif %}
+        {% if _next %}
+        <a href="/plan?week={{ _next.key }}" style="width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:50%;border:1.5px solid var(--border);background:var(--card);color:var(--text-2);text-decoration:none;font-size:.95rem;transition:border-color .15s;" onmouseover="this.style.borderColor='var(--green)'" onmouseout="this.style.borderColor='var(--border)'">›</a>
+        {% else %}
+        <span style="width:28px;height:28px;opacity:.3;display:flex;align-items:center;justify-content:center;font-size:.95rem;color:var(--border-dk);">›</span>
+        {% endif %}
+      </div>
+      {% if recipe_clusters %}
+      <a href="#" onclick="startPlanning();return false;" class="btn-edit" style="margin-left:auto;flex-shrink:0;">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+        Edit
+      </a>
+      {% endif %}
+    </div><!-- /header row -->
+    <div style="margin-top:6px;min-height:26px;">
+      {% if view_week == current_week %}<span class="dash-week-pill">Current</span>{% endif %}
+    </div>
   </div>
-  
-  {% if recipe_clusters %}
+
+  {% if recipe_clusters is none %}
+  <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:40vh;text-align:center;padding:40px 24px;">
+    <h2 style="font-family:system-ui,-apple-system,sans-serif;font-size:.85rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--black);margin-bottom:10px;">No plan yet</h2>
+    <p style="font-size:.9rem;color:var(--text-3);max-width:280px;line-height:1.6;margin-bottom:20px;">The recipes you plan will appear here.</p>
+    <a href="#" onclick="startPlanning();return false;" class="btn btn-primary btn-no-arrow">Start planning</a>
+  </div>
+  {% elif recipe_clusters %}
 
   <!-- Tab nav -->
-  <div class="recipe-tabs" role="tablist">
-    {% for cluster in recipe_clusters %}
-    <button
-      class="recipe-tab{% if loop.first %} active{% endif %}"
-      role="tab"
-      aria-selected="{{ 'true' if loop.first else 'false' }}"
-      aria-controls="recipe-panel-{{ loop.index0 }}"
-      data-tab="{{ loop.index0 }}"
-    >{{ cluster.base.title }}</button>
-    {% endfor %}
+  <div class="recipe-tabs-wrap" id="recipe-tabs-wrap">
+    <div class="recipe-tabs" id="recipe-tabs" role="tablist">
+      {% for cluster in recipe_clusters %}
+      <button
+        class="recipe-tab{% if loop.first %} active{% endif %}"
+        role="tab"
+        aria-selected="{{ 'true' if loop.first else 'false' }}"
+        aria-controls="recipe-panel-{{ loop.index0 }}"
+        data-tab="{{ loop.index0 }}"
+      >{{ cluster.base.title }}</button>
+      {% endfor %}
+    </div>
+    <div class="recipe-tabs-arrow-left" aria-hidden="true">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+    </div>
+    <div class="recipe-tabs-arrow" aria-hidden="true">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+    </div>
   </div>
 
   <!-- Tab panels -->
+  {% set ns_ci = namespace(val=0) %}
   {% for cluster in recipe_clusters %}
+  {% set ns_ci.val = loop.index0 %}
   <div
     class="recipe-panel{% if loop.first %} active{% endif %}"
     id="recipe-panel-{{ loop.index0 }}"
@@ -38,18 +82,19 @@
 
       <!-- Base prep -->
       <section class="recipe-section">
-        <h3 class="recipe-section-heading">Base prep</h3>
         <div class="recipe-columns">
           <div class="recipe-ingredients">
-            <p class="recipe-col-label">Ingredients</p>
+            <p class="recipe-col-label">Base ingredients</p>
             <ul class="recipe-ing-list">
               {% for ing in cluster.base.ingredients %}
+              {% if not (ing.startswith('[') and ing.endswith(']')) %}
               <li>{{ ing }}</li>
+              {% endif %}
               {% endfor %}
             </ul>
           </div>
           <div class="recipe-steps-col">
-            <p class="recipe-col-label">Method</p>
+            <p class="recipe-col-label">Base prep</p>
             <ol class="recipe-steps-list">
               {% for step in cluster.base.steps %}
               <li>{{ step }}</li>
@@ -61,17 +106,20 @@
 
       <!-- Uses -->
       {% if cluster.uses %}
+      {% set ns_uses = namespace(seen_uses=[]) %}
+      {% for use in cluster.uses %}{% if use.name and use.name not in ns_uses.seen_uses %}{% set ns_uses.seen_uses = ns_uses.seen_uses + [use.name] %}{% endif %}{% endfor %}
+      {% set unique_use_count = ns_uses.seen_uses | length %}
+      {% set ns_uses = namespace(seen_uses=[]) %}
       <section class="recipe-section recipe-uses-section">
-        <h3 class="recipe-section-heading">{{ cluster.uses | length }} way{{ 's' if cluster.uses | length != 1 }} to use it</h3>
-        <div class="recipe-uses-grid" style="--use-cols: {{ cluster.uses | length }};">
+        <h3 class="recipe-section-heading">Ways to use it</h3>
+        <div class="recipe-uses-grid" style="--use-cols: {{ unique_use_count }};">
           {% for use in cluster.uses %}
+          {% if use.name and use.name not in ns_uses.seen_uses %}
+          {% set ns_uses.seen_uses = ns_uses.seen_uses + [use.name] %}
+          {% set use_idx = loop.index0 %}
           <div class="recipe-use-card">
             <div class="recipe-use-header">
-              <span class="recipe-use-num">{{ loop.index }}</span>
-              <div>
-                <p class="recipe-use-title">{{ use.name }}</p>
-                {% if use.subtitle %}<p class="recipe-use-sub">{{ use.subtitle }}</p>{% endif %}
-              </div>
+              <p class="recipe-use-title">{{ use.name }}</p>
             </div>
 
             {% if use.extras %}
@@ -93,9 +141,25 @@
             <p class="recipe-tip">{{ use.tip }}</p>
             {% endif %}
           </div>
+          {% endif %}
           {% endfor %}
         </div>
       </section>
+
+      <details class="macros-detail">
+        <summary class="macros-summary">
+          <span>Macros</span>
+          <svg class="macros-chevron" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+        </summary>
+        <div
+          class="macros-panel-body"
+          hx-get="/api/macros-panel/{{ ns_ci.val }}?sk={{ macro_sk | urlencode }}"
+          hx-trigger="toggle from:closest details"
+          hx-swap="innerHTML"
+        >
+          <p style="color:var(--text-3);font-size:.8rem;padding:10px 0;">Loading macros…</p>
+        </div>
+      </details>
       {% endif %}
 
     </article>
@@ -107,16 +171,11 @@
     <p style="font-size:1rem;font-weight:600;color:var(--black);margin-bottom:8px;">Something went wrong generating your recipes.</p>
     <p style="font-size:.875rem;color:var(--text-3);margin-bottom:24px;">This sometimes happens - just try again and it usually works.</p>
     <form action="/recipes/regenerate" method="post">
-      <button type="submit" class="btn btn-primary">Try again</button>
+      <button type="submit" class="btn btn-primary btn-no-arrow">Try again</button>
     </form>
   </div>
   {% endif %}
 
-  <div style="margin-top:40px;display:flex;justify-content:center;gap:10px;padding-bottom:24px;">
-    <a href="/suggest" class="btn btn-ghost">Change selections</a>
-    <a href="/plan" class="btn btn-ghost">Grocery list</a>
-    <a href="/new-plan" class="btn btn-secondary">New week</a>
-  </div>
 
 </div>
 {% endblock %}
@@ -142,6 +201,22 @@
       document.querySelector('.recipe-panel[data-panel="' + idx + '"]').classList.add('active');
     });
   });
+})();
+
+// Scroll arrow visibility
+(function() {
+  var wrap = document.getElementById('recipe-tabs-wrap');
+  var tabs = document.getElementById('recipe-tabs');
+  if (!wrap || !tabs) return;
+  function checkArrows() {
+    var atStart = tabs.scrollLeft < 4;
+    var atEnd = tabs.scrollLeft + tabs.clientWidth >= tabs.scrollWidth - 4;
+    wrap.classList.toggle('has-overflow', !atEnd);
+    wrap.classList.toggle('has-scroll-left', !atStart);
+  }
+  checkArrows();
+  window.addEventListener('resize', checkArrows);
+  tabs.addEventListener('scroll', checkArrows);
 })();
 </script>
 {% endblock %}

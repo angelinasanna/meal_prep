@@ -2,18 +2,14 @@
 {% block title %} · Your taste{% endblock %}
 
 {% block content %}
-<div style="padding-top:12px;">
+<div style="padding-top:12px;position:relative;">
+  <h1 class="page-heading" style="margin-bottom:4px;">What are you craving?</h1>
 
-  <div style="margin-bottom:24px;">
-    <a href="/mode" class="btn btn-ghost btn-sm" style="display:inline-flex;align-items:center;gap:4px;margin-bottom:12px;">← Back</a>
-    <h1 class="page-heading" style="margin:0;font-family:'Kalam',cursive;font-weight:700;">What are you craving?</h1>
-  </div>
-
-  <p class="page-heading-sub" style="margin-top:0;margin-bottom:20px;">Choose the cuisines you're in the mood for and your current season. We'll suggest meals that match your taste and what's fresh right now.</p>
+  <p class="page-heading-sub" style="margin-top:0;margin-bottom:14px;">Choose the cuisines you're in the mood for and your current season. We'll suggest meals that match your taste and what's fresh right now.</p>
 
   <form action="/cuisine" method="post" class="form-card">
 
-    <div class="pref-section-label">Cuisines <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--text-3);font-size:.75rem;">(pick any)</span></div>
+    <div class="pref-section-label">Cuisines</div>
     <div class="cuisine-grid">
       {% for cuisine in cuisines %}
       <label class="cuisine-chip {% if cuisine in selected_cuisines %}selected{% endif %}">
@@ -23,7 +19,7 @@
       {% endfor %}
     </div>
 
-    <div class="pref-section-label" style="margin-top:28px;">Season</div>
+    <div class="pref-section-label" style="margin-top:20px;">Season</div>
     <div class="season-row">
       {% for s in seasons %}
       <label class="season-pill {% if s == selected_season %}selected{% endif %}">
@@ -33,8 +29,9 @@
       {% endfor %}
     </div>
 
-    <div style="margin-top:32px;">
-      <button type="submit" class="btn btn-primary">Get suggestions</button>
+    <div style="margin-top:20px;display:flex;align-items:center;justify-content:space-between;">
+      <a href="/mode" class="btn btn-pond btn-back">Back</a>
+      <button type="submit" id="cuisine-submit" class="btn btn-primary" disabled style="opacity:.45;cursor:not-allowed;">Get suggestions</button>
     </div>
   </form>
 </div>
@@ -42,9 +39,21 @@
 
 {% block extra_js %}
 <script>
+var _submitBtn = document.getElementById('cuisine-submit');
+
+function _checkReady() {
+  var hasCuisine = document.querySelector('.cuisine-chip input:checked') !== null;
+  var hasSeason  = document.querySelector('.season-pill input:checked') !== null;
+  var ready = hasCuisine && hasSeason;
+  _submitBtn.disabled = !ready;
+  _submitBtn.style.opacity = ready ? '' : '.45';
+  _submitBtn.style.cursor  = ready ? '' : 'not-allowed';
+}
+
 document.querySelectorAll('.cuisine-chip input').forEach(function(cb) {
   cb.addEventListener('change', function() {
     this.closest('.cuisine-chip').classList.toggle('selected', this.checked);
+    _checkReady();
   });
 });
 
@@ -53,6 +62,7 @@ document.querySelectorAll('.season-pill input').forEach(function(rb) {
     document.querySelectorAll('.season-pill').forEach(function(pill) {
       pill.classList.toggle('selected', pill.querySelector('input').checked);
     });
+    _checkReady();
   });
 });
 </script>

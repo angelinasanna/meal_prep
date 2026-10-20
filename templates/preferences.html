@@ -1,149 +1,577 @@
 {% extends "base.html" %}
-{% block title %} · Preferences{% endblock %}
+{% block title %} · My Profile{% endblock %}
+
+{% block extra_styles %}
+<style>
+.prof-page {
+  max-width: 700px;
+  margin: 0 auto;
+  padding: 0 clamp(16px, 5vw, 32px) 64px;
+}
+
+/* ── Doodle header banner ── */
+.prof-banner {
+  background-image: url('/static/food-doodle.jpg');
+  background-size: 50% auto;
+  background-repeat: repeat-x;
+  background-position: center;
+  position: relative;
+  border-radius: 0 0 24px 24px;
+  overflow: hidden;
+  margin: 0 clamp(-16px, -5vw, -32px) 28px;
+  padding: clamp(28px, 5vw, 44px) clamp(28px, 5vw, 40px);
+}
+.prof-banner::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: rgba(244,240,232,0.82);
+}
+.prof-header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+
+/* ── Avatar with upload ── */
+.prof-avatar-wrap {
+  position: relative;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.prof-avatar-xl {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  background: var(--green);
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 2rem;
+  font-weight: 700;
+  font-family: 'Kalam', cursive;
+  box-shadow: 0 2px 12px rgba(0,0,0,.12);
+  overflow: hidden;
+  transition: filter 160ms;
+}
+.prof-avatar-xl img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.prof-avatar-wrap:hover .prof-avatar-xl { filter: brightness(0.88); }
+.prof-avatar-overlay {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 160ms;
+  pointer-events: none;
+}
+.prof-avatar-wrap:hover .prof-avatar-overlay { opacity: 1; }
+.prof-avatar-overlay svg { filter: drop-shadow(0 1px 2px rgba(0,0,0,.4)); }
+#avatar-file-input { display: none; }
+
+.prof-header-name {
+  font-family: 'Caveat', cursive;
+  font-size: 1.9rem;
+  font-weight: 700;
+  color: var(--black);
+  line-height: 1.1;
+}
+.prof-header-email {
+  font-size: .85rem;
+  color: var(--black);
+  margin-top: 3px;
+}
+
+/* ── Cards ── */
+.prof-card {
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 22px 24px;
+  margin-bottom: 16px;
+}
+.prof-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 18px;
+}
+.prof-card-title {
+  font-family: 'Caveat', cursive;
+  font-size: 1.3rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--black);
+}
+.btn-edit {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 13px;
+  background: var(--green);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: .775rem;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: none;
+  transition: opacity 140ms;
+}
+.btn-edit:hover { opacity: .85; text-decoration: none; color: white; }
+
+/* ── Field grid ── */
+.prof-field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 20px 24px;
+}
+.prof-field-label {
+  font-family: inherit;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  margin-bottom: 5px;
+}
+.prof-field-value {
+  font-size: .875rem;
+  color: var(--black);
+  font-weight: 500;
+}
+.prof-field-value em { color: var(--text-3); font-style: normal; }
+
+/* ── Inline edit ── */
+.prof-edit-area {
+  border-top: 1px solid var(--border);
+  padding-top: 20px;
+  margin-top: 4px;
+}
+.prof-edit-section-label {
+  font-family: inherit;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  margin-bottom: 10px;
+}
+.prof-edit-actions { display: flex; gap: 8px; margin-top: 20px; }
+
+/* ── Nutrition rings ── */
+.nutrition-layout {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  flex-wrap: wrap;
+}
+.calorie-ring-wrap {
+  position: relative;
+  width: 110px;
+  height: 110px;
+  flex-shrink: 0;
+}
+.calorie-ring-wrap svg { width: 110px; height: 110px; transform: rotate(-90deg); }
+.calorie-ring-center {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+.calorie-ring-number { font-size: 1.1rem; font-weight: 700; color: var(--black); line-height: 1; }
+.calorie-ring-unit   { font-size: .62rem; color: var(--text-3); text-transform: uppercase; letter-spacing: .06em; margin-top: 2px; }
+.macro-rings { display: flex; gap: 20px; flex-wrap: wrap; }
+.macro-ring-wrap { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.macro-ring-wrap svg { width: 64px; height: 64px; transform: rotate(-90deg); }
+.macro-ring-label { font-size: .72rem; color: var(--text-3); text-transform: uppercase; letter-spacing: .05em; }
+.macro-ring-value { font-size: .8rem; font-weight: 600; color: var(--black); }
+
+/* ── Shopping frequency cards ── */
+.freq-cards { display: flex; gap: 12px; }
+.freq-card {
+  flex: 1; cursor: pointer;
+  border: 1.5px solid var(--border); background: white;
+  border-radius: 14px; padding: 14px 12px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 3px; text-align: center;
+  transition: border-color .15s, background .15s;
+}
+.freq-card:hover {
+  border-color: var(--green-3);
+  background: linear-gradient(rgba(255,255,255,.80), rgba(255,255,255,.80)), url('/static/food-doodle.jpg') center/200px;
+}
+.freq-card.active {
+  border: 2px solid var(--green);
+  background: linear-gradient(rgba(255,255,255,.88), rgba(255,255,255,.88)), url('/static/food-doodle.jpg') center/200px;
+}
+.freq-card-title { font-size: .875rem; font-weight: 700; color: var(--black); }
+.freq-card-sub { font-size: .72rem; color: var(--text-3); }
+
+/* ── Nutrition edit grid ── */
+.nutrition-goal-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 14px;
+  margin-top: 4px;
+}
+.nutrition-goal-field label {
+  display: block;
+  font-size: .72rem;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  margin-bottom: 5px;
+}
+.nutrition-goal-field input { width: 100%; box-sizing: border-box; }
+
+
+@media (max-width: 480px) {
+  .prof-field-grid { grid-template-columns: 1fr; }
+  .nutrition-goal-grid { grid-template-columns: 1fr; }
+  .nutrition-layout { gap: 20px; }
+}
+</style>
+{% endblock %}
 
 {% block content %}
-<div style="max-width:560px;margin:0 auto;padding-top:8px;">
 
-  <div style="margin-bottom:28px;">
-    <a href="/landing" class="btn btn-ghost btn-sm" style="display:inline-flex;align-items:center;gap:4px;margin-bottom:12px;">← Back</a>
-    <h1 class="page-heading" style="margin:0;font-family:'Kalam',cursive;font-weight:700;">Preferences</h1>
+{% set saved_days = preferences.mealPrepDays or ['Mon','Tue','Wed','Thu','Fri'] %}
+{% set cur_adv = preferences.adventureLevel or 'curious' %}
+
+<div class="prof-page">
+
+  <!-- ── Doodle banner + header ── -->
+  <div class="prof-banner">
+    <img src="/static/images/doodle6.png" class="page-doodle" aria-hidden="true"
+         style="bottom:-10px;right:10px;width:clamp(120px,18vw,200px);transform:rotate(-6deg);opacity:0.11;">
+    <div class="prof-header">
+      <div class="prof-avatar-wrap" onclick="document.getElementById('avatar-file-input').click()" title="Change photo">
+        <div class="prof-avatar-xl" id="prof-avatar">
+          <svg id="avatar-initial" width="80" height="80" viewBox="0 0 100 100" fill="currentColor"><circle cx="50" cy="31" r="22"/><path d="M -5 110 Q -5 58 50 58 Q 105 58 105 110 Z"/></svg>
+        </div>
+        <div class="prof-avatar-overlay">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"/>
+            <circle cx="12" cy="13" r="4"/>
+          </svg>
+        </div>
+      </div>
+      <input type="file" id="avatar-file-input" accept="image/*" />
+      <div>
+        <div class="prof-header-name">{{ request.session.get('user_name', '') }}</div>
+        <div class="prof-header-email">{{ request.session.get('user_email', '') }}</div>
+      </div>
+    </div>
   </div>
 
+  <!-- ── Daily Goals card ── -->
+  <div class="prof-card">
+    <div class="prof-card-head">
+      <span class="prof-card-title">Daily Goals</span>
+      <button type="button" class="btn-edit" onclick="editSection('nutrition')">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+        Edit
+      </button>
+    </div>
+
+    <div id="nutrition-summary">
+      <div class="nutrition-layout">
+        <div class="calorie-ring-wrap">
+          <svg viewBox="0 0 110 110">
+            <circle cx="55" cy="55" r="46" fill="none" stroke="var(--green-mid)" stroke-width="9"/>
+            <circle cx="55" cy="55" r="46" fill="none" stroke="var(--green)" stroke-width="9"
+              stroke-linecap="round" stroke-dasharray="289.0" stroke-dashoffset="0"/>
+          </svg>
+          <div class="calorie-ring-center">
+            <div class="calorie-ring-number" id="cal-display">2000</div>
+            <div class="calorie-ring-unit">cal / day</div>
+          </div>
+        </div>
+        <div class="macro-rings">
+          <div class="macro-ring-wrap">
+            <svg viewBox="0 0 64 64">
+              <circle cx="32" cy="32" r="26" fill="none" stroke="#e8f0ea" stroke-width="7"/>
+              <circle cx="32" cy="32" r="26" fill="none" stroke="#4caf82" stroke-width="7"
+                stroke-linecap="round" stroke-dasharray="163.4" stroke-dashoffset="0"/>
+            </svg>
+            <div class="macro-ring-value" id="protein-display">150g</div>
+            <div class="macro-ring-label">Protein</div>
+          </div>
+          <div class="macro-ring-wrap">
+            <svg viewBox="0 0 64 64">
+              <circle cx="32" cy="32" r="26" fill="none" stroke="#e8f0ea" stroke-width="7"/>
+              <circle cx="32" cy="32" r="26" fill="none" stroke="#f0b955" stroke-width="7"
+                stroke-linecap="round" stroke-dasharray="163.4" stroke-dashoffset="0"/>
+            </svg>
+            <div class="macro-ring-value" id="carbs-display">200g</div>
+            <div class="macro-ring-label">Carbs</div>
+          </div>
+          <div class="macro-ring-wrap">
+            <svg viewBox="0 0 64 64">
+              <circle cx="32" cy="32" r="26" fill="none" stroke="#e8f0ea" stroke-width="7"/>
+              <circle cx="32" cy="32" r="26" fill="none" stroke="#e07b6a" stroke-width="7"
+                stroke-linecap="round" stroke-dasharray="163.4" stroke-dashoffset="0"/>
+            </svg>
+            <div class="macro-ring-value" id="fat-display">65g</div>
+            <div class="macro-ring-label">Fat</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Show calorie toggle -->
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;margin-top:20px;padding-top:16px;border-top:1px solid var(--border);">
+      <div>
+        <div class="prof-field-label" style="margin-bottom:3px;">Calorie counts</div>
+        <div style="font-size:.76rem;color:var(--text-3);margin-top:2px;">Display calories on meal cards and your plan</div>
+      </div>
+      <label class="toggle-switch">
+        <input type="checkbox" id="toggle-calories" onchange="toggleCalorieDisplay(this)" />
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
+
+    <div id="nutrition-edit" style="display:none;" class="prof-edit-area">
+      <div class="nutrition-goal-grid">
+        <div class="nutrition-goal-field">
+          <label for="goal-calories">Calories (kcal)</label>
+          <input type="number" id="goal-calories" class="input" min="500" max="6000" placeholder="e.g. 2000" />
+        </div>
+        <div class="nutrition-goal-field">
+          <label for="goal-protein">Protein (g)</label>
+          <input type="number" id="goal-protein" class="input" min="0" max="500" placeholder="e.g. 150" />
+        </div>
+        <div class="nutrition-goal-field">
+          <label for="goal-carbs">Carbs (g)</label>
+          <input type="number" id="goal-carbs" class="input" min="0" max="1000" placeholder="e.g. 200" />
+        </div>
+        <div class="nutrition-goal-field">
+          <label for="goal-fat">Fat (g)</label>
+          <input type="number" id="goal-fat" class="input" min="0" max="500" placeholder="e.g. 65" />
+        </div>
+      </div>
+      <div class="prof-edit-actions">
+        <button type="button" class="btn btn-primary btn-no-arrow" onclick="saveNutritionGoals()">Save</button>
+        <button type="button" class="btn btn-ghost" onclick="closeSection('nutrition')">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Food preferences card ── -->
   <form action="/save-preferences" method="post" id="prefs-form" autocomplete="off">
-
-    <!-- Meal types -->
-    <div class="form-card" style="margin-bottom:16px;">
-      <div class="form-card-title">Which meals do you want to plan?</div>
-      <div class="meal-type-stack">
-        <label class="meal-type-row{% if 'breakfast' in (preferences.mealTypes or []) %} checked{% endif %}" id="label-breakfast">
-          <input type="checkbox" name="meal_types" value="breakfast"
-            {% if 'breakfast' in (preferences.mealTypes or []) %}checked{% endif %} />
-          <div class="meal-row-icon">
-            <svg class="icon icon-md" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
-              <circle cx="12" cy="12" r="4"/>
-              <line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/>
-              <line x1="4.22" y1="4.22" x2="6.34" y2="6.34"/><line x1="17.66" y1="17.66" x2="19.78" y2="19.78"/>
-              <line x1="2" y1="12" x2="5" y2="12"/><line x1="19" y1="12" x2="22" y2="12"/>
-              <line x1="4.22" y1="19.78" x2="6.34" y2="17.66"/><line x1="17.66" y1="6.34" x2="19.78" y2="4.22"/>
-            </svg>
-          </div>
-          <span class="meal-row-name">Breakfast</span>
-          <div class="meal-row-check"><svg class="icon icon-xs" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
-        </label>
-        <label class="meal-type-row{% if 'lunch' in (preferences.mealTypes or []) %} checked{% endif %}" id="label-lunch">
-          <input type="checkbox" name="meal_types" value="lunch"
-            {% if 'lunch' in (preferences.mealTypes or []) %}checked{% endif %} />
-          <div class="meal-row-icon">
-            <svg class="icon icon-md" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
-              <path d="M3 2v7c0 1.1.9 2 2 2h4a2 2 0 002-2V2"/><line x1="7" y1="2" x2="7" y2="22"/>
-              <line x1="21" y1="15" x2="21" y2="22"/><path d="M21 2a5 5 0 00-5 5v8h5"/>
-            </svg>
-          </div>
-          <span class="meal-row-name">Lunch</span>
-          <div class="meal-row-check"><svg class="icon icon-xs" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
-        </label>
-        <label class="meal-type-row{% if 'dinner' in (preferences.mealTypes or []) %} checked{% endif %}" id="label-dinner">
-          <input type="checkbox" name="meal_types" value="dinner"
-            {% if 'dinner' in (preferences.mealTypes or []) %}checked{% endif %} />
-          <div class="meal-row-icon">
-            <svg class="icon icon-md" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
-              <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
-            </svg>
-          </div>
-          <span class="meal-row-name">Dinner</span>
-          <div class="meal-row-check"><svg class="icon icon-xs" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
-        </label>
+    <div class="prof-card">
+      <div class="prof-card-head">
+        <span class="prof-card-title">Preferences</span>
+        <button type="button" class="btn-edit" onclick="editSection('meal-plan')">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+          Edit
+        </button>
       </div>
-    </div>
 
-    <!-- Servings -->
-    <div class="form-card" style="margin-bottom:16px;">
-      <div class="form-card-title">How many people are you cooking for?</div>
-      <div class="form-card-subtitle">We will scale ingredient amounts on your grocery list.</div>
-      <div style="display:flex;align-items:center;gap:16px;margin-top:4px;">
-        <div class="stepper">
-          <button class="stepper-btn" type="button" id="servings-dec">-</button>
-          <div class="stepper-value" id="servings-display">{{ preferences.servings or 2 }}</div>
-          <button class="stepper-btn" type="button" id="servings-inc">+</button>
+      <!-- Summary -->
+      <div id="meal-plan-summary">
+
+        <!-- Dietary field -->
+        <div>
+          <div class="prof-field-label">Dietary restrictions</div>
+          <div class="prof-field-value" style="margin-top:4px;">
+            {% if preferences.dietaryNeeds %}{{ preferences.dietaryNeeds }}{% else %}<em style="color:var(--text-3);font-style:normal;">None set</em>{% endif %}
+          </div>
         </div>
-        <input type="hidden" name="servings" id="servings-hidden" value="{{ preferences.servings or 2 }}" />
-        <span style="font-size:.875rem;color:var(--text-3);">people per meal</span>
-      </div>
-    </div>
 
-    <!-- Dietary needs -->
-    <div class="form-card" style="margin-bottom:16px;">
-      <div class="form-card-title">Any dietary needs or preferences?</div>
-      <div class="form-card-subtitle">Leave blank if none.</div>
-      <input type="text" name="dietary_needs" class="input"
-        placeholder="e.g. vegetarian, gluten-free, nut allergy, low-carb"
-        value="{{ preferences.dietaryNeeds or '' }}"
-        autocomplete="off" />
-    </div>
-
-    <!-- Adventure level -->
-    <div class="form-card" style="margin-bottom:16px;">
-      <div class="form-card-title">How adventurous are you?</div>
-      <div class="form-card-subtitle">This shapes the variety of flavors and ingredients we suggest.</div>
-      {% set adv_map = {'familiar': 0, 'curious': 1, 'bold': 2} %}
-      {% set cur_adv = preferences.adventureLevel or 'curious' %}
-      <div class="adventure-slider-wrap">
-        <input type="range" min="0" max="2" value="{{ adv_map.get(cur_adv, 1) }}"
-          class="adventure-slider" id="adventure-slider" />
-        <div class="adventure-ticks" id="adventure-ticks">
-          <span>Familiar</span><span>Curious</span><span>Bold</span>
+        <!-- Shopping schedule — always visible, auto-saves -->
+        {% set cur_freq = preferences.shoppingFrequency or 'weekly' %}
+        <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border);">
+          <div class="prof-field-label" style="margin-bottom:12px;">Shopping schedule</div>
+          <div class="freq-cards">
+            <div class="freq-card{{ ' active' if cur_freq != 'biweekly' else '' }}" data-freq="weekly" onclick="setShoppingFreq('weekly')">
+              <div class="freq-card-title">Weekly</div>
+            </div>
+            <div class="freq-card{{ ' active' if cur_freq == 'biweekly' else '' }}" data-freq="biweekly" onclick="setShoppingFreq('biweekly')">
+              <div class="freq-card-title">Biweekly</div>
+            </div>
+          </div>
         </div>
-        <input type="hidden" name="adventure_level" id="adventure-level-hidden" value="{{ cur_adv }}" />
+
+        <input type="hidden" name="adventure_level" id="style-hidden-val" value="{{ cur_adv }}" />
+        <input type="hidden" name="shopping_frequency" id="freq-hidden-val" value="{{ cur_freq }}" />
+      </div>
+
+      <!-- Edit form -->
+      <div id="meal-plan-edit" style="display:none;" class="prof-edit-area">
+        <div class="prof-edit-section-label">Dietary restrictions</div>
+        <input type="text" name="dietary_needs" class="input"
+          placeholder="e.g. vegetarian, gluten-free, nut allergy, low-carb"
+          value="{{ preferences.dietaryNeeds or '' }}" autocomplete="off" />
+        <input type="hidden" name="adventure_level" value="{{ cur_adv }}" />
+        <input type="hidden" name="shopping_frequency" value="{{ preferences.shoppingFrequency or 'weekly' }}" />
+        <div class="prof-edit-actions">
+          <button type="submit" class="btn btn-primary btn-no-arrow">Save</button>
+          <button type="button" class="btn btn-ghost" onclick="closeSection('meal-plan')">Cancel</button>
+        </div>
       </div>
     </div>
-
-    <!-- Meal prep days -->
-    <div class="form-card" style="margin-bottom:28px;">
-      <div class="form-card-title">Which days are you meal prepping?</div>
-      <div class="form-card-subtitle">Select the days that you are planning to cook.</div>
-      {% set saved_days = preferences.mealPrepDays or ['Mon','Tue','Wed','Thu','Fri'] %}
-      <div class="day-picker" style="margin-top:12px;">
-        {% for day in ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'] %}
-        <label class="day-chip">
-          <input type="checkbox" name="meal_prep_days" value="{{ day }}"
-            {% if day in saved_days %}checked{% endif %} />
-          <span>{{ day }}</span>
-        </label>
-        {% endfor %}
-      </div>
-    </div>
-
-    <div style="display:flex;gap:10px;flex-wrap:wrap;">
-      <button type="submit" class="btn btn-primary">Save preferences</button>
-      <a href="/landing" class="btn btn-ghost">Cancel</a>
-    </div>
-
   </form>
+
+  <!-- ── Hidden recipes card ── -->
+  {% if hidden_recipes %}
+  <div class="prof-card">
+    <div class="prof-card-head">
+      <span class="prof-card-title">Hidden recipes</span>
+      <span style="font-size:.76rem;color:var(--text-3);">{{ hidden_recipes | length }} hidden</span>
+    </div>
+    <p style="font-size:.8rem;color:var(--text-3);margin:-4px 0 14px;">These won't appear in your suggestions. Unhide any time.</p>
+    <div style="display:flex;flex-direction:column;gap:8px;" id="hidden-recipes-list">
+      {% for r in hidden_recipes %}
+      <div id="hidden-{{ r.id }}" style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--border);">
+        {% if r.image %}
+        <img src="{{ r.image }}" alt="{{ r.title }}" style="width:44px;height:44px;border-radius:8px;object-fit:cover;flex-shrink:0;" />
+        {% endif %}
+        <span style="font-size:.875rem;font-weight:600;color:var(--black);flex:1;">{{ r.title }}</span>
+        <button
+          style="background:none;border:1.5px solid var(--border);border-radius:8px;padding:5px 12px;font-size:.75rem;font-weight:600;color:var(--text-2);cursor:pointer;white-space:nowrap;transition:border-color .15s;"
+          hx-post="/unhide-recipe/{{ r.id }}"
+          hx-target="#hidden-{{ r.id }}"
+          hx-swap="outerHTML"
+          onmouseover="this.style.borderColor='var(--green)'"
+          onmouseout="this.style.borderColor='var(--border)'"
+        >Unhide</button>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+  {% if request.session.get('user_id') %}
+  <div style="margin-top:32px;padding-top:24px;border-top:1px solid var(--border);display:flex;justify-content:center;">
+    <form action="/logout" method="post">
+      <button type="submit" style="background:none;border:none;padding:0;font-size:.875rem;color:#c0392b;cursor:pointer;text-decoration:underline;font-family:inherit;">Sign out</button>
+    </form>
+  </div>
+  {% endif %}
+
 </div>
 {% endblock %}
 
 {% block extra_js %}
 <script>
-(function() {
-  var ADV_LEVELS = ['familiar', 'curious', 'bold'];
-  var slider  = document.getElementById('adventure-slider');
-  var ticks   = document.querySelectorAll('#adventure-ticks span');
-  var hidden  = document.getElementById('adventure-level-hidden');
-  if (!slider) return;
+/* ── Section toggle ── */
+function editSection(id) {
+  document.getElementById(id + '-summary').style.display = 'none';
+  document.getElementById(id + '-edit').style.display = 'block';
+  if (id === 'nutrition') loadGoalsIntoForm();
+}
+function closeSection(id) {
+  document.getElementById(id + '-edit').style.display = 'none';
+  document.getElementById(id + '-summary').style.display = '';
+}
 
-  function update() {
-    var i   = parseInt(slider.value);
-    var pct = (i / 2) * 100;
-    slider.style.background =
-      'linear-gradient(to right, var(--green) 0%, var(--green) ' + pct + '%, var(--border-dk) ' + pct + '%, var(--border-dk) 100%)';
-    if (hidden) hidden.value = ADV_LEVELS[i];
-    ticks.forEach(function(t, idx) {
-      t.style.fontWeight = idx === i ? '700' : '400';
-      t.style.color      = idx === i ? 'var(--black)' : 'var(--text-3)';
-    });
+/* ── Shopping frequency ── */
+function setShoppingFreq(freq) {
+  document.querySelectorAll('.freq-card').forEach(function(c) {
+    c.classList.toggle('active', c.dataset.freq === freq);
+  });
+  document.getElementById('freq-hidden-val').value = freq;
+  var form = document.getElementById('prefs-form');
+  var data = new FormData(form);
+  data.set('shopping_frequency', freq);
+  fetch('/save-preferences', { method: 'POST', body: data, credentials: 'same-origin' });
+}
+
+/* ── Profile picture (localStorage) ── */
+document.getElementById('avatar-file-input').addEventListener('change', function(e) {
+  var file = e.target.files[0];
+  if (!file) return;
+  var reader = new FileReader();
+  reader.onload = function(ev) {
+    var dataUrl = ev.target.result;
+    localStorage.setItem('mise_avatar', dataUrl);
+    applyAvatar(dataUrl);
+  };
+  reader.readAsDataURL(file);
+});
+
+function applyAvatar(dataUrl) {
+  var el = document.getElementById('prof-avatar');
+  var initial = document.getElementById('avatar-initial');
+  if (dataUrl) {
+    if (initial) initial.style.display = 'none';
+    var img = el.querySelector('img');
+    if (!img) { img = document.createElement('img'); el.appendChild(img); }
+    img.src = dataUrl;
+    img.style.display = 'block';
   }
-  slider.addEventListener('input', update);
-  update();
+}
+
+(function() {
+  var saved = localStorage.getItem('mise_avatar');
+  if (saved) applyAvatar(saved);
+})();
+
+/* ── Nutrition goals (localStorage) ── */
+var DEFAULT_GOALS = { calories: 2000, protein: 150, carbs: 200, fat: 65 };
+function getGoals() {
+  try { return JSON.parse(localStorage.getItem('mise_nutrition_goals')) || DEFAULT_GOALS; }
+  catch(e) { return DEFAULT_GOALS; }
+}
+function renderGoals() {
+  var g = getGoals();
+  document.getElementById('cal-display').textContent     = g.calories.toLocaleString();
+  document.getElementById('protein-display').textContent = g.protein + 'g';
+  document.getElementById('carbs-display').textContent   = g.carbs + 'g';
+  document.getElementById('fat-display').textContent     = g.fat + 'g';
+}
+function loadGoalsIntoForm() {
+  var g = getGoals();
+  document.getElementById('goal-calories').value = g.calories;
+  document.getElementById('goal-protein').value  = g.protein;
+  document.getElementById('goal-carbs').value    = g.carbs;
+  document.getElementById('goal-fat').value      = g.fat;
+}
+function saveNutritionGoals() {
+  var g = {
+    calories : parseInt(document.getElementById('goal-calories').value) || DEFAULT_GOALS.calories,
+    protein  : parseInt(document.getElementById('goal-protein').value)  || DEFAULT_GOALS.protein,
+    carbs    : parseInt(document.getElementById('goal-carbs').value)    || DEFAULT_GOALS.carbs,
+    fat      : parseInt(document.getElementById('goal-fat').value)      || DEFAULT_GOALS.fat,
+  };
+  localStorage.setItem('mise_nutrition_goals', JSON.stringify(g));
+  // Sync calorie goal to server so portion scaling works server-side
+  fetch('/sync-nutrition-goal', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({calories: g.calories})
+  });
+  renderGoals();
+  closeSection('nutrition');
+}
+renderGoals();
+
+/* ── Calorie display toggle ── */
+function toggleCalorieDisplay(cb) {
+  var g = getGoals();
+  g.showCalories = cb.checked;
+  localStorage.setItem('mise_nutrition_goals', JSON.stringify(g));
+  document.body.classList.toggle('hide-calories', !cb.checked);
+}
+(function initCalorieToggle() {
+  var g = getGoals();
+  var cb = document.getElementById('toggle-calories');
+  if (cb) cb.checked = (g.showCalories !== false);
 })();
 </script>
 {% endblock %}
